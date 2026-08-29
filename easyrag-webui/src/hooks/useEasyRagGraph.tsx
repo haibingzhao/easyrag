@@ -293,6 +293,7 @@ const useEasyRagGraph = () => {
   // old "graph is empty" placeholder + stale fetch signature must be wiped
   // so the label/knowledge endpoints are re-issued against the new scope.
   const lastWorkspaceRef = useRef<string>(workspace)
+  const lastQueryLabelRef = useRef<string>(queryLabel)
   useEffect(() => {
     const wsChanged = lastWorkspaceRef.current !== workspace
     if (wsChanged) {
@@ -310,9 +311,15 @@ const useEasyRagGraph = () => {
         clearTimeout(retryTimerRef.current)
         retryTimerRef.current = null
       }
+      lastQueryLabelRef.current = queryLabel
       return
     }
-    if (!queryLabel && (rawGraph !== null || sigmaGraph !== null)) {
+    // Only react when queryLabel itself changes — NOT when sigmaGraph/rawGraph
+    // change (the latter happens as a side-effect of loading data, and
+    // resetting here would race the fetch completion and zero out counts).
+    const labelChanged = lastQueryLabelRef.current !== queryLabel
+    lastQueryLabelRef.current = queryLabel
+    if (labelChanged && !queryLabel && (rawGraph !== null || sigmaGraph !== null)) {
       const state = useGraphStore.getState()
       state.reset()
       state.setGraphDataFetchAttempted(false)
@@ -325,7 +332,6 @@ const useEasyRagGraph = () => {
   // Graph data fetching logic
   useEffect(() => {
     if (fetchInProgressRef.current) return
-    if (!queryLabel && emptyDataHandledRef.current) return
 
     if (!isFetching && !useGraphStore.getState().graphDataFetchAttempted) {
       const fetchSignature = `${workspace}|${queryLabel}|${maxQueryDepth}|${maxNodes}|v${graphDataVersion}`
@@ -362,11 +368,11 @@ const useEasyRagGraph = () => {
         is_truncated: boolean | undefined
       } | null>
 
-      if (currentQueryLabel) {
-        dataPromise = fetchGraph(currentQueryLabel, currentMaxQueryDepth, currentMaxNodes)
-      } else {
-        dataPromise = Promise.resolve({ rawGraph: null, is_truncated: false })
-      }
+      // Treat empty queryLabel the same as '*' — fetch the full graph.
+      // This guards against a stale persisted empty queryLabel (which would
+      // otherwise silently skip the fetch and leave the graph empty forever).
+      const effectiveQueryLabel = currentQueryLabel || '*'
+      dataPromise = fetchGraph(effectiveQueryLabel, currentMaxQueryDepth, currentMaxNodes)
 
       dataPromise
         .then(async (result) => {
