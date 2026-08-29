@@ -8,7 +8,7 @@ export default function DocumentManager() {
   const [documents, setDocuments] = useState<DocumentInfo[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(10)
+  const [pageSize] = useState(10)
   const [isLoading, setIsLoading] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
   const [isResetting, setIsResetting] = useState(false)

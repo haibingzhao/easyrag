@@ -4,7 +4,7 @@ import { cn } from '@/lib/utils'
 import { FolderIcon, CheckIcon, PlusIcon, XIcon } from 'lucide-react'
 import { Input } from '@/components/ui/Input'
 
-const WORKSPACE_PATTERN = /^[a-zA-Z0-9_\-][a-zA-Z0-9_\-.]{0,63}$/
+const WORKSPACE_PATTERN = /^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,63}$/
 
 export default function WorkspaceSelector() {
   const workspace = useSettingsStore.use.workspace()

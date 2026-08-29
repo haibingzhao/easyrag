@@ -119,7 +119,7 @@ export const queryApi = {
     return data
   },
 
-  queryStream(request: QueryRequest): EventSource | null {
+  queryStream(_request: QueryRequest): EventSource | null {
     // Use fetch for streaming
     return null // Implemented via fetch in component
   },

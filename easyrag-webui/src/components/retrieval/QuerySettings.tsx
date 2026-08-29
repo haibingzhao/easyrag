@@ -13,7 +13,7 @@ export interface QuerySettingsProps {
   onSettingsChange?: (settings: Record<string, any>) => void
 }
 
-const QuerySettings = ({ onSettingsChange }: QuerySettingsProps) => {
+const QuerySettings = ({ onSettingsChange: _onSettingsChange }: QuerySettingsProps) => {
   const querySettings = useSettingsStore.use.querySettings()
   const updateQuerySettings = useSettingsStore.use.updateQuerySettings()
 
@@ -25,13 +25,6 @@ const QuerySettings = ({ onSettingsChange }: QuerySettingsProps) => {
     { value: 'mix', label: 'Mix' },
     { value: 'structure', label: 'Structure' },
     { value: 'bypass', label: 'Bypass' }
-  ]
-
-  const responseTypes = [
-    { value: 'Multiple Paragraphs', label: 'Multiple Paragraphs' },
-    { value: 'Bullet Points', label: 'Bullet Points' },
-    { value: 'Single Paragraph', label: 'Single Paragraph' },
-    { value: 'Concise Summary', label: 'Concise Summary' }
   ]
 
   return (
