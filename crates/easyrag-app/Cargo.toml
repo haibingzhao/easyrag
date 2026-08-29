@@ -31,8 +31,6 @@ tower-http = { workspace = true }
 mime_guess = { workspace = true }
 percent-encoding = { workspace = true }
 regex = { workspace = true }
-chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-futures = { workspace = true }

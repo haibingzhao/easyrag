@@ -11,7 +11,6 @@ pub mod callback;
 pub mod chunker;
 pub mod contextual_chunker;
 pub mod dedup;
-pub mod dir_scan;
 pub mod easy_rag;
 pub mod easy_rag_config;
 pub mod evaluation;
@@ -38,7 +37,6 @@ pub use chunker::{
 };
 pub use contextual_chunker::ContextualChunker;
 pub use dedup::MinHashDeduplicator;
-pub use dir_scan::{scan_directory, ScanOutcome};
 pub use evaluation::GoldenSetEvaluator;
 // Re-export evaluation types from easyrag_core for convenience
 pub use easyrag_core::model::evaluation::{EvalReport, GoldenItem};

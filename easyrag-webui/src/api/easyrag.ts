@@ -92,18 +92,6 @@ export interface PaginatedResponse {
   pageSize: number
 }
 
-// Shape of GET /api/documents/{docId} (full document text plus status meta)
-export interface DocumentFull {
-  doc_id: string
-  content: string | null
-  file_path: string | null
-  status: string | null
-  create_time: string | null
-  external_id: string | null
-  content_length: number | null
-  chunks_count: number | null
-}
-
 export interface GraphNode {
   id: string
   labels: string[]
@@ -165,16 +153,6 @@ export const documentApi = {
     return data
   },
 
-  async getDocument(docId: string, bizId?: string): Promise<DocumentFull> {
-    // bizId must be the line the document belongs to (echoed by list),
-    // matching the reprocess endpoint convention; workspace is attached
-    // automatically by the request interceptor.
-    const { data } = await apiClient.get(`/documents/${docId}`, {
-      params: bizId ? { bizId } : {},
-    })
-    return data
-  },
-
   async deleteDocument(docId: string) {
     const { data } = await apiClient.delete(`/documents/${docId}`)
     return data
@@ -195,13 +173,8 @@ export const documentApi = {
     return data
   },
 
-  async reprocessDocument(docId: string, bizId?: string) {
-    // bizId must be the line the document belongs to (echoed by list):
-    // status writes are scoped by (workspace, biz_id) — omitting it would
-    // let the server fall back to the default line and miss the document.
-    const { data } = await apiClient.post(`/documents/${docId}/reprocess`, null, {
-      params: bizId ? { bizId } : {},
-    })
+  async reprocessDocument(docId: string) {
+    const { data } = await apiClient.post(`/documents/${docId}/reprocess`)
     return data
   },
 }

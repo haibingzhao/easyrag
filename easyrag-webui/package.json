@@ -2,12 +2,6 @@
   "name": "easyrag-webui",
   "private": true,
   "version": "1.0.0",
-  "license": "Apache-2.0",
-  "description": "Web UI for EasyRAG: document management, knowledge graph visualization and conversational retrieval",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/haibingzhao/easyrag.git"
-  },
   "type": "module",
   "scripts": {
     "dev": "vite",

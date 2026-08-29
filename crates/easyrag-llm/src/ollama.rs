@@ -1,15 +1,12 @@
 //! Ollama LLM client.
 
 use easyrag_core::llm::service::{
-    ChatMessage, EmbeddingService, LlmRequest, LlmService, LlmToolResponse, MessageRole,
-    ToolCall, ToolCallingLlmService, ToolDefinition,
+    EmbeddingService, LlmRequest, LlmService, MessageRole,
 };
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::{json, Value as JsonValue};
 use std::time::Duration;
-
-use crate::{arguments_to_map, parse_tool_result_message, serialize_tools};
 
 /// Configuration for [`OllamaClient`].
 #[derive(Clone, Debug)]
@@ -124,117 +121,6 @@ impl OllamaClient {
             .await
             .map_err(|e| easyrag_core::CoreError::ApiConnection(e.to_string()))
     }
-
-    // ===== tool-calling support =====
-
-    /// Convert agent-loop messages into Ollama chat format. User messages
-    /// matching the `[Tool Result: name]` content pattern (see the
-    /// TOOL_RESULT_PREFIX contract in agent.rs) become `{role: "tool",
-    /// tool_name, content}` messages; the preceding assistant message gets
-    /// a synthesized `tool_calls` entry with an incrementing `function.index`
-    /// (Ollama pairs tool results by order/name, not by id). Parallel tool
-    /// results from one turn all append to the same assistant message.
-    fn build_tool_call_messages(messages: &[ChatMessage]) -> Vec<JsonValue> {
-        let mut out: Vec<JsonValue> = Vec::with_capacity(messages.len());
-        let mut counter = 0usize;
-        for msg in messages {
-            if msg.role == MessageRole::User {
-                if let Some((tool_name, result)) = parse_tool_result_message(&msg.content) {
-                    if let Some(prev) = out
-                        .iter_mut()
-                        .rev()
-                        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
-                    {
-                        let entry = json!({
-                            "type": "function",
-                            "function": { "index": counter, "name": tool_name, "arguments": {} }
-                        });
-                        counter += 1;
-                        match prev.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
-                            Some(arr) => arr.push(entry),
-                            None => {
-                                if let Some(obj) = prev.as_object_mut() {
-                                    obj.insert(
-                                        "tool_calls".to_string(),
-                                        JsonValue::Array(vec![entry]),
-                                    );
-                                }
-                            }
-                        }
-                        out.push(json!({
-                            "role": "tool",
-                            "tool_name": tool_name,
-                            "content": result,
-                        }));
-                        continue;
-                    }
-                    // Defensive: no preceding assistant message — fall
-                    // through and send it as a plain user message.
-                }
-            }
-            let role = match msg.role {
-                MessageRole::System => "system",
-                MessageRole::User => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            out.push(json!({ "role": role, "content": msg.content }));
-        }
-        out
-    }
-
-    /// Assemble the /api/chat request body with tool definitions.
-    fn build_chat_body_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[ToolDefinition],
-    ) -> JsonValue {
-        json!({
-            "model": self.config.model,
-            "messages": Self::build_tool_call_messages(messages),
-            "tools": serialize_tools(tools),
-            "stream": false,
-        })
-    }
-
-    /// Parse an /api/chat response that may contain tool calls. Ollama
-    /// returns `arguments` as a JSON object (unlike OpenAI's string form).
-    fn parse_tool_response(response: &str) -> LlmToolResponse {
-        let Ok(json) = serde_json::from_str::<JsonValue>(response) else {
-            return LlmToolResponse::default();
-        };
-        let message = json.get("message");
-        // Empty content is normalized to None (tool-call responses carry "").
-        let content = message
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-        let tool_calls = message
-            .and_then(|m| m.get("tool_calls"))
-            .and_then(|t| t.as_array())
-            .map(|calls| {
-                calls
-                    .iter()
-                    .filter_map(|call| {
-                        let name = call.pointer("/function/name")?.as_str()?.to_string();
-                        let arguments = call
-                            .pointer("/function/arguments")
-                            .map(arguments_to_map)
-                            .unwrap_or_default();
-                        Some(ToolCall {
-                            id: None,
-                            name,
-                            arguments,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        LlmToolResponse {
-            content,
-            tool_calls,
-        }
-    }
 }
 
 #[async_trait::async_trait]
@@ -312,20 +198,6 @@ impl LlmService for OllamaClient {
                 }
             }
         })
-    }
-}
-
-#[async_trait::async_trait]
-impl ToolCallingLlmService for OllamaClient {
-    async fn complete_with_tools(
-        &self,
-        messages: Vec<ChatMessage>,
-        tools: Vec<ToolDefinition>,
-    ) -> easyrag_core::Result<LlmToolResponse> {
-        // No circuit breaker/retry here, consistent with `complete`.
-        let body = self.build_chat_body_with_tools(&messages, &tools);
-        let response = self.post_json("/api/chat", &body).await?;
-        Ok(Self::parse_tool_response(&response))
     }
 }
 

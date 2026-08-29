@@ -113,11 +113,6 @@ pub struct DocProcessingStatus {
     pub has_structure: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
-    /// Biz-line partition key the status row lives under. Echoed so callers
-    /// can route per-document operations (e.g. single-document reprocess)
-    /// back to the right biz_id instead of falling back to the scope default.
-    #[serde(default)]
-    pub biz_id: String,
 }
 
 impl DocProcessingStatus {

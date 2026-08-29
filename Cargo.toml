@@ -13,8 +13,6 @@ members = [
 version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/haibingzhao/easyrag"
-description = "Production-grade RAG knowledge base system: hybrid retrieval (vector + full-text + knowledge graph), pluggable storage backends, multi-tenant, with a built-in Web UI"
 # Trait upcasting (supertrait dyn-object coercion, used to call
 # StorageNameSpace::drop through sub-trait objects) stabilized in 1.86.
 rust-version = "1.86"

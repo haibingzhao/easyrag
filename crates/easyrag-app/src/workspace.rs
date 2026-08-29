@@ -7,16 +7,13 @@ use std::sync::Arc;
 use anyhow::Context;
 use async_trait::async_trait;
 
-use easyrag_core::llm::service::{LlmService, ToolCallingLlmService};
+use easyrag_core::llm::service::LlmService;
 use easyrag_core::storage::keyword::KeywordSearchable;
 use easyrag_core::storage::tenant_config::TenantConfigStorage;
 use easyrag_core::storage::traits::{
     DocStatusStorage, GraphStorage, KVStorage, StorageBundle, StorageNameSpace, VectorStorage,
 };
-use easyrag_pipeline::{
-    IngestionPipeline, QueryEngine, StructureAgentStrategy, StructureQueryStrategy,
-    TreeSearchEngine,
-};
+use easyrag_pipeline::{IngestionPipeline, QueryEngine, StructureQueryStrategy, TreeSearchEngine};
 use easyrag_server::service::{ResolvedScope, WorkspaceContext, WorkspaceResolver};
 use easyrag_server::{AppError, AppResult, ServerConfig};
 use easyrag_storage::memory::{
@@ -42,7 +39,6 @@ pub(crate) struct WorkspaceResolverImpl {
     pub(crate) default_biz_id: String,
     pub(crate) default_context: WorkspaceContext,
     pub(crate) llm: Arc<dyn LlmService>,
-    pub(crate) tool_calling_llm: Option<Arc<dyn ToolCallingLlmService>>,
     pub(crate) config: ServerConfig,
     pub(crate) tenant_config_storage: Arc<dyn TenantConfigStorage>,
     pub(crate) pg_db: Option<easyrag_storage::postgres::PgDatabase>,
@@ -202,17 +198,6 @@ impl WorkspaceResolverImpl {
             Some(search as Arc<dyn KeywordSearchable>)
         };
 
-        // Per-workspace extractor wiring: tenant-resolved extraction
-        // settings flow into the pipeline's EntityExtractor (same shared
-        // override policy as EasyRAG / the global pipeline).
-        let mut extractor_config =
-            easyrag_pipeline::extraction::EntityExtractorConfig::default();
-        extractor_config.apply_ingest_settings(
-            resolved_config.language.clone(),
-            resolved_config.entity_extract_max_gleaning,
-            &resolved_config.entity_types_guidance,
-        );
-
         let mut pipeline = IngestionPipeline::new(
             self.llm.clone(),
             kv.clone(),
@@ -221,13 +206,6 @@ impl WorkspaceResolverImpl {
             doc_status.clone(),
             Arc::new(make_embedding_func(&resolved_config)?),
         )
-        .with_extractor(easyrag_pipeline::extraction::EntityExtractor::new(
-            self.llm.clone(),
-            graph.clone(),
-            vector.clone(),
-            kv.clone(),
-            extractor_config,
-        ))
         .with_language(resolved_config.language.clone())
         .with_max_concurrency(resolved_config.llm_max_async);
         if let Some(keyword) = &keyword {
@@ -235,16 +213,10 @@ impl WorkspaceResolverImpl {
         }
         let pipeline = Arc::new(pipeline);
 
-        let agent_strategy = self.tool_calling_llm.as_ref().map(|tc_llm| {
-            Arc::new(
-                StructureAgentStrategy::new(tc_llm.clone(), kv.clone(), vector.clone())
-                    .with_doc_status_storage(doc_status.clone()),
-            )
-        });
         let structure = Arc::new(
             StructureQueryStrategy::new(
                 TreeSearchEngine::new(self.llm.clone()),
-                agent_strategy,
+                None, // no tool-calling LLM impl available
                 kv.clone(),
                 vector.clone(),
                 self.llm.clone(),

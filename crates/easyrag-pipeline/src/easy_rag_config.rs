@@ -205,16 +205,6 @@ impl EasyRAGConfigBuilder {
         self
     }
 
-    pub fn entity_extract_max_gleaning(mut self, rounds: usize) -> Self {
-        self.config.entity_extract_max_gleaning = rounds;
-        self
-    }
-
-    pub fn entity_types_guidance(mut self, guidance: impl Into<String>) -> Self {
-        self.config.entity_types_guidance = guidance.into();
-        self
-    }
-
     // Anti-hallucination guardrail builders
 
     pub fn enable_verification_gate(mut self, enable: bool) -> Self {

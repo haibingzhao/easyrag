@@ -167,9 +167,6 @@ pub struct ToolDefinition {
 /// A tool call requested by the LLM.
 #[derive(Clone, Debug)]
 pub struct ToolCall {
-    /// Provider-returned tool_call_id (e.g. OpenAI's `call_...`). `None`
-    /// for providers that don't assign IDs (Ollama pairs by order/name).
-    pub id: Option<String>,
     pub name: String,
     pub arguments: std::collections::HashMap<String, String>,
 }

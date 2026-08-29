@@ -3,7 +3,6 @@
 //! Defaults that also exist in `easyrag_core::constants` reference those
 //! constants directly to avoid drift between the two crates.
 
-use easyrag_core::model::ScanTaskSpec;
 use easyrag_core::storage::tenant_config::TenantConfig;
 
 /// Server configuration properties.
@@ -37,11 +36,6 @@ pub struct ServerConfig {
     pub llm_base_url: String,
     pub llm_temperature: f32,
     pub llm_max_tokens: Option<u32>,
-    /// DashScope-style thinking toggle; None = provider default.
-    pub llm_enable_thinking: Option<bool>,
-    /// Per-request LLM timeout in seconds (larger local/slow models need more
-    /// than the 120s client default).
-    pub llm_timeout_secs: u64,
 
     // Embedding
     pub embedding_model: String,
@@ -55,11 +49,6 @@ pub struct ServerConfig {
     pub chunk_size: usize,
     pub chunk_overlap_size: usize,
     pub chunking_method: String,
-
-    // Entity extraction
-    pub entity_extract_max_gleaning: usize,
-    /// empty = extractor's built-in entity-type guidance
-    pub entity_types_guidance: String,
 
     // Query defaults
     pub default_top_k: usize,
@@ -116,14 +105,6 @@ pub struct ServerConfig {
     pub language: String,
     pub verbose: bool,
     pub log_level: String,
-
-    // Background auto-scan
-    pub auto_scan_enabled: bool,
-    pub auto_scan_tasks: Vec<ScanTaskSpec>,
-    pub auto_scan_interval_seconds: u64,
-    pub auto_scan_input_dir: String,
-    pub auto_scan_extensions: String,
-    pub auto_scan_max_files_per_cycle: usize,
 }
 
 impl ServerConfig {
@@ -210,8 +191,6 @@ impl Default for ServerConfig {
             llm_base_url: "https://api.openai.com/v1".to_string(),
             llm_temperature: 0.0,
             llm_max_tokens: None,
-            llm_enable_thinking: None,
-            llm_timeout_secs: 120,
 
             embedding_model: "text-embedding-3-small".to_string(),
             embedding_dim: 1536,
@@ -223,12 +202,6 @@ impl Default for ServerConfig {
             chunk_size: 1200,
             chunk_overlap_size: 100,
             chunking_method: "token_size".to_string(),
-
-            // Kotlin blueprint defaults for extraction settings; the
-            // gleaning constant is u32 on the core side.
-            entity_extract_max_gleaning:
-                easyrag_core::constants::DEFAULT_MAX_GLEANING as usize,
-            entity_types_guidance: String::new(),
 
             // Same value as the core constant.
             default_top_k: easyrag_core::constants::DEFAULT_TOP_K,
@@ -274,14 +247,6 @@ impl Default for ServerConfig {
             language: "English".to_string(),
             verbose: false,
             log_level: "INFO".to_string(),
-
-            // Background auto-scan defaults: disabled, no tasks, 60s interval.
-            auto_scan_enabled: false,
-            auto_scan_tasks: Vec::new(),
-            auto_scan_interval_seconds: 60,
-            auto_scan_input_dir: String::new(),
-            auto_scan_extensions: ".txt,.md,.pdf".to_string(),
-            auto_scan_max_files_per_cycle: 100,
         }
     }
 }
@@ -310,11 +275,6 @@ mod tests {
         assert_eq!(c.chunk_size, 1200);
         assert_eq!(c.chunk_overlap_size, 100);
         assert_eq!(c.chunking_method, "token_size");
-        assert_eq!(
-            c.entity_extract_max_gleaning,
-            easyrag_core::constants::DEFAULT_MAX_GLEANING as usize
-        );
-        assert_eq!(c.entity_types_guidance, "");
         assert_eq!(c.default_top_k, 40);
         assert_eq!(c.default_mode, "mix");
         assert_eq!(c.llm_max_async, 4);

@@ -1,9 +1,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import Button from '@/components/ui/Button'
-import DocumentContentViewer from '@/components/documents/DocumentContentViewer'
 import { documentApi, type DocumentInfo, type PaginatedResponse } from '@/api/easyrag'
 import { errorMessage } from '@/lib/utils'
-import { UploadIcon, TrashIcon, RefreshCwIcon, FileTextIcon, RotateCcwIcon, RotateCwIcon, EyeIcon } from 'lucide-react'
+import { UploadIcon, TrashIcon, RefreshCwIcon, FileTextIcon, RotateCcwIcon, RotateCwIcon } from 'lucide-react'
 
 export default function DocumentManager() {
   const [documents, setDocuments] = useState<DocumentInfo[]>([])
@@ -17,7 +16,6 @@ export default function DocumentManager() {
   const [retryingDocId, setRetryingDocId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [pipelineStatus, setPipelineStatus] = useState<any>(null)
-  const [viewingDoc, setViewingDoc] = useState<DocumentInfo | null>(null)
 
   const fetchDocuments = useCallback(async () => {
     setIsLoading(true)
@@ -127,11 +125,11 @@ export default function DocumentManager() {
     }
   }
 
-  const handleRetry = async (doc: DocumentInfo) => {
-    setRetryingDocId(doc.id)
+  const handleRetry = async (docId: string) => {
+    setRetryingDocId(docId)
     setError(null)
     try {
-      await documentApi.reprocessDocument(doc.id, doc.bizId)
+      await documentApi.reprocessDocument(docId)
       await fetchDocuments()
       await fetchPipelineStatus()
     } catch (err: any) {
@@ -251,15 +249,8 @@ export default function DocumentManager() {
             ) : (
               documents.map((doc) => (
                 <tr key={doc.id} className="border-b last:border-0 hover:bg-muted/30">
-                  <td className="px-4 py-2 max-w-[300px]">
-                    <button
-                      type="button"
-                      className="block w-full truncate text-left hover:text-primary hover:underline"
-                      title={doc.filePath}
-                      onClick={() => setViewingDoc(doc)}
-                    >
-                      {doc.filePath}
-                    </button>
+                  <td className="px-4 py-2 max-w-[300px] truncate" title={doc.filePath}>
+                    {doc.filePath}
                   </td>
                   <td className="px-4 py-2 text-muted-foreground">
                     {doc.bizId || '-'}
@@ -280,18 +271,9 @@ export default function DocumentManager() {
                       variant="ghost"
                       size="icon"
                       className="size-7"
-                      title="View document content"
-                      onClick={() => setViewingDoc(doc)}
-                    >
-                      <EyeIcon className="size-3.5" />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="size-7"
                       title="Reprocess this document (re-run extraction)"
                       disabled={retryingDocId === doc.id || pipelineStatus?.busy || doc.status === 'processing'}
-                      onClick={() => handleRetry(doc)}
+                      onClick={() => handleRetry(doc.id)}
                     >
                       <RotateCwIcon
                         className={`size-3.5 ${retryingDocId === doc.id ? 'animate-spin' : ''}`}
@@ -342,15 +324,6 @@ export default function DocumentManager() {
           </div>
         </div>
       )}
-
-      {/* Document content preview */}
-      <DocumentContentViewer
-        doc={viewingDoc}
-        open={!!viewingDoc}
-        onOpenChange={(o) => {
-          if (!o) setViewingDoc(null)
-        }}
-      />
     </div>
   )
 }

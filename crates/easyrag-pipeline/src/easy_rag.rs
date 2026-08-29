@@ -37,12 +37,28 @@ use crate::query::{ClaimVerifier, EvidenceScorer, QueryEngine, QueryRouter};
 /// Main EasyRAG class - unified entry point for RAG operations.
 pub struct EasyRAG {
     pub config: EasyRAGConfig,
+    /// Held for API compatibility; query/ingestion carry their
+    /// own clones.
+    #[allow(dead_code)]
+    llm_service: Arc<dyn LlmService>,
+    #[allow(dead_code)]
+    embedding_func: Arc<EmbeddingFunc>,
     vector_storage: Arc<dyn VectorStorage>,
     graph_storage: Arc<dyn GraphStorage>,
     kv_storage: Arc<dyn KVStorage>,
     doc_status_storage: Arc<dyn DocStatusStorage>,
+    #[allow(dead_code)]
+    rerank_service: Option<Arc<dyn RerankService>>,
+    #[allow(dead_code)]
+    chunker: Arc<dyn Chunker>,
+    #[allow(dead_code)]
+    keyword_search: Option<Arc<dyn KeywordSearchable>>,
 
     query_engine: Arc<QueryEngine>,
+    /// Held for API compatibility; ingestion carries its own
+    /// extractor instance.
+    #[allow(dead_code)]
+    entity_extractor: Arc<EntityExtractor>,
     ingestion_pipeline: Arc<IngestionPipeline>,
 
     initialized: AtomicBool,
@@ -59,17 +75,22 @@ impl EasyRAG {
         kv_storage: Arc<dyn KVStorage>,
         doc_status_storage: Arc<dyn DocStatusStorage>,
         rerank_service: Option<Arc<dyn RerankService>>,
+        chunker: Option<Arc<dyn Chunker>>,
         keyword_search: Option<Arc<dyn KeywordSearchable>>,
     ) -> Self {
-        let mut chunker = Arc::new(TokenSizeChunker::new(
-            config.chunk_size,
-            config.chunk_overlap_size,
-        )) as Arc<dyn Chunker>;
+        let chunker = chunker.unwrap_or_else(|| {
+            Arc::new(TokenSizeChunker::new(
+                config.chunk_size,
+                config.chunk_overlap_size,
+            ))
+        });
 
         // Wrap with ContextualChunker if enabled (Feature 4)
-        if config.enable_contextual_chunking {
-            chunker = Arc::new(ContextualChunker::new(Arc::clone(&llm_service), chunker));
-        }
+        let chunker: Arc<dyn Chunker> = if config.enable_contextual_chunking {
+            Arc::new(ContextualChunker::new(Arc::clone(&llm_service), chunker))
+        } else {
+            chunker
+        };
 
         let mut query_engine = QueryEngine::new(
             Arc::clone(&llm_service),
@@ -107,12 +128,22 @@ impl EasyRAG {
         }
         let query_engine = Arc::new(query_engine);
 
+        let mut extractor_config = EntityExtractorConfig::default();
+        extractor_config.language = config.language.clone();
+        extractor_config.entity_types_guidance = config.entity_types_guidance.clone();
+        extractor_config.gleaning_rounds = config.entity_extract_max_gleaning;
+        let entity_extractor = Arc::new(EntityExtractor::new(
+            Arc::clone(&llm_service),
+            Arc::clone(&graph_storage),
+            Arc::clone(&vector_storage),
+            Arc::clone(&kv_storage),
+            extractor_config,
+        ));
+
         let mut pipeline_extractor_config = EntityExtractorConfig::default();
-        pipeline_extractor_config.apply_ingest_settings(
-            config.language.clone(),
-            config.entity_extract_max_gleaning,
-            &config.entity_types_guidance,
-        );
+        pipeline_extractor_config.language = config.language.clone();
+        // `IngestionPipeline` builds its own `EntityExtractor` with
+        // only `language` wired through; gleaning/guidance stay at defaults.
         let mut ingestion_pipeline = IngestionPipeline::new(
             Arc::clone(&llm_service),
             Arc::clone(&kv_storage),
@@ -138,11 +169,17 @@ impl EasyRAG {
 
         Self {
             config,
+            llm_service,
+            embedding_func,
             vector_storage,
             graph_storage,
             kv_storage,
             doc_status_storage,
+            rerank_service,
+            chunker,
+            keyword_search,
             query_engine,
+            entity_extractor,
             ingestion_pipeline,
             initialized: AtomicBool::new(false),
         }
@@ -561,7 +598,6 @@ impl EasyRAG {
                 .get("external_id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
-            biz_id: biz_id.to_string(),
         }))
     }
 

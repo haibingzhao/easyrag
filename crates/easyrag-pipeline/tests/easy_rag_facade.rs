@@ -114,6 +114,7 @@ async fn setup(llm: Arc<dyn LlmService>) -> FacadeEnv {
         doc_status.clone(),
         None,
         None,
+        None,
     ));
     FacadeEnv {
         rag,

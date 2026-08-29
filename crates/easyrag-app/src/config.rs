@@ -86,12 +86,6 @@ pub(crate) fn build_config(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Resu
     config.llm_base_url = env_get(get, "LLM_BINDING_HOST", "https://api.openai.com/v1");
     config.llm_temperature = env_parse(get, "LLM_TEMPERATURE", 0.0f32)?;
     config.llm_max_tokens = Some(env_parse(get, "LLM_MAX_TOKENS", 4096)?);
-    config.llm_timeout_secs = env_parse(get, "LLM_TIMEOUT_SECONDS", 120u64)?;
-    // Only an explicit value reaches the wire; unset keeps the provider default.
-    config.llm_enable_thinking = match get("LLM_ENABLE_THINKING") {
-        Some(v) if !v.trim().is_empty() => Some(env_bool(get, "LLM_ENABLE_THINKING", true)?),
-        _ => None,
-    };
 
     config.embedding_model = env_get(get, "EMBEDDING_MODEL", "text-embedding-3-small");
     config.embedding_api_key = env_get(get, "EMBEDDING_BINDING_API_KEY", "");
@@ -104,15 +98,6 @@ pub(crate) fn build_config(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Resu
     config.chunk_overlap_size = env_parse(get, "CHUNK_OVERLAP", 100)?;
     config.llm_max_async = env_parse(get, "MAX_CONCURRENCY", 4)?;
     config.language = env_get(get, "LANGUAGE", "English");
-
-    // Entity extraction: empty guidance keeps the extractor's built-in
-    // entity-type prompt section.
-    config.entity_extract_max_gleaning = env_parse(
-        get,
-        "ENTITY_EXTRACT_MAX_GLEANING",
-        easyrag_core::constants::DEFAULT_MAX_GLEANING as usize,
-    )?;
-    config.entity_types_guidance = env_get(get, "ENTITY_TYPES_GUIDANCE", "");
     config.default_top_k = env_parse(get, "TOP_K", 40)?;
     config.default_mode = env_get(get, "QUERY_MODE", "mix");
 
@@ -184,11 +169,6 @@ mod tests {
         assert_eq!(config.chunk_overlap_size, 100);
         assert_eq!(config.llm_max_async, 4);
         assert_eq!(config.language, "English");
-        assert_eq!(
-            config.entity_extract_max_gleaning,
-            easyrag_core::constants::DEFAULT_MAX_GLEANING as usize
-        );
-        assert_eq!(config.entity_types_guidance, "");
         assert_eq!(config.default_top_k, 40);
         assert_eq!(config.default_mode, "mix");
         assert!(config.keyword_search_enabled);
@@ -202,29 +182,15 @@ mod tests {
         let mut vars: HashMap<&str, String> = HashMap::new();
         vars.insert("STORAGE_BACKEND", "postgres".into());
         vars.insert("LLM_MODEL", "qwen3.6-flash".into());
-        vars.insert("LLM_TIMEOUT_SECONDS", "300".into());
-        vars.insert("LLM_ENABLE_THINKING", "false".into());
         vars.insert("EMBEDDING_DIM", "1024".into());
         vars.insert("KEYWORD_SEARCH_ENABLED", "false".into());
         vars.insert("PG_PORT", "6432".into());
-        vars.insert("ENTITY_EXTRACT_MAX_GLEANING", "0".into());
-        vars.insert(
-            "ENTITY_TYPES_GUIDANCE",
-            "- Product: software or hardware goods".into(),
-        );
         let config = build_config(&getter(vars)).unwrap();
         assert_eq!(config.storage_type, "postgres");
         assert_eq!(config.llm_model, "qwen3.6-flash");
-        assert_eq!(config.llm_timeout_secs, 300);
-        assert_eq!(config.llm_enable_thinking, Some(false));
         assert_eq!(config.embedding_dim, 1024);
         assert!(!config.keyword_search_enabled);
         assert_eq!(config.pg_port, 6432);
-        assert_eq!(config.entity_extract_max_gleaning, 0);
-        assert_eq!(
-            config.entity_types_guidance,
-            "- Product: software or hardware goods"
-        );
     }
 
     #[test]
