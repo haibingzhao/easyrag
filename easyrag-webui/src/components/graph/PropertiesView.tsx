@@ -1,6 +1,4 @@
-import { useCallback } from 'react'
 import { useGraphStore } from '@/stores/graph'
-import { useSettingsStore } from '@/stores/settings'
 import { ScrollArea } from '@/components/ui/ScrollArea'
 import { Button } from '@/components/ui/Button'
 import { XIcon, ExpandIcon, TrashIcon } from 'lucide-react'
@@ -13,15 +11,11 @@ const PropertiesView = () => {
   const triggerNodeExpand = useGraphStore.use.triggerNodeExpand()
   const triggerNodePrune = useGraphStore.use.triggerNodePrune()
 
-  const getNode = useCallback(
-    (nodeId: string) => rawGraph?.getNode(nodeId) || null,
-    [rawGraph]
-  )
+  // Plain functions: the React compiler memoizes these automatically;
+  // manual useCallback here breaks its memoization preservation.
+  const getNode = (nodeId: string) => rawGraph?.getNode(nodeId) || null
 
-  const getEdge = useCallback(
-    (edgeId: string) => rawGraph?.getEdge(edgeId, true) || null,
-    [rawGraph]
-  )
+  const getEdge = (edgeId: string) => rawGraph?.getEdge(edgeId, true) || null
 
   if (!selectedNode && !selectedEdge) return null
 

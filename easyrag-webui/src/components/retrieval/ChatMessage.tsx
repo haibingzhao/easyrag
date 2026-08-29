@@ -25,7 +25,6 @@ export type MessageWithError = Message & {
 export const ChatMessage = ({
   message,
   isTabActive = true,
-  activeProgress = null,
   isQuerying = false
 }: {
   message: MessageWithError
