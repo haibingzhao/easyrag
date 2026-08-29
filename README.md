@@ -1,5 +1,8 @@
 # EasyRAG
 
+[![CI](https://github.com/haibingzhao/easyrag/actions/workflows/ci.yml/badge.svg)](https://github.com/haibingzhao/easyrag/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 一个用 Rust 从零实现的生产级 RAG（Retrieval-Augmented Generation）知识库检索系统。
 
 - **检索引擎**：向量检索 + 全文检索（RRF 混合排序）+ 知识图谱，支持多路召回
