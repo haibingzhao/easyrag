@@ -135,6 +135,10 @@ const fetchGraph = async (label: string, maxDepth: number, maxNodes: number) => 
 
     for (let i = 0; i < rawData.edges.length; i++) {
       const edge = rawData.edges[i]
+      // Ensure every edge has a stable id: prefer the backend-supplied one,
+      // fall back to a synthetic src↔tgt key to keep `RawEdgeType.id` filled
+      // and the `edgeIdMap` index populated regardless of payload shape.
+      if (!edge.id) edge.id = `${edge.source}::${edge.target}`
       edgeIdMap[edge.id] = i
       const source = nodeIdMap[edge.source]
       const target = nodeIdMap[edge.target]
@@ -284,8 +288,30 @@ const useEasyRagGraph = () => {
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [retryNonce, setRetryNonce] = useState(0)
 
-  // Reset graph when query label is cleared
+  // Reset graph when query label is cleared OR workspace changes.
+  // `useEffect` scope: when switching tenants (e.g. default → easyai) the
+  // old "graph is empty" placeholder + stale fetch signature must be wiped
+  // so the label/knowledge endpoints are re-issued against the new scope.
+  const lastWorkspaceRef = useRef<string>(workspace)
   useEffect(() => {
+    const wsChanged = lastWorkspaceRef.current !== workspace
+    if (wsChanged) {
+      lastWorkspaceRef.current = workspace
+      const state = useGraphStore.getState()
+      state.reset()
+      state.setGraphDataFetchAttempted(false)
+      state.setLabelsFetchAttempted(false)
+      dataLoadedRef.current = false
+      initialLoadRef.current = false
+      emptyDataHandledRef.current = false
+      lastFetchSignatureRef.current = null
+      retryStateRef.current = { signature: '', attempts: 0 }
+      if (retryTimerRef.current !== null) {
+        clearTimeout(retryTimerRef.current)
+        retryTimerRef.current = null
+      }
+      return
+    }
     if (!queryLabel && (rawGraph !== null || sigmaGraph !== null)) {
       const state = useGraphStore.getState()
       state.reset()
@@ -294,7 +320,7 @@ const useEasyRagGraph = () => {
       dataLoadedRef.current = false
       initialLoadRef.current = false
     }
-  }, [queryLabel, rawGraph, sigmaGraph])
+  }, [workspace, queryLabel, rawGraph, sigmaGraph])
 
   // Graph data fetching logic
   useEffect(() => {

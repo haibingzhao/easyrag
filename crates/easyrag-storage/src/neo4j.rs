@@ -446,6 +446,22 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
         format!("`{}`", self.workspace)
     }
 
+    /// Node label + biz-line scope fragment for Cypher MATCH: `` `ws` ``
+    /// (read-path wildcard when `biz_id` is empty — lists every biz line of
+    /// the workspace) or `` `ws` {biz_id: $biz} `` (exact biz line). Mirrors
+    /// `PgDocStatusStorage::list_scope_clause`: an empty biz_id is the
+    /// read-path wildcard, never a literal match against the empty string.
+    /// Write paths and single-node reads must NOT route through this helper
+    /// — they keep the exact scope.
+    fn node_scope(&self, biz_id: &str) -> String {
+        let ws = self.ws_label();
+        if biz_id.is_empty() {
+            ws
+        } else {
+            format!("{ws} {{biz_id: $biz}}")
+        }
+    }
+
     /// Fulltext index name (sanitized for Neo4j symbolic name rules).
     /// Derived per workspace; biz isolation comes from the `node.biz_id`
     /// post-filter applied on search results.
@@ -566,13 +582,16 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
     }
 
     async fn get_full_graph(&self, max_nodes: usize, biz_id: &str) -> easyrag_core::Result<KnowledgeGraph> {
-        let ws = self.ws_label();
+        // Read-path: empty biz_id lists every biz line of the workspace
+        // (see `node_scope`); the $biz param is still passed for the
+        // non-wildcard branch.
+        let node = self.node_scope(biz_id);
         // Effective LIMIT (guarded against 0 so is_truncated stays truthful).
         let limit = max_nodes.max(1);
         let node_records = self
             .db
             .run(
-                &format!("MATCH (n:{ws} {{biz_id: $biz}}) RETURN n LIMIT $limit"),
+                &format!("MATCH (n:{node}) RETURN n LIMIT $limit"),
                 Self::biz_params_with(biz_id, &[("limit", JsonValue::from(limit as i64))]),
             )
             .await?;
@@ -592,7 +611,7 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
             .db
             .run(
                 &format!(
-                    "MATCH (a:{ws} {{biz_id: $biz}})-[r:DIRECTED]->(b:{ws} {{biz_id: $biz}}) \
+                    "MATCH (a:{node})-[r:DIRECTED]->(b:{node}) \
                      RETURN a.entity_id AS src, b.entity_id AS tgt, r LIMIT $limit"
                 ),
                 Self::biz_params_with(biz_id, &[(
@@ -634,15 +653,27 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
         let safe_depth = max_depth.clamp(1, 10);
         let safe_max_nodes = max_nodes.clamp(1, 10_000);
         let ws = self.ws_label();
+        // Read-path wildcard: an empty biz_id expands across every biz line
+        // of the workspace (drops the biz_id predicate instead of matching
+        // the literal empty string). See `node_scope`.
+        let start_map = if biz_id.is_empty() {
+            "{entity_id: $label}".to_string()
+        } else {
+            "{entity_id: $label, biz_id: $biz}".to_string()
+        };
+        let biz_where = if biz_id.is_empty() {
+            String::new()
+        } else {
+            "WHERE n.biz_id = $biz ".to_string()
+        };
         // BFS-style expansion using variable-length path
         let records = self
             .db
             .run(
                 &format!(
-                    "MATCH path = (start:{ws} {{entity_id: $label, biz_id: $biz}})-[:DIRECTED*0..{safe_depth}]-(connected:{ws}) \
+                    "MATCH path = (start:{ws} {start_map})-[:DIRECTED*0..{safe_depth}]-(connected:{ws}) \
                      UNWIND nodes(path) AS n \
-                     WHERE n.biz_id = $biz \
-                     WITH DISTINCT n LIMIT $maxNodes \
+                     {biz_where}WITH DISTINCT n LIMIT $maxNodes \
                      RETURN n"
                 ),
                 Self::biz_params_with(biz_id, &[
@@ -676,12 +707,18 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
             .iter()
             .map(|n| JsonValue::String(n.id.clone()))
             .collect();
+        let a_map = if biz_id.is_empty() {
+            "{entity_id: srcId}".to_string()
+        } else {
+            "{entity_id: srcId, biz_id: $biz}".to_string()
+        };
+        let b_scope = self.node_scope(biz_id);
         let edge_records = self
             .db
             .run(
                 &format!(
                     "UNWIND $ids AS srcId \
-                     MATCH (a:{ws} {{entity_id: srcId, biz_id: $biz}})-[r:DIRECTED]-(b:{ws} {{biz_id: $biz}}) \
+                     MATCH (a:{ws} {a_map})-[r:DIRECTED]-(b:{b_scope}) \
                      WHERE b.entity_id IN $ids \
                      RETURN DISTINCT a.entity_id AS src, b.entity_id AS tgt, r"
                 ),
@@ -1095,10 +1132,11 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
     }
 
     async fn get_all_nodes(&self, biz_id: &str) -> easyrag_core::Result<Vec<JsonMap>> {
-        let ws = self.ws_label();
+        // Read-path wildcard: empty biz_id lists every biz line (node_scope).
+        let node = self.node_scope(biz_id);
         let records = self
             .db
-            .run(&format!("MATCH (n:{ws} {{biz_id: $biz}}) RETURN n"), Self::biz_params(biz_id))
+            .run(&format!("MATCH (n:{node}) RETURN n"), Self::biz_params(biz_id))
             .await?;
         Ok(records
             .iter()
@@ -1108,12 +1146,12 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
     }
 
     async fn get_all_edges(&self, biz_id: &str) -> easyrag_core::Result<Vec<JsonMap>> {
-        let ws = self.ws_label();
+        let node = self.node_scope(biz_id);
         let records = self
             .db
             .run(
                 &format!(
-                    "MATCH (a:{ws} {{biz_id: $biz}})-[r:DIRECTED]->(b:{ws} {{biz_id: $biz}}) \
+                    "MATCH (a:{node})-[r:DIRECTED]->(b:{node}) \
                      RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props"
                 ),
                 Self::biz_params(biz_id),
@@ -1141,12 +1179,12 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
     }
 
     async fn get_popular_labels(&self, limit: usize, biz_id: &str) -> easyrag_core::Result<Vec<String>> {
-        let ws = self.ws_label();
+        let node = self.node_scope(biz_id);
         let records = self
             .db
             .run(
                 &format!(
-                    "MATCH (n:{ws} {{biz_id: $biz}})-[r:DIRECTED]-() \
+                    "MATCH (n:{node})-[r:DIRECTED]-() \
                      RETURN n.entity_id AS label, count(r) AS degree \
                      ORDER BY degree DESC LIMIT $limit"
                 ),
@@ -1157,8 +1195,15 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
     }
 
     async fn search_labels(&self, query: &str, limit: usize, biz_id: &str) -> easyrag_core::Result<Vec<String>> {
-        let ws = self.ws_label();
         let ftn = self.fulltext_index_name();
+        // Read-path wildcard: an empty biz_id drops the biz post-filter so
+        // search spans every biz line of the workspace.
+        let biz_pred = if biz_id.is_empty() {
+            String::new()
+        } else {
+            " AND node.biz_id = $biz".to_string()
+        };
+        let node = self.node_scope(biz_id);
         let params = Self::biz_params_with(biz_id, &[
             ("query", JsonValue::String(query.to_string())),
             ("limit", JsonValue::from(limit as i64)),
@@ -1168,13 +1213,13 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
         ]);
         // Try fulltext index first, fallback to CONTAINS. Both paths apply
         // the biz_id post-filter (fulltext indexes cannot be partitioned by
-        // property at creation time).
+        // property at creation time); the filter is dropped on wildcard read.
         match self
             .db
             .run(
                 &format!(
                     "CALL db.index.fulltext.queryNodes({ftn}, $query) \
-                     YIELD node WHERE $ws IN labels(node) AND node.biz_id = $biz \
+                     YIELD node WHERE $ws IN labels(node){biz_pred} \
                      RETURN node.entity_id AS label LIMIT $limit"
                 ),
                 params.clone(),
@@ -1188,7 +1233,7 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
                     .db
                     .run(
                         &format!(
-                            "MATCH (n:{ws} {{biz_id: $biz}}) WHERE n.entity_id CONTAINS $query \
+                            "MATCH (n:{node}) WHERE n.entity_id CONTAINS $query \
                              RETURN n.entity_id AS label LIMIT $limit"
                         ),
                         params,

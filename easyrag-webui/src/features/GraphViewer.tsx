@@ -57,13 +57,23 @@ const GraphViewer = () => {
   const graphEdgeCount = useGraphStore.use.graphEdgeCount()
   const showNodeSearchBar = useSettingsStore.use.showNodeSearchBar()
   const showPropertyPanel = useSettingsStore.use.showPropertyPanel()
+  const workspace = useSettingsStore.use.workspace()
   const isDarkTheme = useIsDarkMode()
   const [graphStats, setGraphStats] = useState<{ node_count: number; edge_count: number } | null>(null)
 
-  // Fetch graph stats
+  // Refresh stats on mount and whenever workspace changes.
   useEffect(() => {
-    graphApi.getStats().then(setGraphStats).catch(() => {})
-  }, [])
+    let cancelled = false
+    graphApi
+      .getStats()
+      .then((s) => {
+        if (!cancelled) setGraphStats(s)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [workspace])
 
   const handleRefresh = useCallback(() => {
     graphApi.getStats().then(setGraphStats).catch(() => {})

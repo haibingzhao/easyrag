@@ -2036,6 +2036,17 @@ impl<D: PgDb> PgDocStatusStorage<D> {
         scope_filter(&self.workspace, biz_id)
     }
 
+    /// List/count scope: an empty biz_id is the read-path wildcard matching
+    /// every biz line of the workspace. Single-document reads and writes keep
+    /// the exact scope (status writes must never land on the wrong biz line).
+    fn list_scope_clause(&self, biz_id: &str) -> String {
+        if biz_id.is_empty() {
+            format!("workspace = '{}'", sql_escape(&self.workspace))
+        } else {
+            self.scope_clause(biz_id)
+        }
+    }
+
     fn ops(&self, biz_id: &str) -> PgCrudOps<'_, D> {
         PgCrudOps {
             db: &self.db,
@@ -2096,6 +2107,11 @@ impl<D: PgDb> PgDocStatusStorage<D> {
             content_hash: get_opt_str("content_hash"),
             has_structure: content.get("has_structure").and_then(|v| v.as_bool()) == Some(true),
             external_id: get_opt_str("external_id"),
+            biz_id: row
+                .get("biz_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
         }
     }
 
@@ -2105,9 +2121,9 @@ impl<D: PgDb> PgDocStatusStorage<D> {
         biz_id: &str,
     ) -> easyrag_core::Result<HashMap<String, DocProcessingStatus>> {
         let sql = format!(
-            "SELECT id, content, status, created_at, updated_at FROM {} WHERE {}{}",
+            "SELECT id, biz_id, content, status, created_at, updated_at FROM {} WHERE {}{}",
             self.table_name,
-            self.scope_clause(biz_id),
+            self.list_scope_clause(biz_id),
             condition
         );
         let rows = self.db.fetch_all(&sql).await?;
@@ -2283,7 +2299,7 @@ impl<D: PgDb> DocStatusStorage for PgDocStatusStorage<D> {
         let sql = format!(
             "SELECT status, COUNT(*) as cnt FROM {} WHERE {} GROUP BY status",
             self.table_name,
-            self.scope_clause(biz_id)
+            self.list_scope_clause(biz_id)
         );
         let rows = self.db.fetch_all(&sql).await?;
         let mut result = HashMap::new();
@@ -2376,7 +2392,7 @@ impl<D: PgDb> DocStatusStorage for PgDocStatusStorage<D> {
         let count_sql = format!(
             "SELECT COUNT(*) as cnt FROM {} WHERE {}{}",
             self.table_name,
-            self.scope_clause(biz_id),
+            self.list_scope_clause(biz_id),
             condition
         );
         let count_row = self.db.fetch_one(&count_sql).await?;
@@ -2398,12 +2414,12 @@ impl<D: PgDb> DocStatusStorage for PgDocStatusStorage<D> {
         };
 
         let sql = format!(
-            "SELECT id, content, status, created_at, updated_at FROM {t}
+            "SELECT id, biz_id, content, status, created_at, updated_at FROM {t}
              WHERE {scope}{condition}
              ORDER BY {safe_sort_field} {safe_sort_dir}
              LIMIT {page_size} OFFSET {offset}",
             t = self.table_name,
-            scope = self.scope_clause(biz_id)
+            scope = self.list_scope_clause(biz_id)
         );
         let rows = self.db.fetch_all(&sql).await?;
         let results = rows

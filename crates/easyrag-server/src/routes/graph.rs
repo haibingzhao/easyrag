@@ -50,6 +50,25 @@ async fn scoped_bundle(
     Ok((resolved.context.bundle, resolved.biz_id))
 }
 
+/// Read-path scope: resolve (workspace, biz_id), then — when biz_id was
+/// omitted/blank — blank it out so the storage layer treats it as a
+/// wildcard across every biz line of the workspace (mirrors the documents
+/// list endpoint's read-scope behavior). Write paths and single-node reads
+/// must use `scoped_bundle` to keep their exact (workspace, biz_id) scope:
+/// status writes landing on the wrong biz line would create ghost rows.
+async fn read_bundle(
+    state: &AppServices,
+    workspace: Option<&str>,
+    biz_id: Option<&str>,
+) -> AppResult<(StorageBundle, String)> {
+    let mut resolved = state.workspace_resolver.resolve(workspace, biz_id).await?;
+    let explicit = biz_id.map(str::trim).filter(|b| !b.is_empty());
+    if explicit.is_none() {
+        resolved.biz_id = String::new();
+    }
+    Ok((resolved.context.bundle, resolved.biz_id))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateEntityRequest {
@@ -195,7 +214,7 @@ struct ScopeQuery {
 
 async fn all_labels(state: AppState, Query(q): Query<LabelsQuery>) -> AppResult<Json<Value>> {
     let limit = q.limit.unwrap_or(300);
-    let (bundle, biz_id) = scoped_bundle(&state, q.workspace.as_deref(), q.biz_id.as_deref()).await?;
+    let (bundle, biz_id) = read_bundle(&state, q.workspace.as_deref(), q.biz_id.as_deref()).await?;
     let labels = bundle.graph_storage.get_popular_labels(limit, &biz_id).await?;
     let total = labels.len();
     Ok(Json(json!({ "labels": labels, "total": total })))
@@ -203,7 +222,7 @@ async fn all_labels(state: AppState, Query(q): Query<LabelsQuery>) -> AppResult<
 
 async fn search_labels(state: AppState, Query(q): Query<SearchQuery>) -> AppResult<Json<Value>> {
     let limit = q.limit.unwrap_or(50);
-    let (bundle, biz_id) = scoped_bundle(&state, q.workspace.as_deref(), q.biz_id.as_deref()).await?;
+    let (bundle, biz_id) = read_bundle(&state, q.workspace.as_deref(), q.biz_id.as_deref()).await?;
     let labels = bundle.graph_storage.search_labels(&q.query, limit, &biz_id).await?;
     let total = labels.len();
     Ok(Json(json!({ "labels": labels, "total": total })))
@@ -216,36 +235,14 @@ async fn knowledge_graph(
     let node_label = q.node_label.unwrap_or_else(|| "*".to_string());
     let max_depth = q.max_depth.unwrap_or(3);
     let max_nodes = q.max_nodes.unwrap_or(1000);
-    let (bundle, biz_id) = scoped_bundle(&state, q.workspace.as_deref(), q.biz_id.as_deref()).await?;
+    let (bundle, biz_id) = read_bundle(&state, q.workspace.as_deref(), q.biz_id.as_deref()).await?;
     let kg = bundle
         .graph_storage
         .get_knowledge_graph(Some(&node_label), max_depth, max_nodes, &biz_id)
         .await?;
-    let nodes: Vec<Value> = kg
-        .nodes
-        .iter()
-        .map(|n| {
-            json!({
-                "id": n.id,
-                "labels": n.labels,
-                "properties": n.properties,
-            })
-        })
-        .collect();
-    let edges: Vec<Value> = kg
-        .edges
-        .iter()
-        .map(|e| {
-            json!({
-                "source": e.source,
-                "target": e.target,
-                "properties": e.properties,
-            })
-        })
-        .collect();
     Ok(Json(json!({
-        "nodes": nodes,
-        "edges": edges,
+        "nodes": kg.nodes,
+        "edges": kg.edges,
         "is_truncated": kg.is_truncated,
     })))
 }
@@ -275,7 +272,7 @@ async fn get_node(
 }
 
 async fn stats(state: AppState, Query(q): Query<ScopeQuery>) -> AppResult<Json<Value>> {
-    let (bundle, biz_id) = scoped_bundle(&state, q.workspace.as_deref(), q.biz_id.as_deref()).await?;
+    let (bundle, biz_id) = read_bundle(&state, q.workspace.as_deref(), q.biz_id.as_deref()).await?;
     let all_nodes = bundle.graph_storage.get_all_nodes(&biz_id).await?;
     let all_edges = bundle.graph_storage.get_all_edges(&biz_id).await?;
     Ok(Json(json!({

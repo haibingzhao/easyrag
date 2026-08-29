@@ -43,6 +43,7 @@ pub fn router() -> Router<Arc<AppServices>> {
             get(get_document).delete(delete_document),
         )
         .route("/api/documents/{docId}/index", post(index_document))
+        .route("/api/documents/{docId}/reprocess", post(reprocess_document))
         .route("/api/documents/batch_delete", post(batch_delete_documents))
         .route("/api/documents/pipeline_status", get(pipeline_status))
         .route("/api/documents/status_counts", get(status_counts))
@@ -222,6 +223,24 @@ async fn query_scope(state: &AppServices, q: &ScopeQuery) -> AppResult<ResolvedS
         .workspace_resolver
         .resolve(q.workspace.as_deref(), q.biz_id.as_deref())
         .await
+}
+
+/// Read-path scope: an omitted/blank `bizId` selects every biz line of the
+/// workspace (empty-string wildcard understood by the list/count storage
+/// methods), so multi-biz workspaces keep their documents visible. Never
+/// route writes through this helper — status writes must carry the real
+/// per-document biz line.
+async fn read_scope(state: &AppServices, q: &ScopeQuery) -> AppResult<ResolvedScope> {
+    let mut scope = query_scope(state, q).await?;
+    let explicit = q
+        .biz_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
+    if explicit.is_none() {
+        scope.biz_id = String::new();
+    }
+    Ok(scope)
 }
 
 /// P2.16 pipeline concurrency guard: 409 while the pipeline is busy.
@@ -430,10 +449,19 @@ async fn list_documents(
         Some(s) => Some(DocStatus::from_value(s)?),
         None => None,
     };
-    let resolved = state
+    let mut resolved = state
         .workspace_resolver
         .resolve(query.workspace.as_deref(), query.biz_id.as_deref())
         .await?;
+    // Read path: blank bizId lists every biz line of the workspace.
+    let explicit = query
+        .biz_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
+    if explicit.is_none() {
+        resolved.biz_id = String::new();
+    }
     let (docs, total) = resolved
         .context
         .bundle
@@ -463,6 +491,7 @@ async fn list_documents(
                 "chunksCount": doc.chunks_count,
                 "externalId": doc.external_id,
                 "hasStructure": doc.has_structure,
+                "bizId": doc.biz_id,
             })
         })
         .collect();
@@ -508,6 +537,28 @@ async fn get_by_external_id(
 /// R6: index a single document asynchronously, bypassing the global
 /// pipeline queue.
 async fn index_document(
+    state: AppState,
+    AxumPath(doc_id): AxumPath<String>,
+    Query(query): Query<WorkspaceQuery>,
+) -> AppResult<Json<Value>> {
+    let (ops, biz_id) =
+        ops_for(&state, query.workspace.as_deref(), query.biz_id.as_deref()).await?;
+    let result = state
+        .lifecycle_service
+        .index_single_document(&doc_id, &ops, &biz_id)
+        .await?;
+    Ok(Json(result))
+}
+
+/// Reprocess a single failed/pending document by id. The caller must pass the
+/// `bizId` the document belongs to (echoed by `/api/documents/list`): doc ids
+/// are content-derived and can repeat across biz lines, and every status write
+/// is scoped by (workspace, biz_id) — writing with the server-default biz_id
+/// would create a ghost status row instead of resetting the real one.
+/// `index_single_document` guards the whole flow: 404 when the KV content is
+/// missing under this scope, then an atomic claim (pending/failed ->
+/// processing) whose storage-level UPDATE can never insert new rows.
+async fn reprocess_document(
     state: AppState,
     AxumPath(doc_id): AxumPath<String>,
     Query(query): Query<WorkspaceQuery>,
@@ -575,8 +626,10 @@ async fn pipeline_status(
     state: AppState,
     Query(q): Query<ScopeQuery>,
 ) -> AppResult<Json<Value>> {
-    let scope = query_scope(&state, &q).await?;
-    let counts = state
+    let scope = read_scope(&state, &q).await?;
+    let counts = scope
+        .context
+        .bundle
         .doc_status_storage
         .get_status_counts(&scope.biz_id)
         .await?;
@@ -587,8 +640,10 @@ async fn status_counts(
     state: AppState,
     Query(q): Query<ScopeQuery>,
 ) -> AppResult<Json<Value>> {
-    let scope = query_scope(&state, &q).await?;
-    let counts = state
+    let scope = read_scope(&state, &q).await?;
+    let counts = scope
+        .context
+        .bundle
         .doc_status_storage
         .get_all_status_counts(&scope.biz_id)
         .await?;
@@ -635,12 +690,17 @@ async fn track_status(
     })))
 }
 
-async fn reprocess_failed(state: AppState) -> AppResult<Json<Value>> {
-    let scope = default_scope(&state).await?;
-    let biz_id = scope.biz_id;
-    let failed_docs = state
-        .doc_status_storage
-        .get_docs_by_status(DocStatus::Failed, &biz_id)
+async fn reprocess_failed(
+    state: AppState,
+    Query(q): Query<ScopeQuery>,
+) -> AppResult<Json<Value>> {
+    // Wildcard read: collect failed rows across every biz line of the
+    // workspace, then reset each row under its own biz_id — an upsert with
+    // the wrong line would create a ghost row instead of resetting this one.
+    let scope = read_scope(&state, &q).await?;
+    let doc_status_storage = &scope.context.bundle.doc_status_storage;
+    let failed_docs = doc_status_storage
+        .get_docs_by_status(DocStatus::Failed, &scope.biz_id)
         .await?;
     if failed_docs.is_empty() {
         return Ok(Json(json!({
@@ -651,16 +711,26 @@ async fn reprocess_failed(state: AppState) -> AppResult<Json<Value>> {
     }
     // Reset failed docs to pending.
     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
-    for doc_id in failed_docs.keys() {
+    for (doc_id, doc) in failed_docs.iter() {
+        let biz_id = if !doc.biz_id.is_empty() {
+            doc.biz_id.clone()
+        } else if !scope.biz_id.is_empty() {
+            scope.biz_id.clone()
+        } else {
+            tracing::warn!("Skipping failed doc {doc_id}: no biz line recorded");
+            continue;
+        };
         let mut update = JsonMap::new();
         update.insert("status".into(), json!("pending"));
         update.insert("updated_at".into(), json!(now));
         update.insert("error_msg".into(), Value::Null);
         let mut data = HashMap::new();
         data.insert(doc_id.clone(), update);
-        state.doc_status_storage.upsert(data, &biz_id).await?;
+        doc_status_storage.upsert(data, &biz_id).await?;
     }
-    spawn_pipeline(Arc::clone(&state.pipeline), biz_id);
+    // Empty biz_id starts a wildcard pipeline run; per-document biz lines
+    // are resolved inside run_pipeline.
+    spawn_pipeline(Arc::clone(&state.pipeline), scope.biz_id);
     Ok(Json(json!({
         "status": "success",
         "message": format!("Reprocessing {} failed documents", failed_docs.len()),

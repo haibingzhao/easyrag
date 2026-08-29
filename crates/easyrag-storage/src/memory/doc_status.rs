@@ -110,6 +110,7 @@ fn map_to_doc_status(doc: &JsonMap) -> DocProcessingStatus {
             .get("external_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        biz_id: record_biz(doc).unwrap_or_default().to_string(),
     }
 }
 
@@ -233,7 +234,8 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
             .data
             .lock()
             .values()
-            .filter(|doc| record_biz(doc) == Some(biz_id))
+            // Empty biz_id is the read-path wildcard: count every biz line.
+            .filter(|doc| biz_id.is_empty() || record_biz(doc) == Some(biz_id))
         {
             let status = doc
                 .get("status")
@@ -254,7 +256,7 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
         Ok(data
             .iter()
             .filter(|(_, doc)| {
-                record_biz(doc) == Some(biz_id)
+                (biz_id.is_empty() || record_biz(doc) == Some(biz_id))
                     && doc.get("status").and_then(|v| v.as_str()) == Some(status.value())
             })
             .map(|(id, doc)| (id.clone(), map_to_doc_status(doc)))
@@ -271,7 +273,7 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
         Ok(data
             .iter()
             .filter(|(_, doc)| {
-                record_biz(doc) == Some(biz_id)
+                (biz_id.is_empty() || record_biz(doc) == Some(biz_id))
                     && doc
                         .get("status")
                         .and_then(|v| v.as_str())
@@ -291,7 +293,7 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
         Ok(data
             .iter()
             .filter(|(_, doc)| {
-                record_biz(doc) == Some(biz_id)
+                (biz_id.is_empty() || record_biz(doc) == Some(biz_id))
                     && doc.get("track_id").and_then(|v| v.as_str()) == Some(track_id)
             })
             .map(|(id, doc)| (id.clone(), map_to_doc_status(doc)))
@@ -315,7 +317,8 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
         let mut filtered: Vec<(String, &JsonMap)> = data
             .iter()
             .filter(|(_, doc)| {
-                let biz_ok = record_biz(doc) == Some(biz_id);
+                // Empty biz_id is the read-path wildcard: list every biz line.
+                let biz_ok = biz_id.is_empty() || record_biz(doc) == Some(biz_id);
                 let status_ok = filter_values.as_ref().map_or(true, |values| {
                     doc.get("status")
                         .and_then(|v| v.as_str())
