@@ -1,0 +1,38 @@
+[package]
+name = "easyrag-server"
+description = "HTTP/SSE server for EasyRAG: axum routes, DTOs, SSE streaming, Ollama-compatible endpoints"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+easyrag-core = { workspace = true }
+easyrag-pipeline = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+async-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+mime = { workspace = true }
+mime_guess = { workspace = true }
+jsonwebtoken = { workspace = true }
+bcrypt = { workspace = true }
+moka = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+easyrag-storage = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
+tempfile = { workspace = true }
+tokio-test = "0.4"

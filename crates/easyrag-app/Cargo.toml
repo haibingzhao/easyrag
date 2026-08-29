@@ -1,0 +1,38 @@
+[package]
+name = "easyrag-app"
+description = "EasyRAG application entrypoint: config loading, storage assembly matrix, axum serve, webui static hosting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "easyrag"
+path = "src/main.rs"
+
+[dependencies]
+easyrag-core = { workspace = true }
+# Enable every production storage backend so the AppConfig assembly matrix
+# (postgres / neo4j / tantivy keyword) has its modules compiled in.
+easyrag-storage = { workspace = true, features = ["postgres", "neo4j", "tantivy-backend"] }
+easyrag-llm = { workspace = true }
+easyrag-pipeline = { workspace = true }
+easyrag-server = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+mime_guess = { workspace = true }
+percent-encoding = { workspace = true }
+regex = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+futures = { workspace = true }

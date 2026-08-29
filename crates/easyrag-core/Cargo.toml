@@ -1,0 +1,27 @@
+[package]
+name = "easyrag-core"
+description = "EasyRAG core: domain models, storage/LLM traits, utilities, prompts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+regex = { workspace = true }
+md-5 = { workspace = true }
+hex = { workspace = true }
+once_cell = { workspace = true }
+tiktoken-rs = { workspace = true }
+dashmap = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

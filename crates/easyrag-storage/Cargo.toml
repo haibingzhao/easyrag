@@ -1,0 +1,41 @@
+[package]
+name = "easyrag-storage"
+description = "Storage backends for EasyRAG: in-memory, JSON file, PostgreSQL (pgvector), Neo4j, tantivy keyword index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+easyrag-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+sqlx = { workspace = true, optional = true }
+pgvector = { workspace = true, optional = true }
+neo4rs = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+tantivy = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serial_test = { workspace = true }
+tokio-test = "0.4"
+sqlx = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+default = ["memory", "json"]
+memory = []
+json = []
+postgres = ["dep:sqlx", "dep:pgvector"]
+neo4j = ["dep:neo4rs", "dep:futures"]
+tantivy-backend = ["dep:tantivy"]

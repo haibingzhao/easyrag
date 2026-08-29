@@ -1,0 +1,38 @@
+[package]
+name = "easyrag-pipeline"
+description = "RAG pipeline for EasyRAG: parsers, chunkers, ingestion, entity extraction, query engine, multimodal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+easyrag-core = { workspace = true }
+easyrag-storage = { workspace = true }
+easyrag-llm = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+async-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+once_cell = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+base64 = { workspace = true }
+md-5 = { workspace = true }
+moka = { workspace = true }
+pdf-extract = { workspace = true }
+calamine = { workspace = true }
+zip = { workspace = true }
+quick-xml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serial_test = { workspace = true }
+tokio-test = "0.4"

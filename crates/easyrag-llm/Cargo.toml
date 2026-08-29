@@ -1,0 +1,26 @@
+[package]
+name = "easyrag-llm"
+description = "LLM clients for EasyRAG: OpenAI-compatible, Ollama, rerank, response cache, role routing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+easyrag-core = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+async-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+moka = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tokio-test = "0.4"

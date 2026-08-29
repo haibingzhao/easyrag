@@ -1,0 +1,98 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/easyrag-core",
+    "crates/easyrag-storage",
+    "crates/easyrag-llm",
+    "crates/easyrag-pipeline",
+    "crates/easyrag-server",
+    "crates/easyrag-app",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/haibingzhao/easyrag"
+description = "Production-grade RAG knowledge base system: hybrid retrieval (vector + full-text + knowledge graph), pluggable storage backends, multi-tenant, with a built-in Web UI"
+# Trait upcasting (supertrait dyn-object coercion, used to call
+# StorageNameSpace::drop through sub-trait objects) stabilized in 1.86.
+rust-version = "1.86"
+
+[workspace.dependencies]
+# Internal crates
+easyrag-core = { path = "crates/easyrag-core" }
+easyrag-storage = { path = "crates/easyrag-storage" }
+easyrag-llm = { path = "crates/easyrag-llm" }
+easyrag-pipeline = { path = "crates/easyrag-pipeline" }
+easyrag-server = { path = "crates/easyrag-server" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+regex = "1"
+once_cell = "1"
+dashmap = "6"
+md-5 = "0.10"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+hex = "0.4"
+base64 = "0.22"
+parking_lot = "0.12"
+tiktoken-rs = "0.6"
+percent-encoding = "2"
+
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+axum = { version = "0.8", features = ["multipart", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "trace", "limit"] }
+mime = "0.3"
+mime_guess = "2"
+
+# Auth / config
+jsonwebtoken = "9"
+bcrypt = "0.17"
+dotenvy = "0.15"
+
+# Cache
+moka = { version = "0.12", features = ["future"] }
+
+# Storage backends
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "json", "chrono"] }
+pgvector = { version = "0.4", features = ["sqlx"] }
+neo4rs = "0.8"
+tantivy = "0.22"
+
+# Document parsing
+pdf-extract = "0.7"
+calamine = "0.26"
+zip = "2"
+quick-xml = "0.37"
+scraper = "0.22"
+
+# Testing
+wiremock = "0.6"
+tempfile = "3"
+serial_test = "3"
+
+[profile.release]
+lto = "thin"
