@@ -210,6 +210,10 @@ impl StructureAgentStrategy {
                     reasoning: assistant_content.clone(),
                 });
 
+                // TOOL_RESULT_PREFIX contract: ToolCallingLlmService clients
+                // (openai.rs / ollama.rs) detect this exact prefix to convert
+                // User messages into API-native tool result messages. Do NOT
+                // change this format without updating those implementations.
                 messages.push(ChatMessage {
                     role: MessageRole::User,
                     content: format!("[Tool Result: {}]\n{}", tool_call.name, result),

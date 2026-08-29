@@ -600,11 +600,22 @@ impl IngestionPipeline {
 
         let semaphore = Arc::new(Semaphore::new(self.max_concurrency.max(1)));
         let mut tasks = Vec::with_capacity(pending_docs.len());
-        for doc_id in pending_docs.keys() {
+        for (doc_id, doc_status) in pending_docs.iter() {
             let pipeline = Arc::clone(self);
             let semaphore = Arc::clone(&semaphore);
             let doc_id = doc_id.clone();
-            let biz_id = biz_id.to_string();
+            // Per-document biz line: a wildcard run (empty biz_id) matches every
+            // line, so each document must be read and written under its own line.
+            // Never fall through to an empty biz_id — writing with one would
+            // create a ghost status row keyed (id, workspace, '').
+            let biz_id = if !doc_status.biz_id.is_empty() {
+                doc_status.biz_id.clone()
+            } else if !biz_id.is_empty() {
+                biz_id.to_string()
+            } else {
+                tracing::warn!("Skipping pending doc {doc_id}: no biz line recorded");
+                continue;
+            };
             tasks.push(async move {
                 if pipeline.cancel_requested.load(Ordering::SeqCst) {
                     return;

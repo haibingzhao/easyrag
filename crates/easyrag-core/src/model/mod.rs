@@ -5,6 +5,7 @@ pub mod document_structure;
 pub mod evaluation;
 pub mod query_param;
 pub mod query_result;
+pub mod scan_task;
 pub mod types;
 pub mod verification;
 
@@ -17,6 +18,7 @@ pub use evaluation::{
 };
 pub use query_param::{QueryParam, QueryMode};
 pub use query_result::{QueryContextResult, QueryResult, TextChunk};
+pub use scan_task::{ScanCycleStats, ScanPosition, ScanTaskKind, ScanTaskSpec};
 pub use types::{
     EntityExtractionResult, ExtractedEntity, ExtractedRelationship, KnowledgeGraph,
     KnowledgeGraphEdge, KnowledgeGraphNode,

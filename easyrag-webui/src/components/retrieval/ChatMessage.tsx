@@ -1,12 +1,6 @@
-import { ReactNode, useMemo, useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { cn } from '@/lib/utils'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import remarkMath from 'remark-math'
-import rehypeRaw from 'rehype-raw'
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
-import { oneLight, oneDark } from 'react-syntax-highlighter/dist/cjs/styles/prism'
-import useTheme from '@/hooks/useTheme'
+import Markdown from '@/components/markdown/Markdown'
 import { LoaderIcon, ClockIcon, ZapIcon, ChevronRightIcon } from 'lucide-react'
 
 export interface Message {
@@ -38,7 +32,6 @@ export const ChatMessage = ({
   activeProgress?: string | null
   isQuerying?: boolean
 }) => {
-  const { theme } = useTheme()
   const { thinkingContent, displayContent, thinkingTime, responseTime, firstTokenTime, isThinking } = message
 
   const hasThinking = !!thinkingContent && thinkingContent.trim() !== ''
@@ -77,40 +70,6 @@ export const ChatMessage = ({
       </div>
     ) : null
 
-  const markdownComponents = useMemo(() => ({
-    code: (props: any) => {
-      const { inline, className, children, ...restProps } = props
-      const match = /language-(\w+)/.exec(className || '')
-      const language = match ? match[1] : undefined
-      const contentStr = String(children || '').replace(/\n$/, '')
-
-      if (!inline && language) {
-        return (
-          <SyntaxHighlighter
-            style={theme === 'dark' ? oneDark : oneLight}
-            PreTag="div"
-            language={language}
-            {...restProps}
-          >
-            {contentStr}
-          </SyntaxHighlighter>
-        )
-      }
-      return (
-        <code className="mx-1 rounded-sm bg-muted px-1 py-0.5 font-mono text-sm" {...restProps}>
-          {children}
-        </code>
-      )
-    },
-    p: ({ children }: { children?: ReactNode }) => <div className="my-2">{children}</div>,
-    h1: ({ children }: { children?: ReactNode }) => <h1 className="text-xl font-bold mt-4 mb-2">{children}</h1>,
-    h2: ({ children }: { children?: ReactNode }) => <h2 className="text-lg font-bold mt-4 mb-2">{children}</h2>,
-    h3: ({ children }: { children?: ReactNode }) => <h3 className="text-base font-bold mt-3 mb-2">{children}</h3>,
-    ul: ({ children }: { children?: ReactNode }) => <ul className="list-disc pl-5 my-2">{children}</ul>,
-    ol: ({ children }: { children?: ReactNode }) => <ol className="list-decimal pl-5 my-2">{children}</ol>,
-    li: ({ children }: { children?: ReactNode }) => <li className="my-1">{children}</li>
-  }), [theme])
-
   return (
     <div
       className={`${
@@ -148,14 +107,7 @@ export const ChatMessage = ({
           </button>
           {thinkingExpanded && hasThinking && (
             <div className="mt-2 pl-4 border-l-2 border-primary/20 text-sm text-muted-foreground break-words">
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm, remarkMath]}
-                rehypePlugins={[rehypeRaw]}
-                skipHtml={false}
-                components={markdownComponents}
-              >
-                {thinkingContent!}
-              </ReactMarkdown>
+              <Markdown content={thinkingContent!} />
             </div>
           )}
         </div>
@@ -167,14 +119,7 @@ export const ChatMessage = ({
           'prose dark:prose-invert max-w-none text-sm break-words',
           message.role === 'user' ? 'text-primary-foreground' : 'text-foreground'
         )}>
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm, remarkMath]}
-            rehypePlugins={[rehypeRaw]}
-            skipHtml={false}
-            components={markdownComponents}
-          >
-            {finalDisplayContent}
-          </ReactMarkdown>
+          <Markdown content={finalDisplayContent} />
         </div>
       )}
 

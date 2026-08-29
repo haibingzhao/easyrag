@@ -4,12 +4,15 @@
 
 use easyrag_core::concurrency::resilience::{BreakerError, CircuitBreaker};
 use easyrag_core::llm::service::{
-    EmbeddingService, LlmRequest, LlmService, MessageRole, ResponseFormat,
+    ChatMessage, EmbeddingService, LlmRequest, LlmService, LlmToolResponse, MessageRole,
+    ResponseFormat, ToolCall, ToolCallingLlmService, ToolDefinition,
 };
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::{json, Value as JsonValue};
 use std::time::Duration;
+
+use crate::{parse_arguments_json, parse_tool_result_message, serialize_tools};
 
 /// Configuration for [`OpenAiClient`].
 #[derive(Clone, Debug)]
@@ -24,6 +27,10 @@ pub struct OpenAiConfig {
     pub connect_timeout: Duration,
     /// Dimension of embeddings produced by the configured model.
     pub embedding_dimension: usize,
+    /// DashScope-style thinking toggle for reasoning models (e.g. qwen3.8-max).
+    /// None = send nothing (provider default); Some(false) disables the
+    /// reasoning phase so long prompts don't blow past the request timeout.
+    pub enable_thinking: Option<bool>,
     /// Base for the quadratic retry delay `base * attempt^2` ms
     ///
     pub retry_delay_base_ms: u64,
@@ -39,6 +46,7 @@ impl OpenAiConfig {
             timeout: Duration::from_secs(120),
             connect_timeout: Duration::from_secs(30),
             embedding_dimension: 1536,
+            enable_thinking: None,
             retry_delay_base_ms: 1000,
         }
     }
@@ -93,7 +101,11 @@ impl OpenAiClient {
 
     /// Apply shared completion parameters (temperature, max tokens,
     /// response format)..
-    fn apply_common_params(body: &mut serde_json::Map<String, JsonValue>, request: &LlmRequest) {
+    fn apply_common_params(
+        body: &mut serde_json::Map<String, JsonValue>,
+        request: &LlmRequest,
+        config: &OpenAiConfig,
+    ) {
         if request.temperature > 0.0 {
             body.insert("temperature".to_string(), json!(request.temperature));
         }
@@ -106,6 +118,11 @@ impl OpenAiClient {
                 json!({ "type": "json_object" }),
             );
         }
+        // Only send the field when explicitly configured — OpenAI's API
+        // rejects unknown params in strict mode.
+        if let Some(enable) = config.enable_thinking {
+            body.insert("enable_thinking".to_string(), json!(enable));
+        }
     }
 
     fn build_request_body(&self, request: &LlmRequest, stream: bool) -> JsonValue {
@@ -117,7 +134,7 @@ impl OpenAiClient {
             JsonValue::Array(Self::build_messages(request, user_message)),
         );
         body.insert("stream".to_string(), json!(stream));
-        Self::apply_common_params(&mut body, request);
+        Self::apply_common_params(&mut body, request, &self.config);
         JsonValue::Object(body)
     }
 
@@ -145,7 +162,7 @@ impl OpenAiClient {
             JsonValue::Array(Self::build_messages(request, user_message)),
         );
         body.insert("stream".to_string(), json!(false));
-        Self::apply_common_params(&mut body, request);
+        Self::apply_common_params(&mut body, request, &self.config);
         JsonValue::Object(body)
     }
 
@@ -227,6 +244,120 @@ impl OpenAiClient {
                     .map(|s| s.to_string())
             })
             .unwrap_or_default()
+    }
+
+    // ===== tool-calling support =====
+
+    /// Convert agent-loop messages into OpenAI chat format. User messages
+    /// matching the `[Tool Result: name]` content pattern (see the
+    /// TOOL_RESULT_PREFIX contract in agent.rs) become `role: "tool"`
+    /// messages with synthesized `tool_call_id`s; the preceding assistant
+    /// message gets a matching `tool_calls` entry. Parallel tool results
+    /// from one turn all append to the same assistant message.
+    fn build_tool_call_messages(messages: &[ChatMessage]) -> Vec<JsonValue> {
+        let mut out: Vec<JsonValue> = Vec::with_capacity(messages.len());
+        let mut counter = 0usize;
+        for msg in messages {
+            if msg.role == MessageRole::User {
+                if let Some((tool_name, result)) = parse_tool_result_message(&msg.content) {
+                    if let Some(prev) = out.iter_mut().rev().find(|m| {
+                        m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                    }) {
+                        let tool_call_id = format!("call_{counter}");
+                        counter += 1;
+                        let entry = json!({
+                            "id": tool_call_id,
+                            "type": "function",
+                            "function": { "name": tool_name, "arguments": "{}" }
+                        });
+                        match prev.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+                            Some(arr) => arr.push(entry),
+                            None => {
+                                if let Some(obj) = prev.as_object_mut() {
+                                    obj.insert(
+                                        "tool_calls".to_string(),
+                                        JsonValue::Array(vec![entry]),
+                                    );
+                                }
+                            }
+                        }
+                        out.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": result,
+                        }));
+                        continue;
+                    }
+                    // Defensive: no preceding assistant message — fall
+                    // through and send it as a plain user message.
+                }
+            }
+            let role = match msg.role {
+                MessageRole::System => "system",
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+            };
+            out.push(json!({ "role": role, "content": msg.content }));
+        }
+        out
+    }
+
+    /// Assemble the full tool-calling request body.
+    fn build_tool_call_body(&self, messages: &[ChatMessage], tools: &[ToolDefinition]) -> JsonValue {
+        let mut body = json!({
+            "model": self.config.model,
+            "messages": Self::build_tool_call_messages(messages),
+            "tools": serialize_tools(tools),
+            "stream": false,
+        });
+        // Reasoning models must skip the thinking phase here too — entity
+        // extraction prompts are long and would otherwise time out.
+        if let Some(enable) = self.config.enable_thinking {
+            body["enable_thinking"] = json!(enable);
+        }
+        body
+    }
+
+    /// Parse a chat completion response that may contain tool calls.
+    fn parse_tool_response(response: &str) -> LlmToolResponse {
+        let Ok(json) = serde_json::from_str::<JsonValue>(response) else {
+            return LlmToolResponse::default();
+        };
+        let message = json.pointer("/choices/0/message");
+        let content = message
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string());
+        let tool_calls = message
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|t| t.as_array())
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter_map(|call| {
+                        let name = call.pointer("/function/name")?.as_str()?.to_string();
+                        let id = call
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let arguments = call
+                            .pointer("/function/arguments")
+                            .and_then(|a| a.as_str())
+                            .map(parse_arguments_json)
+                            .unwrap_or_default();
+                        Some(ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        LlmToolResponse {
+            content,
+            tool_calls,
+        }
     }
 }
 
@@ -383,6 +514,34 @@ impl LlmService for OpenAiClient {
             }
         })
         .await
+    }
+}
+
+#[async_trait::async_trait]
+impl ToolCallingLlmService for OpenAiClient {
+    async fn complete_with_tools(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Vec<ToolDefinition>,
+    ) -> easyrag_core::Result<LlmToolResponse> {
+        let body = self.build_tool_call_body(&messages, &tools);
+        let result = self
+            .llm_breaker
+            .execute(|| {
+                let body = body.clone();
+                async move {
+                    self.execute_with_retry("OpenAI-tools", || {
+                        let body = body.clone();
+                        async move {
+                            let response = self.post_json("/chat/completions", &body).await?;
+                            Ok(Self::parse_tool_response(&response))
+                        }
+                    })
+                    .await
+                }
+            })
+            .await;
+        breaker_result(result)
     }
 }
 

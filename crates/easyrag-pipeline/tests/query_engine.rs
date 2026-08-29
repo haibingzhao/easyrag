@@ -734,6 +734,7 @@ fn tool_call_response(name: &str, args: &[(&str, &str)]) -> LlmToolResponse {
     LlmToolResponse {
         content: Some("thinking".to_string()),
         tool_calls: vec![ToolCall {
+            id: None,
             name: name.to_string(),
             arguments: args
                 .iter()

@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod routes;
+pub mod scan_stats;
 pub mod service;
 pub mod state;
 pub mod util;
@@ -16,6 +17,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 pub use config::{ServerConfig, DEFAULT_JWT_SECRET};
 pub use error::{AppError, AppResult};
+pub use scan_stats::AutoScanStats;
 pub use state::{AppServices, AppState};
 
 /// Assemble the full router from shared services ( controller beans +

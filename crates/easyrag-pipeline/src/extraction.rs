@@ -44,6 +44,26 @@ pub struct EntityExtractorConfig {
     pub max_extract_input_tokens: usize,
 }
 
+impl EntityExtractorConfig {
+    /// Shared host-level overrides for every ingestion assembly site
+    /// (`EasyRAG`, the global pipeline, and per-workspace pipelines):
+    /// language and gleaning pass through directly; empty guidance means
+    /// "unset" and keeps the built-in entity-type guidance instead of
+    /// blanking the extraction prompt.
+    pub fn apply_ingest_settings(
+        &mut self,
+        language: impl Into<String>,
+        gleaning_rounds: usize,
+        entity_types_guidance: &str,
+    ) {
+        self.language = language.into();
+        self.gleaning_rounds = gleaning_rounds;
+        if !entity_types_guidance.is_empty() {
+            self.entity_types_guidance = entity_types_guidance.to_string();
+        }
+    }
+}
+
 impl Default for EntityExtractorConfig {
     fn default() -> Self {
         Self {

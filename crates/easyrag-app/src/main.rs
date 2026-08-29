@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 
-use easyrag_core::llm::service::LlmService;
+use easyrag_core::llm::service::{LlmService, ToolCallingLlmService};
 use easyrag_core::storage::tenant_config::TenantConfigStorage;
 use easyrag_core::storage::traits::StorageBundle;
 use easyrag_core::storage::user::UserStorage;
@@ -32,7 +32,7 @@ use easyrag_llm::rerank::{RerankClient, RerankConfig, RerankProvider};
 use easyrag_pipeline::multimodal::{RagAnythingConfig, RAGAnything, TextQueryBackend};
 use easyrag_pipeline::{
     EasyRAGConfigBuilder, EasyRAG, IngestionPipeline, ParserRegistry, QueryEngine,
-    StructureQueryStrategy, TreeSearchEngine,
+    StructureAgentStrategy, StructureQueryStrategy, TreeSearchEngine,
 };
 use easyrag_server::auth::{JwtAuthProvider, LoginRateLimiter};
 use easyrag_server::service::{DocumentLifecycleService, WorkspaceContext};
@@ -83,7 +83,14 @@ async fn main() -> anyhow::Result<()> {
     let mut llm_config = OpenAiConfig::new(llm_api_key);
     llm_config.base_url = config.llm_base_url.clone();
     llm_config.model = config.llm_model.clone();
-    let llm: Arc<dyn LlmService> = Arc::new(OpenAiClient::new(llm_config)?);
+    // Slow reasoning models (e.g. qwen3.8-max) can exceed the 120s default.
+    llm_config.timeout = Duration::from_secs(config.llm_timeout_secs);
+    // LLM_ENABLE_THINKING=false is what keeps reasoning models fast enough.
+    llm_config.enable_thinking = config.llm_enable_thinking;
+    // One client, two trait views: plain completion + tool calling.
+    let openai_client = Arc::new(OpenAiClient::new(llm_config)?);
+    let llm: Arc<dyn LlmService> = openai_client.clone();
+    let tool_calling_llm: Arc<dyn ToolCallingLlmService> = openai_client;
 
     // Stateless embedding bean: construct a fresh identical instance for
     // the facade (storage layers consumed their own in assemble_storage).
@@ -113,6 +120,8 @@ async fn main() -> anyhow::Result<()> {
         .embedding_dim(config.embedding_dim)
         .chunk_size(config.chunk_size)
         .chunk_overlap_size(config.chunk_overlap_size)
+        .entity_extract_max_gleaning(config.entity_extract_max_gleaning)
+        .entity_types_guidance(config.entity_types_guidance.clone())
         .storage_type(config.storage_type.clone())
         .language(config.language.clone())
         .build();
@@ -125,16 +134,23 @@ async fn main() -> anyhow::Result<()> {
         storage.kv.clone(),
         storage.doc_status.clone(),
         rerank.clone(),
-        None,
         storage.keyword.clone(),
     ));
     easy_rag.initialize().await.context("EasyRAG initialize")?;
 
     // --- Structure strategy -------
+    let agent_strategy = Some(Arc::new(
+        StructureAgentStrategy::new(
+            tool_calling_llm.clone(),
+            storage.kv.clone(),
+            storage.vector.clone(),
+        )
+        .with_doc_status_storage(storage.doc_status.clone()),
+    ));
     let structure_strategy = Some(Arc::new(
         StructureQueryStrategy::new(
             TreeSearchEngine::new(llm.clone()),
-            None, // OpenAiClient has no tool-calling impl -> no agent strategy
+            agent_strategy,
             storage.kv.clone(),
             storage.vector.clone(),
             llm.clone(),
@@ -163,6 +179,13 @@ async fn main() -> anyhow::Result<()> {
     let query_engine = Arc::new(query_engine);
 
     // --- Ingestion pipeline ------------------------------------------------
+    let mut extractor_config =
+        easyrag_pipeline::extraction::EntityExtractorConfig::default();
+    extractor_config.apply_ingest_settings(
+        config.language.clone(),
+        config.entity_extract_max_gleaning,
+        &config.entity_types_guidance,
+    );
     let mut pipeline = IngestionPipeline::new(
         llm.clone(),
         storage.kv.clone(),
@@ -171,6 +194,13 @@ async fn main() -> anyhow::Result<()> {
         storage.doc_status.clone(),
         embedding_func.clone(),
     )
+    .with_extractor(easyrag_pipeline::extraction::EntityExtractor::new(
+        llm.clone(),
+        storage.graph.clone(),
+        storage.vector.clone(),
+        storage.kv.clone(),
+        extractor_config,
+    ))
     .with_language(config.language.clone())
     .with_max_concurrency(config.llm_max_async);
     if let Some(keyword) = &storage.keyword {
@@ -212,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
         default_biz_id: config.biz_id.clone(),
         default_context,
         llm: llm.clone(),
+        tool_calling_llm: Some(tool_calling_llm.clone()),
         config: config.clone(),
         tenant_config_storage: tenant_config_storage.clone(),
         pg_db: storage.pg_db.clone(),

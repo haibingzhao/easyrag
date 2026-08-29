@@ -3,7 +3,9 @@
 
 use easyrag_core::llm::service::{
     ChatMessage, EmbeddingService, LlmRequest, LlmService, MessageRole, ResponseFormat,
+    ToolCallingLlmService, ToolDefinition,
 };
+use easyrag_core::JsonMap;
 use easyrag_llm::{OpenAiClient, OpenAiConfig};
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -329,4 +331,196 @@ async fn embed_empty_data_array_is_error() {
     let result = client.embed(vec!["a".to_string()]).await;
     let err = result.expect_err("empty data must be an error");
     assert!(err.to_string().contains("empty data"));
+}
+
+// ===== tool calling =====
+
+fn test_tool(name: &str) -> ToolDefinition {
+    let mut params = JsonMap::new();
+    params.insert("type".to_string(), json!("object"));
+    ToolDefinition {
+        name: name.to_string(),
+        description: format!("{name} description"),
+        parameters: params,
+    }
+}
+
+fn tool_response_body(content: Value) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "choices": [{ "message": content }]
+    }))
+}
+
+#[tokio::test]
+async fn complete_with_tools_sends_tools_and_tool_results() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(tool_response_body(json!({ "content": "final answer" })))
+        .mount(&server)
+        .await;
+    let client = start_client(&server, |_| {}).await;
+
+    // Agent-loop shaped history: one assistant turn followed by two
+    // parallel tool results encoded with the `[Tool Result: name]` pattern.
+    let messages = vec![
+        ChatMessage {
+            role: MessageRole::System,
+            content: "sys".to_string(),
+        },
+        ChatMessage {
+            role: MessageRole::User,
+            content: "find docs".to_string(),
+        },
+        ChatMessage {
+            role: MessageRole::Assistant,
+            content: "thinking".to_string(),
+        },
+        ChatMessage {
+            role: MessageRole::User,
+            content: "[Tool Result: list_documents]\n1. doc_id=d1".to_string(),
+        },
+        ChatMessage {
+            role: MessageRole::User,
+            content: "[Tool Result: get_document_structure]\n{\"tree\":[]}".to_string(),
+        },
+    ];
+
+    let response = client
+        .complete_with_tools(messages, vec![test_tool("list_documents")])
+        .await
+        .unwrap();
+    assert_eq!(Some("final answer".to_string()), response.content);
+    assert!(!response.has_tool_calls());
+
+    let body = last_request_body(&server).await;
+    // Tools are serialized in the OpenAI function schema.
+    assert_eq!(
+        json!([{
+            "type": "function",
+            "function": {
+                "name": "list_documents",
+                "description": "list_documents description",
+                "parameters": { "type": "object" }
+            }
+        }]),
+        body["tools"]
+    );
+    assert_eq!(json!(false), body["stream"]);
+
+    let msgs = body["messages"].as_array().unwrap();
+    // Both parallel results mount on the SAME preceding assistant message.
+    assert_eq!(
+        json!([
+            {
+                "id": "call_0",
+                "type": "function",
+                "function": { "name": "list_documents", "arguments": "{}" }
+            },
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "get_document_structure", "arguments": "{}" }
+            }
+        ]),
+        msgs[2]["tool_calls"]
+    );
+    assert_eq!(
+        json!({ "role": "tool", "tool_call_id": "call_0", "content": "1. doc_id=d1" }),
+        msgs[3]
+    );
+    assert_eq!(
+        json!({ "role": "tool", "tool_call_id": "call_1", "content": "{\"tree\":[]}" }),
+        msgs[4]
+    );
+}
+
+#[tokio::test]
+async fn complete_with_tools_parses_tool_calls_with_arguments() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(tool_response_body(json!({
+            "content": null,
+            "tool_calls": [{
+                "id": "call_abc123",
+                "type": "function",
+                "function": {
+                    "name": "get_section_content",
+                    "arguments": "{\"doc_id\":\"d1\",\"max_chars\":4000}"
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+    let client = start_client(&server, |_| {}).await;
+
+    let response = client
+        .complete_with_tools(
+            vec![ChatMessage {
+                role: MessageRole::User,
+                content: "q".to_string(),
+            }],
+            vec![test_tool("get_section_content")],
+        )
+        .await
+        .unwrap();
+
+    assert!(response.content.is_none(), "null content maps to None");
+    assert_eq!(1, response.tool_calls.len());
+    let call = &response.tool_calls[0];
+    assert_eq!(Some("call_abc123".to_string()), call.id);
+    assert_eq!("get_section_content", call.name);
+    // Non-string scalars are stringified, strings kept as-is.
+    assert_eq!("d1", call.arguments["doc_id"]);
+    assert_eq!("4000", call.arguments["max_chars"]);
+}
+
+#[tokio::test]
+async fn complete_with_tools_returns_content_when_no_tool_calls() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(tool_response_body(json!({ "content": "plain answer" })))
+        .mount(&server)
+        .await;
+    let client = start_client(&server, |_| {}).await;
+
+    let response = client
+        .complete_with_tools(Vec::new(), vec![test_tool("list_documents")])
+        .await
+        .unwrap();
+    assert_eq!(Some("plain answer".to_string()), response.content);
+    assert!(response.tool_calls.is_empty());
+}
+
+#[tokio::test]
+async fn complete_with_tools_shares_the_llm_circuit_breaker() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("down"))
+        .mount(&server)
+        .await;
+    let client = start_client(&server, |c| {
+        c.max_retries = 1;
+        c.retry_delay_base_ms = 1;
+    })
+    .await;
+
+    for _ in 0..5 {
+        assert!(client
+            .complete_with_tools(Vec::new(), vec![test_tool("list_documents")])
+            .await
+            .is_err());
+    }
+    let err = client
+        .complete_with_tools(Vec::new(), vec![test_tool("list_documents")])
+        .await
+        .expect_err("breaker should be open");
+    assert!(matches!(
+        err,
+        easyrag_core::CoreError::CircuitBreakerOpen(_)
+    ));
+    assert_eq!(5, server.received_requests().await.unwrap().len());
 }

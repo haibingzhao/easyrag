@@ -59,12 +59,12 @@ pub struct ScanTaskSpec {
  pub max_files_per_cycle: usize,
 }
 
-fn default_enabled -> bool {
- true
+fn default_enabled() -> bool {
+    true
 }
 
-fn default_max_files -> usize {
- 100
+fn default_max_files() -> usize {
+    100
 }
 
 /// Persisted scan cursor of one task (equivalent to one `rag_watermark` row

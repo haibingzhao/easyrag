@@ -143,7 +143,6 @@ async fn build_env(auth_enabled: bool, with_structure: bool) -> Env {
         doc_status.clone() as Arc<dyn DocStatusStorage>,
         None,
         None,
-        None,
     ));
     easy_rag.initialize().await.unwrap();
 
