@@ -248,8 +248,9 @@ async fn insert_text_content_writes_kv_and_vector() {
     assert_eq!(stored.get("content").unwrap().as_str().unwrap(), "para one\n\npara two");
     assert_eq!(stored.get("full_doc_id").unwrap().as_str().unwrap(), "doc-x");
     assert_eq!(stored.get("chunk_order_index").unwrap().as_i64().unwrap(), 0);
-    // tokens = chars / 4 (project convention)
-    let expected_tokens = "para one\n\npara two".chars().count() / 4;
+    // tokens = precise tokenizer count (cl100k_base BPE)
+    let expected_tokens = easyrag_core::util::tokenizer::TokenizerProvider::get_tokenizer()
+        .count_tokens("para one\n\npara two");
     assert_eq!(stored.get("tokens").unwrap().as_i64().unwrap(), expected_tokens as i64);
 
     let vector_row = storages.vector.get_by_id(&chunk_id, BIZ).await.unwrap().unwrap();

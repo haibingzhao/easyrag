@@ -13,6 +13,7 @@ use easyrag_core::llm::{LlmRequest, LlmService};
 use easyrag_core::model::source_id::source_ids_value;
 use easyrag_core::storage::{GraphStorage, KVStorage, VectorStorage};
 use easyrag_core::util::hash::compute_mdhash_id;
+use easyrag_core::util::tokenizer::{Tokenizer, TokenizerProvider};
 use easyrag_core::{CoreError, JsonMap};
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -199,6 +200,9 @@ pub struct BaseModalProcessor {
     /// Business line bound at construction; passed as the biz filter on
     /// every storage call.
     pub biz_id: String,
+    /// Precise token counting (cl100k_base BPE) for the persisted `tokens`
+    /// field, snapshotted at construction like the chunkers do.
+    tokenizer: Arc<Tokenizer>,
 }
 
 impl BaseModalProcessor {
@@ -217,6 +221,7 @@ impl BaseModalProcessor {
             graph_storage,
             context_extractor,
             biz_id,
+            tokenizer: TokenizerProvider::get_tokenizer(),
         }
     }
 
@@ -247,9 +252,9 @@ impl BaseModalProcessor {
 
         // Generate chunk ID.
         let chunk_id = compute_mdhash_id(modal_chunk, "chunk-");
-        // Approximate token count (: String.length / 4; char count is
-        // the closest Rust analogue of UTF-16 length).
-        let tokens = modal_chunk.chars().count() as i64 / 4;
+        // Precise tokenizer count (the old chars/4 estimate badly
+        // understated CJK chunks and the value is persisted).
+        let tokens = self.tokenizer.count_tokens(modal_chunk) as i64;
 
         let actual_doc_id = doc_id.unwrap_or(&chunk_id).to_string();
 

@@ -9,6 +9,7 @@ use std::time::Instant;
 use easyrag_core::llm::LlmService;
 use easyrag_core::storage::{GraphStorage, KVStorage, VectorStorage};
 use easyrag_core::util::hash::compute_mdhash_id;
+use easyrag_core::util::tokenizer::{Tokenizer, TokenizerProvider};
 use easyrag_core::{CoreError, JsonMap};
 use serde_json::Value as JsonValue;
 use tokio::sync::Semaphore;
@@ -42,6 +43,9 @@ pub struct DocumentProcessor {
     parser: OnceLock<Arc<dyn super::parser::MultimodalParser>>,
     /// Lazy context extractor.
     context_extractor: OnceLock<ContextExtractor>,
+    /// Precise token counting (cl100k_base BPE) for the persisted `tokens`
+    /// field, snapshotted at construction like the chunkers do.
+    tokenizer: Arc<Tokenizer>,
 }
 
 impl DocumentProcessor {
@@ -66,6 +70,7 @@ impl DocumentProcessor {
             biz_id,
             parser: OnceLock::new(),
             context_extractor: OnceLock::new(),
+            tokenizer: TokenizerProvider::get_tokenizer(),
         }
     }
 
@@ -290,8 +295,9 @@ impl DocumentProcessor {
 
         // Store as a chunk in KV storage
         let chunk_id = compute_mdhash_id(&text_content, "chunk-");
-        // `textContent.length / 4` (char count based, project convention)
-        let tokens = text_content.chars().count() / 4;
+        // Precise tokenizer count (the old chars/4 estimate badly
+        // understated CJK text and the value is persisted).
+        let tokens = self.tokenizer.count_tokens(&text_content);
 
         let mut chunk_data = JsonMap::new();
         chunk_data.insert("tokens".to_string(), JsonValue::from(tokens as u64));

@@ -2,7 +2,8 @@
 
 use easyrag_core::concurrency::keyed_mutex::KeyedMutex;
 use easyrag_core::constants::{
-    DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE, DEFAULT_SUMMARY_MAX_TOKENS, GRAPH_FIELD_SEP,
+    DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE, DEFAULT_SUMMARY_MAX_TOKENS,
+    DEFAULT_SUMMARY_OUTPUT_MAX_TOKENS, GRAPH_FIELD_SEP,
 };
 use easyrag_core::llm::service::{
     ChatMessage, LlmRequest, LlmService, MessageRole, ResponseFormat,
@@ -22,6 +23,7 @@ use easyrag_core::prompt::{
 };
 use easyrag_core::storage::traits::{GraphStorage, KVStorage, VectorStorage};
 use easyrag_core::util::json::{parse_json, to_json};
+use easyrag_core::util::tokenizer::{Tokenizer, TokenizerProvider};
 use easyrag_core::JsonMap;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -41,6 +43,7 @@ pub struct EntityExtractorConfig {
     pub gleaning_rounds: usize,
     pub force_llm_summary_on_merge: usize,
     pub summary_max_tokens: usize,
+    pub summary_output_max_tokens: usize,
     pub max_source_ids_per_entity: usize,
     pub max_extract_input_tokens: usize,
 }
@@ -76,6 +79,7 @@ impl Default for EntityExtractorConfig {
             gleaning_rounds: 0,
             force_llm_summary_on_merge: DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
             summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
+            summary_output_max_tokens: DEFAULT_SUMMARY_OUTPUT_MAX_TOKENS,
             max_source_ids_per_entity: 30,
             max_extract_input_tokens: 20000,
         }
@@ -284,6 +288,9 @@ pub struct EntityExtractor {
     kv_storage: Arc<dyn KVStorage>,
     keyed_mutex: KeyedMutex,
     config: EntityExtractorConfig,
+    /// Precise token counting (cl100k_base BPE), snapshotted at construction
+    /// like the chunkers and the query engine do.
+    tokenizer: Arc<Tokenizer>,
 }
 
 impl EntityExtractor {
@@ -301,6 +308,7 @@ impl EntityExtractor {
             kv_storage,
             keyed_mutex: KeyedMutex::new(),
             config,
+            tokenizer: TokenizerProvider::get_tokenizer(),
         }
     }
 
@@ -364,10 +372,14 @@ impl EntityExtractor {
             // `gleaning_rounds` rounds, counting down.
             for round in (1..=cfg.gleaning_rounds).rev() {
                 // Token safety guard: skip gleaning if context would
-                // exceed limit (rough chars/4 estimate).
-                let history_tokens: usize =
-                    history.iter().map(|m| m.content.len() / 4).sum();
-                let system_tokens = system_prompt.len() / 4;
+                // exceed the limit. Uses the precise tokenizer: the old
+                // bytes/4 estimate badly overstated CJK prompts and
+                // skipped gleaning that would have fit.
+                let history_tokens: usize = history
+                    .iter()
+                    .map(|m| self.tokenizer.count_tokens(&m.content))
+                    .sum();
+                let system_tokens = self.tokenizer.count_tokens(&system_prompt);
                 if history_tokens + system_tokens > cfg.max_extract_input_tokens {
                     tracing::warn!(
                         "Gleaning round {round} skipped: estimated tokens {} exceeds limit {}",
@@ -682,8 +694,12 @@ impl EntityExtractor {
         );
 
         // Estimate total tokens; if within budget, single-pass summary.
-        let total_chars: usize = fragments.iter().map(|f| f.len()).sum();
-        let estimated_tokens = total_chars / 4;
+        // Precise tokenizer count: the old bytes/4 estimate skewed the
+        // single-pass vs map-reduce decision on non-ASCII descriptions.
+        let estimated_tokens: usize = fragments
+            .iter()
+            .map(|f| self.tokenizer.count_tokens(f))
+            .sum();
         // Guard against a degenerate config (0 budget) that would panic on
         // integer division below; try/catch swallows the error
         // instead, so clamping keeps the graceful-degradation contract.
@@ -732,7 +748,7 @@ impl EntityExtractor {
                     vars.insert("description_list".to_string(), description_list);
                     vars.insert(
                         "summary_length".to_string(),
-                        cfg.summary_max_tokens.to_string(),
+                        cfg.summary_output_max_tokens.to_string(),
                     );
                     vars.insert("language".to_string(), cfg.language.clone());
                     let reduce_prompt = format_prompt(SUMMARIZE_ENTITY_DESCRIPTIONS, &vars);
@@ -782,7 +798,7 @@ impl EntityExtractor {
         vars.insert("description_list".to_string(), description_list);
         vars.insert(
             "summary_length".to_string(),
-            cfg.summary_max_tokens.to_string(),
+            cfg.summary_output_max_tokens.to_string(),
         );
         vars.insert("language".to_string(), cfg.language.clone());
         let prompt = format_prompt(SUMMARIZE_ENTITY_DESCRIPTIONS, &vars);

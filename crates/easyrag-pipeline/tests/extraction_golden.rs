@@ -501,6 +501,7 @@ fn cfg(json: bool) -> EntityExtractorConfig {
         gleaning_rounds: 0,
         force_llm_summary_on_merge: easyrag_core::constants::DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE,
         summary_max_tokens: easyrag_core::constants::DEFAULT_SUMMARY_MAX_TOKENS,
+        summary_output_max_tokens: easyrag_core::constants::DEFAULT_SUMMARY_OUTPUT_MAX_TOKENS,
         max_source_ids_per_entity: 30,
         // Large enough that the gleaning token guard never trips by accident;
         // `gleaning_skipped_when_token_budget_exceeded` lowers it on purpose.
@@ -772,8 +773,9 @@ async fn gleaning_skipped_when_token_budget_exceeded() {
     let llm = CaptureLlm::new(vec![JSON_RESPONSE]);
     let mut config = cfg(true);
     config.gleaning_rounds = 3;
-    // The system prompt alone is a few thousand chars, so chars/4 already
-    // blows a budget of 10 and the guard breaks before the first round.
+    // The system prompt alone counts several hundred precise tokens, so a
+    // budget of 10 is blown many times over and the guard breaks before the
+    // first round.
     config.max_extract_input_tokens = 10;
     let ex = extractor(
         Arc::clone(&llm) as Arc<dyn LlmService>,
@@ -1296,8 +1298,8 @@ async fn summary_single_pass_prompt() {
 
 #[tokio::test]
 async fn summary_map_reduce_prompts() {
-    // A one-token budget forces the map-reduce path. Three fragments totalling
-    // 38 chars estimate to 9 tokens, so `group_size = 3 / ((9 / 1) + 1) = 0`,
+    // A one-token budget forces the map-reduce path. The three fragments count
+    // well over one precise token, so `group_size = 3 / ((tokens / 1) + 1) = 0`,
     // clamped to 1: one fragment per group, three map calls, then one reduce.
     let existing = format!("fragment one{GRAPH_FIELD_SEP}fragment two");
     let graph = RecordingGraph::new().with_node(

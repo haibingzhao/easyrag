@@ -19,7 +19,8 @@ pub const DEFAULT_MAX_EXTRACTION_ENTITIES: usize = 40;
 
 // Number of description fragments to trigger LLM summary
 pub const DEFAULT_FORCE_LLM_SUMMARY_ON_MERGE: usize = 8;
-pub const DEFAULT_SUMMARY_MAX_TOKENS: usize = 1200;
+pub const DEFAULT_SUMMARY_MAX_TOKENS: usize = 8000;
+pub const DEFAULT_SUMMARY_OUTPUT_MAX_TOKENS: usize = 1200;
 pub const DEFAULT_SUMMARY_LENGTH_RECOMMENDED: usize = 600;
 pub const DEFAULT_SUMMARY_CONTEXT_SIZE: usize = 12000;
 pub const DEFAULT_MAX_EXTRACT_INPUT_TOKENS: usize = 20480;
