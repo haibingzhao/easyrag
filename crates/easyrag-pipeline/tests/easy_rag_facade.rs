@@ -333,15 +333,13 @@ async fn delete_updates_shared_node_preserving_source_order() {
     let result = env.rag.delete_document("doc-seeded", BIZ).await.unwrap();
     assert_eq!(result.status, DeletionStatus::Success);
 
-    // Node survives with remaining sources in original order
-    //
+    // Node survives with remaining sources in original order. The stored value
+    // was a legacy `<SEP>`-joined string; the trim writes back the canonical
+    // array form, so this also covers "read legacy → write canonical".
     let nodes = env.graph.get_all_nodes(BIZ).await.unwrap();
     let e1 = nodes.iter().find(|n| n.get("id").and_then(|v| v.as_str()) == Some("E1"));
     let e1 = e1.expect("shared node must survive");
-    assert_eq!(
-        e1.get("source_id").and_then(|v| v.as_str()),
-        Some(["x", "y"].join(GRAPH_FIELD_SEP).as_str())
-    );
+    assert_eq!(e1.get("source_id"), Some(&json!(["x", "y"])));
     // Edge referencing the deleted chunk is gone.
     assert!(env.graph.get_all_edges(BIZ).await.unwrap().is_empty());
 }

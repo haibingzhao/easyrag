@@ -3,6 +3,7 @@
 //! - [`parser`]: document parsers + registry (txt/md/pdf/docx/pptx/xlsx/html/code)
 //! - [`chunker`]: 5 chunkers + registry; [`structure`]: heading-based structure tree
 //! - [`ingest`]: ingestion pipeline; [`extraction`]: entity/relation extraction
+//! - [`graph_cleanup`]: graph trim/delete after a document is removed
 //! - [`callback`]: processing events/metrics; [`summarizer`]: LLM structure summaries
 //! - [`query`]: query engine + tree search / structure / agent strategies
 //! - multimodal: implemented in P4.6
@@ -16,6 +17,7 @@ pub mod easy_rag;
 pub mod easy_rag_config;
 pub mod evaluation;
 pub mod extraction;
+pub mod graph_cleanup;
 pub mod heading;
 pub mod ingest;
 pub mod multimodal;
@@ -44,6 +46,7 @@ pub use evaluation::GoldenSetEvaluator;
 // Re-export evaluation types from easyrag_core for convenience
 pub use easyrag_core::model::evaluation::{EvalReport, GoldenItem};
 pub use extraction::{EntityExtractor, EntityExtractorConfig, ExtractionResult};
+pub use graph_cleanup::{cleanup_graph_by_chunks, GraphCleanupReport};
 pub use heading::{has_headings, parse_headings, HeadingInfo};
 pub use ingest::{InsertDocumentExtras, IngestionPipeline};
 pub use multimodal::{

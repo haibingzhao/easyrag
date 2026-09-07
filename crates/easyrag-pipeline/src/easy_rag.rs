@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use easyrag_core::constants::{GRAPH_FIELD_SEP, STRUCTURE_INDEX_KEY_PREFIX};
+use easyrag_core::constants::STRUCTURE_INDEX_KEY_PREFIX;
 use easyrag_core::llm::embedding_func::EmbeddingFunc;
 use easyrag_core::llm::{LlmService, RerankService};
 use easyrag_core::model::doc_status::{
@@ -30,6 +30,7 @@ use crate::chunker::{Chunker, TokenSizeChunker};
 use crate::contextual_chunker::ContextualChunker;
 use crate::easy_rag_config::EasyRAGConfig;
 use crate::extraction::{EntityExtractor, EntityExtractorConfig};
+use crate::graph_cleanup::cleanup_graph_by_chunks;
 use crate::ingest::IngestionPipeline;
 use crate::multimodal::TextQueryBackend;
 use crate::query::{ClaimVerifier, EvidenceScorer, QueryEngine, QueryRouter};
@@ -351,107 +352,28 @@ impl EasyRAG {
 
     /// Clean up knowledge graph after document deletion.
     /// Removes source_id references and deletes orphaned entities/relations.
+    ///
+    /// The sequence is shared with the server's cascade delete — see
+    /// [`crate::graph_cleanup`] for why there is exactly one copy.
     async fn cleanup_knowledge_graph(
         &self,
         _doc_id: &str,
         chunk_ids: &HashSet<String>,
         biz_id: &str,
     ) -> easyrag_core::Result<()> {
-        let all_nodes = self.graph_storage.get_all_nodes(biz_id).await?;
-        let mut nodes_to_delete = Vec::new();
-        let mut nodes_to_update: Vec<(String, easyrag_core::JsonMap)> = Vec::new();
+        let report = cleanup_graph_by_chunks(
+            self.graph_storage.as_ref(),
+            self.vector_storage.as_ref(),
+            chunk_ids,
+            biz_id,
+        )
+        .await?;
 
-        for node in all_nodes {
-            let Some(node_id) = node.get("id").and_then(|v| v.as_str()).map(|s| s.to_string())
-            else {
-                continue;
-            };
-            let source_id = node
-                .get("source_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            // Order-preserving dedup
-            // (LinkedHashSet): the rewritten `source_id` keeps the
-            // original occurrence order.
-            let mut sources: Vec<String> = Vec::new();
-            for s in source_id
-                .split(GRAPH_FIELD_SEP)
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-            {
-                if !sources.iter().any(|x| x == s) {
-                    sources.push(s.to_string());
-                }
-            }
-
-            // Remove references to deleted chunks
-            let before = sources.len();
-            sources.retain(|s| !chunk_ids.contains(s));
-            if sources.len() == before {
-                continue;
-            }
-
-            if sources.is_empty() {
-                // No more sources - mark for deletion
-                nodes_to_delete.push(node_id);
-            } else {
-                // Update with remaining sources
-                let mut updated = node.clone();
-                updated.insert(
-                    "source_id".to_string(),
-                    serde_json::Value::from(sources.join(GRAPH_FIELD_SEP)),
-                );
-                nodes_to_update.push((node_id, updated));
-            }
+        if report.deleted_edges > 0 {
+            tracing::debug!("Removed {} orphaned edges", report.deleted_edges);
         }
-
-        // Delete orphaned edges
-        let mut edges_to_delete: Vec<(String, String)> = Vec::new();
-        let nodes_to_delete_set: HashSet<&str> =
-            nodes_to_delete.iter().map(|s| s.as_str()).collect();
-        let all_edges = self.graph_storage.get_all_edges(biz_id).await?;
-        for edge in all_edges {
-            let Some(source) = edge.get("source").and_then(|v| v.as_str()).map(|s| s.to_string())
-            else {
-                continue;
-            };
-            let Some(target) = edge.get("target").and_then(|v| v.as_str()).map(|s| s.to_string())
-            else {
-                continue;
-            };
-            let source_id = edge
-                .get("source_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let sources: HashSet<String> = source_id
-                .split(GRAPH_FIELD_SEP)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-
-            if sources.iter().any(|s| chunk_ids.contains(s))
-                || nodes_to_delete_set.contains(source.as_str())
-                || nodes_to_delete_set.contains(target.as_str())
-            {
-                edges_to_delete.push((source, target));
-            }
-        }
-
-        // Execute deletions
-        if !edges_to_delete.is_empty() {
-            self.graph_storage.remove_edges(&edges_to_delete, biz_id).await?;
-            tracing::debug!("Removed {} orphaned edges", edges_to_delete.len());
-        }
-        if !nodes_to_delete.is_empty() {
-            self.graph_storage.remove_nodes(&nodes_to_delete, biz_id).await?;
-            // Also remove from vector storage
-            self.vector_storage.delete(&nodes_to_delete, biz_id).await?;
-            tracing::debug!("Removed {} orphaned nodes", nodes_to_delete.len());
-        }
-
-        // Execute updates
-        for (node_id, data) in nodes_to_update {
-            self.graph_storage.upsert_node(&node_id, data, biz_id).await?;
+        if report.deleted_nodes > 0 {
+            tracing::debug!("Removed {} orphaned nodes", report.deleted_nodes);
         }
 
         Ok(())

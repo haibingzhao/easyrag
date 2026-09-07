@@ -1,0 +1,13 @@
+---
+source: crates/easyrag-storage/tests/postgres_storage.rs
+---
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_graph_srcid_legacy ON graph_nodes_graph (id) WHERE jsonb_typeof(properties -> 'source_id') = 'string'
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_graph_srcid ON graph_nodes_graph USING gin ((properties -> 'source_id'))
+SELECT COUNT(*) as cnt FROM graph_nodes_graph WHERE workspace = 'test_ws' AND jsonb_typeof(properties -> 'source_id') = 'string'
+UPDATE graph_nodes_graph SET properties = jsonb_set(properties, '{source_id}', COALESCE((SELECT jsonb_agg(btrim(x.part) ORDER BY x.ord) FROM unnest(string_to_array(replace(properties ->> 'source_id', '<SEP>', ','), ',')) WITH ORDINALITY AS x(part, ord) WHERE btrim(x.part) <> ''), '[]'::jsonb)), updated_at = NOW() WHERE workspace = 'test_ws' AND jsonb_typeof(properties -> 'source_id') = 'string'
+SELECT COUNT(*) as cnt FROM graph_nodes_graph WHERE workspace = 'test_ws' AND jsonb_typeof(properties -> 'source_id') = 'string'
+CREATE INDEX IF NOT EXISTS idx_graph_edges_graph_srcid_legacy ON graph_edges_graph (id) WHERE jsonb_typeof(properties -> 'source_id') = 'string'
+CREATE INDEX IF NOT EXISTS idx_graph_edges_graph_srcid ON graph_edges_graph USING gin ((properties -> 'source_id'))
+SELECT COUNT(*) as cnt FROM graph_edges_graph WHERE workspace = 'test_ws' AND jsonb_typeof(properties -> 'source_id') = 'string'
+UPDATE graph_edges_graph SET properties = jsonb_set(properties, '{source_id}', COALESCE((SELECT jsonb_agg(btrim(x.part) ORDER BY x.ord) FROM unnest(string_to_array(replace(properties ->> 'source_id', '<SEP>', ','), ',')) WITH ORDINALITY AS x(part, ord) WHERE btrim(x.part) <> ''), '[]'::jsonb)), updated_at = NOW() WHERE workspace = 'test_ws' AND jsonb_typeof(properties -> 'source_id') = 'string'
+SELECT COUNT(*) as cnt FROM graph_edges_graph WHERE workspace = 'test_ws' AND jsonb_typeof(properties -> 'source_id') = 'string'

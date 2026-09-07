@@ -9,3 +9,27 @@ CREATE INDEX IF NOT EXISTS FOR (n:`test`) ON (n.entity_id, n.biz_id)
 CREATE FULLTEXT INDEX `test_entity_fulltext` IF NOT EXISTS FOR (n:`test`) ON EACH [n.entity_id]
 --- params[1] ---
 {}
+--- query[2] ---
+MATCH (m:EasyRagGraphMeta {workspace: $ws, meta_key: 'source_id_format'}) RETURN m.meta_value AS v
+--- params[2] ---
+{
+  "ws": "test"
+}
+--- query[3] ---
+CREATE INDEX IF NOT EXISTS FOR (m:EasyRagGraphMeta) ON (m.workspace, m.meta_key)
+--- params[3] ---
+{}
+--- query[4] ---
+MATCH (n:`test`) WHERE n.entity_id > $cur_id OR (n.entity_id = $cur_id AND n.biz_id > $cur_biz) RETURN n.entity_id AS id, n.biz_id AS biz, n.source_id AS sid ORDER BY n.entity_id, n.biz_id LIMIT $batch
+--- params[4] ---
+{
+  "cur_id": "",
+  "cur_biz": "",
+  "batch": 1000
+}
+--- query[5] ---
+MERGE (m:EasyRagGraphMeta {workspace: $ws, meta_key: 'source_id_format'}) SET m.meta_value = 'array', m.updated_at = datetime()
+--- params[5] ---
+{
+  "ws": "test"
+}

@@ -2,7 +2,9 @@
 
 use async_trait::async_trait;
 use easyrag_core::llm::EmbeddingFunc;
-use easyrag_core::model::{KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode};
+use easyrag_core::model::{
+    source_ids_intersect, KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode,
+};
 use easyrag_core::storage::traits::{GraphStorage, StorageNameSpace};
 use easyrag_core::JsonMap;
 use parking_lot::Mutex;
@@ -306,8 +308,34 @@ impl GraphStorage for InMemoryGraphStorage {
     }
 
     async fn remove_nodes(&self, node_ids: &[String], biz_id: &str) -> easyrag_core::Result<()> {
-        for node_id in node_ids {
-            self.delete_node(node_id, biz_id).await?;
+        // One pass holding all three locks, in the order the rest of this file
+        // already uses (nodes, edges, adjacency). Looping `delete_node`
+        // reacquired and released them six times per node, and left the graph
+        // observably half-deleted between two of those acquisitions.
+        let mut nodes = self.nodes.lock();
+        let mut edges = self.edges.lock();
+        let mut adjacency = self.adjacency.lock();
+
+        // Nodes on another biz line are left alone, exactly as `delete_node`
+        // does, so the single and batch paths cannot disagree about scope.
+        let doomed: Vec<&str> = node_ids
+            .iter()
+            .filter(|id| {
+                nodes
+                    .get(id.as_str())
+                    .is_some_and(|props| props_biz(props) == Some(biz_id))
+            })
+            .map(|id| id.as_str())
+            .collect();
+
+        for node_id in doomed {
+            nodes.remove(node_id);
+            for other in adjacency.remove(node_id).unwrap_or_default() {
+                edges.remove(&Self::edge_key(node_id, &other));
+                if let Some(set) = adjacency.get_mut(&other) {
+                    set.remove(node_id);
+                }
+            }
         }
         Ok(())
     }
@@ -474,6 +502,52 @@ impl GraphStorage for InMemoryGraphStorage {
             .lock()
             .values()
             .filter(|props| props_in_list_scope(props, biz_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn get_nodes_by_source_ids(
+        &self,
+        chunk_ids: &[String],
+        biz_id: &str,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        if chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: HashSet<String> = chunk_ids.iter().cloned().collect();
+        // Filtering happens under the lock, before any clone: the trait default
+        // clones every property map in the graph to hand back the handful that
+        // match, which is pure waste here where the maps are already local.
+        let nodes = self.nodes.lock();
+        Ok(nodes
+            .iter()
+            .filter(|(_, props)| {
+                props_in_list_scope(props, biz_id) && source_ids_intersect(props, &wanted)
+            })
+            .map(|(id, props)| {
+                let mut result = props.clone();
+                result.insert("id".to_string(), serde_json::Value::String(id.clone()));
+                result
+            })
+            .collect())
+    }
+
+    async fn get_edges_by_source_ids(
+        &self,
+        chunk_ids: &[String],
+        biz_id: &str,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        if chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: HashSet<String> = chunk_ids.iter().cloned().collect();
+        Ok(self
+            .edges
+            .lock()
+            .values()
+            .filter(|props| {
+                props_in_list_scope(props, biz_id) && source_ids_intersect(props, &wanted)
+            })
             .cloned()
             .collect())
     }

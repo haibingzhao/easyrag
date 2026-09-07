@@ -3,7 +3,7 @@
 //! Data carriers use `JsonMap` (serde_json Map) to mirror the
 
 use crate::llm::EmbeddingFunc;
-use crate::model::{DocProcessingStatus, DocStatus, KnowledgeGraph};
+use crate::model::{source_ids_intersect, DocProcessingStatus, DocStatus, KnowledgeGraph};
 use crate::JsonMap;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
@@ -357,6 +357,69 @@ pub trait GraphStorage: StorageNameSpace {
             self.upsert_edge(src, tgt, data.clone(), biz_id).await?;
         }
         Ok(())
+    }
+
+    /// Nodes whose `source_id` references any of `chunk_ids`.
+    ///
+    /// The server-side half of document-deletion cleanup. Without it the caller
+    /// has to pull the whole graph via [`GraphStorage::get_all_nodes`] and filter
+    /// in Rust: O(nodes) in network transfer, deserialisation and peak memory
+    /// for an answer that is usually two orders of magnitude smaller. Backends
+    /// with a real sub-value predicate override this — Postgres jsonb `?|`,
+    /// Cypher `ANY(c IN $ids WHERE c IN n.source_id)` — and the default keeps
+    /// every implementation correct with no work at all.
+    ///
+    /// Contract, identical for every backend (pinned by
+    /// `tests/cross_backend_consistency.rs`):
+    ///
+    /// - An **empty** `chunk_ids` returns an **empty** result; it must never
+    ///   degrade into a full scan, which would be worse than the status quo.
+    /// - Membership is whole-element equality: `chunk_1` never matches
+    ///   `chunk_10`. Substring matching on the legacy joined string is exactly
+    ///   the bug this method exists to make unrepresentable.
+    /// - Both stored shapes match — the canonical array and legacy
+    ///   `<SEP>`/`,`-joined strings, which survive until the backfill runs or
+    ///   arrive from an older pod during a rolling deploy. Missing a shape here
+    ///   means silently leaking orphaned nodes.
+    /// - The returned maps have the same shape as `get_all_nodes`, injected `id`
+    ///   included, so callers can treat the two interchangeably.
+    async fn get_nodes_by_source_ids(
+        &self,
+        chunk_ids: &[String],
+        biz_id: &str,
+    ) -> crate::Result<Vec<JsonMap>> {
+        if chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: HashSet<String> = chunk_ids.iter().cloned().collect();
+        Ok(self
+            .get_all_nodes(biz_id)
+            .await?
+            .into_iter()
+            .filter(|node| source_ids_intersect(node, &wanted))
+            .collect())
+    }
+
+    /// Edges whose `source_id` references any of `chunk_ids`.
+    ///
+    /// Same contract as [`GraphStorage::get_nodes_by_source_ids`]; the returned
+    /// maps have the same shape as `get_all_edges`, injected `source`/`target`
+    /// included.
+    async fn get_edges_by_source_ids(
+        &self,
+        chunk_ids: &[String],
+        biz_id: &str,
+    ) -> crate::Result<Vec<JsonMap>> {
+        if chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted: HashSet<String> = chunk_ids.iter().cloned().collect();
+        Ok(self
+            .get_all_edges(biz_id)
+            .await?
+            .into_iter()
+            .filter(|edge| source_ids_intersect(edge, &wanted))
+            .collect())
     }
 }
 

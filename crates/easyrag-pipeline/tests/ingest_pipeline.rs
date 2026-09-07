@@ -314,10 +314,14 @@ async fn process_document_full_flow_marks_processed_and_builds_graph() {
         Some("A researcher"),
         alice.get("description").and_then(|v| v.as_str())
     );
-    assert_eq!(
-        Some(chunk_id.as_str()),
-        alice.get("source_id").and_then(|v| v.as_str())
-    );
+    let alice_sources: Vec<&str> = alice
+        .get("source_id")
+        .and_then(|v| v.as_array())
+        .expect("graph source_id is stored as an array")
+        .iter()
+        .map(|v| v.as_str().expect("chunk ids are strings"))
+        .collect();
+    assert_eq!(alice_sources, [chunk_id.as_str()]);
     let edge = env
         .graph
         .get_edge("Alice", "The Lab", BIZ)
@@ -567,9 +571,16 @@ async fn extractor_merges_descriptions_and_weights_on_second_merge() {
         "A researcher",
         alice.get("description").and_then(|v| v.as_str()).unwrap()
     );
-    // Source ids accumulate.
-    let source_id = alice.get("source_id").and_then(|v| v.as_str()).unwrap();
-    assert!(source_id.contains("chunk-1") && source_id.contains("chunk-2"));
+    // Source ids accumulate — as array elements, so membership is exact rather
+    // than the substring check the old joined string forced.
+    let source_ids: Vec<&str> = alice
+        .get("source_id")
+        .and_then(|v| v.as_array())
+        .expect("graph source_id is stored as an array")
+        .iter()
+        .map(|v| v.as_str().expect("chunk ids are strings"))
+        .collect();
+    assert_eq!(source_ids, ["chunk-1", "chunk-2"]);
 
     // Edge weight increments on re-merge.
     let edge = graph.get_edge("Alice", "The Lab", BIZ).await.unwrap().unwrap();

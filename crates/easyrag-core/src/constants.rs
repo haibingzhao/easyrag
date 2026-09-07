@@ -26,7 +26,12 @@ pub const DEFAULT_MAX_EXTRACT_INPUT_TOKENS: usize = 20480;
 pub const DEFAULT_MAX_SECTION_CONTEXT_TOKENS: usize = 256;
 pub const DEFAULT_HEADING_LEVEL_MAX_CHARS: usize = 80;
 
-/// Separator for description, source_id and relation-key fields
+/// Separator used to join `description` fragments during entity/relation merge
+/// (see `extraction.rs`), and to read the legacy joined `source_id` string form.
+///
+/// `source_id` is written as a JSON array now; this constant survives purely as
+/// the delimiter for parsing pre-array rows. Relation keys use `"<->"`, not
+/// this constant.
 pub const GRAPH_FIELD_SEP: &str = "<SEP>";
 
 // Query and retrieval configuration defaults
@@ -44,6 +49,18 @@ pub const DEFAULT_MIN_RERANK_SCORE: f32 = 0.0;
 pub const DEFAULT_RERANK_BINDING: &str = "null";
 
 // Default source ids limit in metadata for entity and relation
+//
+// NOT WIRED UP — registered as a follow-up by the `source_id` array refactor,
+// deliberately left untouched so that deciding them stays out of that diff:
+//
+// - These two caps have no readers. `EntityExtractorConfig::default` hardcodes
+//   `max_source_ids_per_entity: 30` (see `extraction.rs`), so 200 and 30 are two
+//   unrelated numbers for the same knob. Unify or delete.
+// - The `*_LIMIT_METHOD_*` group has no readers either. `merge_source_ids` is
+//   unconditionally FIFO (drop the oldest chunk id past the cap), so `KEEP` —
+//   which `DEFAULT_SOURCE_IDS_LIMIT_METHOD` names as the default — describes a
+//   behaviour that does not exist. Wiring it up is a behaviour change; deleting
+//   it is not. Decide one way.
 pub const DEFAULT_MAX_SOURCE_IDS_PER_ENTITY: usize = 200;
 pub const DEFAULT_MAX_SOURCE_IDS_PER_RELATION: usize = 200;
 

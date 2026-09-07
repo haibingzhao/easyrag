@@ -1,0 +1,13 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+MATCH (n:`test` {biz_id: $biz}) WHERE ANY(c IN $chunks WHERE c IN n.source_id) RETURN n
+--- params[0] ---
+{
+  "biz": "default",
+  "chunks": [
+    "chunk-1",
+    "chunk-2"
+  ]
+}

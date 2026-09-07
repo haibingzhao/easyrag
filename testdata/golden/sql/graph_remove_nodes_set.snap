@@ -1,0 +1,5 @@
+---
+source: crates/easyrag-storage/tests/postgres_storage.rs
+---
+DELETE FROM graph_edges_graph WHERE workspace = 'test_ws' AND biz_id = 'default' AND (source IN ('Alice','Bob','Carol') OR target IN ('Alice','Bob','Carol'))
+DELETE FROM graph_nodes_graph WHERE id IN ('Alice','Bob','Carol') AND workspace = 'test_ws' AND biz_id = 'default'

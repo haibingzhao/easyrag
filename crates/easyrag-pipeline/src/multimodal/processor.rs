@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use easyrag_core::llm::{LlmRequest, LlmService};
+use easyrag_core::model::source_id::source_ids_value;
 use easyrag_core::storage::{GraphStorage, KVStorage, VectorStorage};
 use easyrag_core::util::hash::compute_mdhash_id;
 use easyrag_core::{CoreError, JsonMap};
@@ -285,7 +286,11 @@ impl BaseModalProcessor {
         node_data.insert("entity_id".to_string(), JsonValue::from(entity_name.clone()));
         node_data.insert("entity_type".to_string(), JsonValue::from(entity_type.clone()));
         node_data.insert("description".to_string(), JsonValue::from(summary.clone()));
-        node_data.insert("source_id".to_string(), JsonValue::from(chunk_id.clone()));
+        // Graph `source_id` is the canonical chunk-id array. The vector-store
+        // `source_id` below stays a plain string: it is a different schema, and
+        // `MemoryVectorStorage::delete_entity_relation` substring-matches that
+        // field as an entity name via `as_str()`.
+        node_data.insert("source_id".to_string(), source_ids_value(&[chunk_id.clone()]));
         node_data.insert("file_path".to_string(), JsonValue::from(file_path));
         node_data.insert(
             "created_at".to_string(),

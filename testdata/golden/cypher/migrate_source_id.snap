@@ -1,0 +1,115 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+MATCH (m:EasyRagGraphMeta {workspace: $ws, meta_key: 'source_id_format'}) RETURN m.meta_value AS v
+--- params[0] ---
+{
+  "ws": "test"
+}
+--- query[1] ---
+CREATE INDEX IF NOT EXISTS FOR (m:EasyRagGraphMeta) ON (m.workspace, m.meta_key)
+--- params[1] ---
+{}
+--- query[2] ---
+MATCH (n:`test`) WHERE n.entity_id > $cur_id OR (n.entity_id = $cur_id AND n.biz_id > $cur_biz) RETURN n.entity_id AS id, n.biz_id AS biz, n.source_id AS sid ORDER BY n.entity_id, n.biz_id LIMIT $batch
+--- params[2] ---
+{
+  "cur_id": "",
+  "cur_biz": "",
+  "batch": 2
+}
+--- query[3] ---
+UNWIND $items AS item MATCH (n:`test` {entity_id: item.id, biz_id: item.biz}) SET n.source_id = item.sids
+--- params[3] ---
+{
+  "items": [
+    {
+      "id": "A",
+      "biz": "default",
+      "sids": [
+        "c1",
+        "c2"
+      ]
+    }
+  ]
+}
+--- query[4] ---
+UNWIND $nodes AS nd MATCH (a:`test` {entity_id: nd.id, biz_id: nd.biz})-[r:DIRECTED]->(b:`test`) WHERE r.source_id IS NOT NULL RETURN a.entity_id AS src, a.biz_id AS biz, b.entity_id AS tgt, b.biz_id AS tgt_biz, r.source_id AS sid
+--- params[4] ---
+{
+  "nodes": [
+    {
+      "id": "A",
+      "biz": "default"
+    },
+    {
+      "id": "B",
+      "biz": "default"
+    }
+  ]
+}
+--- query[5] ---
+UNWIND $items AS item MATCH (a:`test` {entity_id: item.src, biz_id: item.biz})-[r:DIRECTED]->(b:`test` {entity_id: item.tgt, biz_id: item.tgt_biz}) SET r.source_id = item.sids
+--- params[5] ---
+{
+  "items": [
+    {
+      "src": "A",
+      "biz": "default",
+      "tgt": "B",
+      "tgt_biz": "default",
+      "sids": [
+        "c1",
+        "c2"
+      ]
+    }
+  ]
+}
+--- query[6] ---
+MATCH (n:`test`) WHERE n.entity_id > $cur_id OR (n.entity_id = $cur_id AND n.biz_id > $cur_biz) RETURN n.entity_id AS id, n.biz_id AS biz, n.source_id AS sid ORDER BY n.entity_id, n.biz_id LIMIT $batch
+--- params[6] ---
+{
+  "cur_id": "B",
+  "cur_biz": "default",
+  "batch": 2
+}
+--- query[7] ---
+UNWIND $items AS item MATCH (n:`test` {entity_id: item.id, biz_id: item.biz}) SET n.source_id = item.sids
+--- params[7] ---
+{
+  "items": [
+    {
+      "id": "C",
+      "biz": "other",
+      "sids": [
+        "c3"
+      ]
+    }
+  ]
+}
+--- query[8] ---
+UNWIND $nodes AS nd MATCH (a:`test` {entity_id: nd.id, biz_id: nd.biz})-[r:DIRECTED]->(b:`test`) WHERE r.source_id IS NOT NULL RETURN a.entity_id AS src, a.biz_id AS biz, b.entity_id AS tgt, b.biz_id AS tgt_biz, r.source_id AS sid
+--- params[8] ---
+{
+  "nodes": [
+    {
+      "id": "C",
+      "biz": "other"
+    }
+  ]
+}
+--- query[9] ---
+MATCH (n:`test`) WHERE n.entity_id > $cur_id OR (n.entity_id = $cur_id AND n.biz_id > $cur_biz) RETURN n.entity_id AS id, n.biz_id AS biz, n.source_id AS sid ORDER BY n.entity_id, n.biz_id LIMIT $batch
+--- params[9] ---
+{
+  "cur_id": "",
+  "cur_biz": "",
+  "batch": 2
+}
+--- query[10] ---
+MERGE (m:EasyRagGraphMeta {workspace: $ws, meta_key: 'source_id_format'}) SET m.meta_value = 'array', m.updated_at = datetime()
+--- params[10] ---
+{
+  "ws": "test"
+}

@@ -9,12 +9,16 @@
 use async_trait::async_trait;
 use easyrag_core::concurrency::{with_retry as retry_core, IsRetryable, RetryConfig};
 use easyrag_core::llm::EmbeddingFunc;
-use easyrag_core::model::{KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode, TenantScopeRef};
+use easyrag_core::model::{
+    parse_source_ids, source_ids_intersect, source_ids_value, KnowledgeGraph, KnowledgeGraphEdge,
+    KnowledgeGraphNode, TenantScopeRef,
+};
 use easyrag_core::storage::traits::{GraphStorage, StorageNameSpace};
 use easyrag_core::{CoreError, JsonMap};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use crate::drop_result::{drop_error, drop_success};
@@ -35,6 +39,35 @@ pub const META_KIND: &str = "__kind__";
 pub const META_ID: &str = "__id__";
 pub const META_LABELS: &str = "__labels__";
 pub const META_TYPE: &str = "__type__";
+
+/// Reserved label for workspace-level graph *metadata*.
+///
+/// Deliberately not the workspace label: every graph read is
+/// `MATCH (n:`ws`)`, so a marker kept under its own label can never surface as
+/// graph data — not through `get_all_nodes`, `get_all_edges` or
+/// `get_knowledge_graph`. It also survives `drop(biz_id)`, which is correct
+/// rather than a leak: "this workspace holds no legacy `source_id` values" stays
+/// true once its data is gone. Deleting the marker node by hand is how an
+/// operator forces a re-backfill, e.g. after bulk-importing string-format data
+/// from outside this codebase.
+const META_LABEL: &str = "EasyRagGraphMeta";
+
+/// Marker key recording how `source_id` is stored in this workspace.
+const META_KEY_SOURCE_ID_FORMAT: &str = "source_id_format";
+
+/// Marker value meaning "backfilled and verified: every value is a list".
+const META_VALUE_SOURCE_ID_ARRAY: &str = "array";
+
+/// Rows per `source_id` backfill page.
+const DEFAULT_SOURCE_ID_MIGRATION_BATCH: usize = 1000;
+
+/// Env override for [`DEFAULT_SOURCE_ID_MIGRATION_BATCH`].
+const SOURCE_ID_MIGRATION_BATCH_ENV: &str = "GRAPH_SOURCE_ID_MIGRATION_BATCH";
+
+/// Sweep rounds before the backfill gives up and leaves the marker unpublished.
+/// One round converts everything reachable; a second, clean round is what proves
+/// it. The spare round absorbs a value written by an old pod mid-run.
+const MAX_SOURCE_ID_MIGRATION_ROUNDS: usize = 3;
 
 /// Neo4j database operations abstraction.
 /// Allows testing without a live Neo4j instance.
@@ -552,6 +585,14 @@ pub struct Neo4jGraphStorage<O: Neo4jOps = Neo4jDatabase> {
     global_config: JsonMap,
     embedding_func: Option<EmbeddingFunc>,
     db: O,
+    /// Flipped once the `source_id` backfill has verified that every node and
+    /// edge in this workspace stores an array. While it is false the membership
+    /// queries carry an extra arm for the legacy joined string: still correct and
+    /// still server-side, but that arm cannot be index-assisted.
+    source_id_arrays_only: AtomicBool,
+    /// The "migration pending" warning is worth one line per instance, not one
+    /// per deleted document.
+    source_id_legacy_warned: AtomicBool,
 }
 
 impl<O: Neo4jOps> Neo4jGraphStorage<O> {
@@ -578,7 +619,405 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
             global_config,
             embedding_func,
             db,
+            source_id_arrays_only: AtomicBool::new(false),
+            source_id_legacy_warned: AtomicBool::new(false),
         })
+    }
+
+    /// Record the outcome of the `source_id` backfill (see
+    /// `migrate_source_id_to_array`). `true` lets the membership queries run as a
+    /// single server-side Cypher instead of pulling the workspace and filtering
+    /// it in Rust — see [`Self::source_id_needs_fallback`].
+    pub fn set_source_id_arrays_only(&self, arrays_only: bool) {
+        self.source_id_arrays_only
+            .store(arrays_only, Ordering::Release);
+    }
+
+    /// Is the backfill verified for this workspace?
+    pub fn source_id_arrays_only(&self) -> bool {
+        self.source_id_arrays_only.load(Ordering::Acquire)
+    }
+
+    /// `source_id` membership predicate for `MATCH ... WHERE`.
+    ///
+    /// `c IN n.source_id` on a LIST is **element equality**, which is the whole
+    /// point of the array model: a substring test on the joined string would
+    /// match `chunk_1` inside `chunk_10` and delete unrelated graph data.
+    ///
+    /// Only ever emitted once the backfill marker guarantees list values — see
+    /// [`Self::source_id_needs_fallback`] for why there is no legacy arm.
+    fn source_id_array_where(var: &str) -> String {
+        format!("ANY(c IN $chunks WHERE c IN {var}.source_id)")
+    }
+
+    /// Must [`GraphStorage::get_nodes_by_source_ids`] and its edge twin fall back
+    /// to a full pull plus a Rust-side membership test?
+    ///
+    /// They must, until the backfill marker says every value here is a list.
+    /// Cypher has no *version-agnostic* way to ask "is this property a string",
+    /// and every candidate was measured against a live server (Neo4j
+    /// 2026.07.1 / Cypher 25):
+    ///
+    /// - `replace(n.source_id, ...)` and `toString(n.source_id)` both raise
+    ///   `Neo.ClientError.Statement.TypeError` on a LIST
+    ///   (*"Expected a string value for `replace`, but got: StringArray[c1, c2]"*)
+    ///   instead of yielding `null`.
+    /// - So a two-armed `WHERE (array arm) OR (string arm)` only *looks* safe: it
+    ///   succeeds while the array arm matches, because `OR` short-circuits, and
+    ///   raises the moment a chunk id does not match a list-valued row — which is
+    ///   the common case in cleanup, where one document's chunks touch a small
+    ///   subset of the graph. Verified both ways: reordering the arms raises
+    ///   immediately.
+    /// - `n.source_id IS :: STRING` does discriminate, but needs Neo4j 5.x; on 4.x
+    ///   it is a `SyntaxError`, which would turn cleanup into a hard failure
+    ///   rather than a slow path.
+    ///
+    /// The Rust fallback is correct for `string|array` on every version and costs
+    /// only the full pull this refactor exists to remove — which is why the
+    /// backfill flips the flag as soon as it can verify the data, and why the
+    /// window is normally one `initialize()`.
+    fn source_id_needs_fallback(&self) -> bool {
+        if self.source_id_arrays_only() {
+            return false;
+        }
+        // One line per instance, not one per deleted document.
+        if !self
+            .source_id_legacy_warned
+            .swap(true, Ordering::AcqRel)
+        {
+            tracing::warn!(
+                workspace = %self.workspace,
+                "Neo4j source_id backfill not verified yet: graph cleanup falls back to a full \
+                 pull plus in-Rust filtering. Correct, but not server-side — restart once the \
+                 migration marker exists to drop it."
+            );
+        }
+        true
+    }
+
+    /// The trait's default filtering, spelled out: an override cannot call the
+    /// default it overrides, and the pre-backfill path has to behave exactly like
+    /// it so the three backends cannot drift.
+    fn filter_by_source_ids(rows: Vec<JsonMap>, chunk_ids: &[String]) -> Vec<JsonMap> {
+        let wanted: HashSet<String> = chunk_ids.iter().cloned().collect();
+        rows.into_iter()
+            .filter(|props| source_ids_intersect(props, &wanted))
+            .collect()
+    }
+
+    /// Rows per backfill page: env override, else
+    /// [`DEFAULT_SOURCE_ID_MIGRATION_BATCH`]. Resolved per run rather than at
+    /// construction so an operator can retune without a redeploy. What keeps
+    /// repeat runs cheap is the marker short-circuit, not this number.
+    fn source_id_migration_batch() -> usize {
+        std::env::var(SOURCE_ID_MIGRATION_BATCH_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_SOURCE_ID_MIGRATION_BATCH)
+    }
+
+    /// Backfill `source_id` from `<SEP>`/`,`-joined strings to lists, then record
+    /// the outcome in the workspace marker. Called from `initialize()`.
+    ///
+    /// Mirrors the Postgres backfill's contract exactly: a failure is logged and
+    /// swallowed, because a missing marker only costs the Rust fallback in
+    /// [`Self::source_id_needs_fallback`] — correct but not server-side. Startup
+    /// must never depend on the migration succeeding.
+    async fn migrate_source_id_to_array(&self) {
+        if let Err(e) = self
+            .migrate_source_id_with_batch(Self::source_id_migration_batch())
+            .await
+        {
+            tracing::warn!(
+                workspace = %self.workspace,
+                "Neo4j source_id migration failed (non-fatal): {e}"
+            );
+        }
+    }
+
+    /// The backfill itself, with the page size as a parameter rather than read
+    /// from the env here: process-global env would make parallel tests race, and
+    /// this is also the explicit operator entry point for a retuned re-run.
+    pub async fn migrate_source_id_with_batch(&self, batch: usize) -> easyrag_core::Result<()> {
+        let batch = batch.max(1);
+        let ws = self.ws_label();
+
+        // (a) Marker short-circuit. `initialize()` reruns on every workspace LRU
+        // rebuild, so in steady state the entire backfill costs this one lookup.
+        let marker = self
+            .db
+            .run(
+                &format!(
+                    "MATCH (m:{META_LABEL} {{workspace: $ws, meta_key: '{META_KEY_SOURCE_ID_FORMAT}'}}) \
+                     RETURN m.meta_value AS v"
+                ),
+                Self::params(&[("ws", JsonValue::String(self.workspace.clone()))]),
+            )
+            .await?;
+        if marker
+            .first()
+            .and_then(|row| row.get("v"))
+            .and_then(JsonValue::as_str)
+            == Some(META_VALUE_SOURCE_ID_ARRAY)
+        {
+            self.set_source_id_arrays_only(true);
+            return Ok(());
+        }
+
+        // The marker index, and only that: it is what makes step (a) a point
+        // lookup from the second run onwards, and the marker label is tiny so it
+        // costs nothing to maintain.
+        //
+        // A `source_id` index is deliberately **not** created. Measured on a live
+        // server (Neo4j 2026.07.1 / Cypher 25, 200k nodes, RANGE index ONLINE and
+        // `SHOW INDEXES` confirming it): both nestings of the membership
+        // predicate — this code's `ANY(c IN $chunks WHERE c IN n.source_id)` and
+        // the documentation's index-backable shape
+        // `ANY(x IN n.source_id WHERE x IN $chunks)` — plan as `NodeByLabelScan`
+        // + `Filter`, never `NodeIndexSeek`, with the predicate estimated at 75%
+        // selectivity (150k of 200k rows), so a seek would not be chosen even
+        // where one exists. The index would therefore tax every node write with
+        // one entry per list element — up to `max_source_ids_per_entity` — and
+        // buy nothing on the read. What this refactor does save on Neo4j is the
+        // server-side filtering and the bytes not shipped; an index seek is not
+        // part of the claim. Revisit only if a future version resolves list
+        // membership, or when the Phase 2 chunk→entity edge model lands.
+        let stmt =
+            format!("CREATE INDEX IF NOT EXISTS FOR (m:{META_LABEL}) ON (m.workspace, m.meta_key)");
+        if let Err(e) = self.db.run_write_void(&stmt, Neo4jParams::new()).await {
+            tracing::debug!("Index creation skipped: {e}");
+        }
+
+        // (b) Sweep until a full pass rewrites nothing.
+        //
+        // The pass that does the converting cannot itself prove the workspace is
+        // clean: an old pod may write a legacy string to a node the keyset cursor
+        // has already passed, and nothing in Cypher can ask "is this property a
+        // string" without raising on the list case (see
+        // `source_id_needs_fallback`). A *fresh* pass that finds nothing to
+        // rewrite is the only portable evidence, so rounds keep going until one
+        // comes back empty — `MAX_SOURCE_ID_MIGRATION_ROUNDS` is the budget.
+        let (mut nodes, mut edges, mut verified) = (0usize, 0usize, false);
+        for round in 1..=MAX_SOURCE_ID_MIGRATION_ROUNDS {
+            let (converted_nodes, converted_edges) = self.backfill_source_ids(&ws, batch).await?;
+            nodes += converted_nodes;
+            edges += converted_edges;
+            if converted_nodes == 0 && converted_edges == 0 {
+                verified = true;
+                break;
+            }
+            tracing::debug!(
+                workspace = %self.workspace,
+                round,
+                nodes = converted_nodes,
+                edges = converted_edges,
+                "Neo4j source_id backfill converted a round; sweeping again to verify"
+            );
+        }
+
+        // (c) Publish only on evidence. The flag drops the Rust fallback from
+        // every membership query, so a false positive here means silently missed
+        // deletes later, while a false negative only costs the full pull.
+        self.set_source_id_arrays_only(verified);
+        if !verified {
+            tracing::warn!(
+                workspace = %self.workspace,
+                nodes,
+                edges,
+                rounds = MAX_SOURCE_ID_MIGRATION_ROUNDS,
+                "Neo4j source_id backfill kept finding string values; marker withheld and cleanup \
+                 queries keep the Rust fallback. Correct, but not server-side — rerun once every \
+                 writer is on this build."
+            );
+            return Ok(());
+        }
+        self.db
+            .run_write_void(
+                &format!(
+                    "MERGE (m:{META_LABEL} {{workspace: $ws, meta_key: '{META_KEY_SOURCE_ID_FORMAT}'}}) \
+                     SET m.meta_value = '{META_VALUE_SOURCE_ID_ARRAY}', m.updated_at = datetime()"
+                ),
+                Self::params(&[("ws", JsonValue::String(self.workspace.clone()))]),
+            )
+            .await?;
+        tracing::info!(
+            workspace = %self.workspace,
+            nodes,
+            edges,
+            "Neo4j source_id backfill complete; marker published"
+        );
+        Ok(())
+    }
+
+    /// Keyset sweep over `(entity_id, biz_id)` — the node MERGE key, and the only
+    /// ordering on which a page boundary cannot skip rows: `entity_id` alone
+    /// repeats once per biz line, so a page ending mid-tie would drop the rest of
+    /// the group. Relationships are reached *through* their source node, which
+    /// visits each one exactly once and lets the composite index drive the seek;
+    /// a relationship has no unique ordered key short of all four endpoint
+    /// columns.
+    ///
+    /// Every node is paged, including one with no `source_id` at all: filtering
+    /// the page read on `source_id IS NOT NULL` would also skip its outgoing
+    /// relationships, and a legacy value left on one of those would let the
+    /// marker be published over data the array-only query can no longer see.
+    ///
+    /// Returns how many node and relationship values were rewritten.
+    async fn backfill_source_ids(
+        &self,
+        ws: &str,
+        batch: usize,
+    ) -> easyrag_core::Result<(usize, usize)> {
+        let mut cur_id = String::new();
+        let mut cur_biz = String::new();
+        let (mut nodes, mut edges) = (0, 0);
+        loop {
+            // Entity ids are non-empty entity names, so the empty start cursor
+            // sorts before every row. Nothing in the WHERE depends on the value
+            // being converted, so a page can never strand a row behind the
+            // cursor.
+            let rows = self
+                .db
+                .run(
+                    &format!(
+                        "MATCH (n:{ws}) \
+                         WHERE n.entity_id > $cur_id \
+                            OR (n.entity_id = $cur_id AND n.biz_id > $cur_biz) \
+                         RETURN n.entity_id AS id, n.biz_id AS biz, n.source_id AS sid \
+                         ORDER BY n.entity_id, n.biz_id LIMIT $batch"
+                    ),
+                    Self::params(&[
+                        ("cur_id", JsonValue::String(cur_id.clone())),
+                        ("cur_biz", JsonValue::String(cur_biz.clone())),
+                        ("batch", JsonValue::from(batch as i64)),
+                    ]),
+                )
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+            let page_len = rows.len();
+            // Advance from the raw page, before the already-a-list filter below:
+            // converted rows must still move the cursor or the loop never ends.
+            let last = &rows[page_len - 1];
+            cur_id = Self::row_str(last, "id");
+            cur_biz = Self::row_str(last, "biz");
+
+            // Nodes. The pattern is spelled out rather than built with
+            // `cypher::node_pat`, which always binds biz to `$biz` — a page mixes
+            // biz lines because the backfill is workspace-wide.
+            let node_items: Vec<JsonValue> = rows
+                .iter()
+                .filter_map(|row| {
+                    let sids = Self::converted_source_ids(row.get("sid"))?;
+                    Some(JsonValue::Object(Self::params(&[
+                        ("id", JsonValue::String(Self::row_str(row, "id"))),
+                        ("biz", JsonValue::String(Self::row_str(row, "biz"))),
+                        ("sids", sids),
+                    ])))
+                })
+                .collect();
+            nodes += node_items.len();
+            if !node_items.is_empty() {
+                self.db
+                    .run_write_void(
+                        &format!(
+                            "{} \
+                             MATCH (n:{ws} {{entity_id: item.id, biz_id: item.biz}}) \
+                             SET n.source_id = item.sids",
+                            cypher::unwind("items", "item")
+                        ),
+                        Self::params(&[("items", JsonValue::Array(node_items))]),
+                    )
+                    .await?;
+            }
+
+            // Relationships of every node on the page, including nodes whose own
+            // value was already a list: a prior interrupted run may have converted
+            // the node and not its edges.
+            let keys: Vec<JsonValue> = rows
+                .iter()
+                .map(|row| {
+                    JsonValue::Object(Self::params(&[
+                        ("id", JsonValue::String(Self::row_str(row, "id"))),
+                        ("biz", JsonValue::String(Self::row_str(row, "biz"))),
+                    ]))
+                })
+                .collect();
+            let edge_rows = self
+                .db
+                .run(
+                    &format!(
+                        "{} \
+                         MATCH (a:{ws} {{entity_id: nd.id, biz_id: nd.biz}}){}(b:{ws}) \
+                         WHERE r.source_id IS NOT NULL \
+                         RETURN a.entity_id AS src, a.biz_id AS biz, \
+                                b.entity_id AS tgt, b.biz_id AS tgt_biz, r.source_id AS sid",
+                        cypher::unwind("nodes", "nd"),
+                        cypher::edge_pat("r", true)
+                    ),
+                    Self::params(&[("nodes", JsonValue::Array(keys))]),
+                )
+                .await?;
+            let edge_items: Vec<JsonValue> = edge_rows
+                .iter()
+                .filter_map(|row| {
+                    let sids = Self::converted_source_ids(row.get("sid"))?;
+                    Some(JsonValue::Object(Self::params(&[
+                        ("src", JsonValue::String(Self::row_str(row, "src"))),
+                        ("biz", JsonValue::String(Self::row_str(row, "biz"))),
+                        ("tgt", JsonValue::String(Self::row_str(row, "tgt"))),
+                        ("tgt_biz", JsonValue::String(Self::row_str(row, "tgt_biz"))),
+                        ("sids", sids),
+                    ])))
+                })
+                .collect();
+            edges += edge_items.len();
+            if !edge_items.is_empty() {
+                self.db
+                    .run_write_void(
+                        &format!(
+                            "{} \
+                             MATCH (a:{ws} {{entity_id: item.src, biz_id: item.biz}}){}\
+                             (b:{ws} {{entity_id: item.tgt, biz_id: item.tgt_biz}}) \
+                             SET r.source_id = item.sids",
+                            cypher::unwind("items", "item"),
+                            cypher::edge_pat("r", true)
+                        ),
+                        Self::params(&[("items", JsonValue::Array(edge_items))]),
+                    )
+                    .await?;
+            }
+
+            if page_len < batch {
+                break;
+            }
+        }
+        Ok((nodes, edges))
+    }
+
+    /// The list to write for one stored value, or `None` when the row needs no
+    /// rewrite. Going through [`parse_source_ids`] — the same function the read
+    /// side uses — is what stops the backfill and the readers from ever
+    /// disagreeing about what a legacy string meant, including the `,` form two
+    /// of the three historical readers also split on.
+    ///
+    /// Only the joined *string* is a migration target. A list is already
+    /// canonical, and an absent/null value carries no chunk references, so both
+    /// are returned as `None` and left byte-identical: rewriting them would
+    /// invent provenance where there was none, and [`source_ids_intersect`] reads
+    /// every one of those shapes as "references no chunk" anyway. `None` on an
+    /// already-converted row is also what makes a re-run a per-row no-op.
+    ///
+    /// A stored scalar that is neither string nor list is unreachable through
+    /// this codebase's write path (`sanitize_props` + `source_ids_value`), so it
+    /// is left alone rather than coerced.
+    fn converted_source_ids(sid: Option<&JsonValue>) -> Option<JsonValue> {
+        if !matches!(sid, Some(JsonValue::String(_))) {
+            return None;
+        }
+        Some(source_ids_value(&parse_source_ids(sid)))
     }
 
     /// Borrowed tenant scope for this backend (no allocation).
@@ -683,6 +1122,26 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
             .to_string();
         map.insert("entity_id".to_string(), JsonValue::String(entity_id));
         Some(map)
+    }
+
+    /// Edge map = `properties(r)` plus the injected `source`/`target` endpoints.
+    /// Shared by `get_all_edges` and `get_edges_by_source_ids` so the two cannot
+    /// drift on result shape.
+    fn edge_row_to_map(row: &Neo4jRow) -> JsonMap {
+        let mut props = row
+            .get("props")
+            .and_then(Self::as_object)
+            .cloned()
+            .unwrap_or_default();
+        props.insert(
+            "source".to_string(),
+            JsonValue::String(Self::row_str(row, "src")),
+        );
+        props.insert(
+            "target".to_string(),
+            JsonValue::String(Self::row_str(row, "tgt")),
+        );
+        props
     }
 
     fn node_labels(node: &JsonValue) -> Vec<String> {
@@ -894,6 +1353,15 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
 /// Neo4j only supports primitive types, strings, and lists of primitives.
 /// Reserved META_* keys are dropped on the write side so that the read side
 /// (`strip_meta`) and the wire encoding stay symmetric.
+///
+/// Scalars pass through unchanged at *both* levels. That matters more than it
+/// looks: `serde_json::Value::to_string()` is `Display`, i.e. JSON
+/// serialisation, so stringifying a `Value::String("chunk-1")` yields
+/// `"\"chunk-1\""` — quotes included. Routing list elements through that
+/// fallback would double-quote every `source_id` entry and silently break
+/// element-membership predicates such as `ANY(c IN $ids WHERE c IN n.source_id)`.
+/// Only genuinely unsupported shapes (nested objects / nested lists) are
+/// stringified, since Neo4j has no representation for them.
 fn sanitize_props(data: JsonMap) -> JsonMap {
     data.into_iter()
         .filter(|(k, _)| !matches!(k.as_str(), META_KIND | META_ID | META_LABELS | META_TYPE))
@@ -907,7 +1375,10 @@ fn sanitize_props(data: JsonMap) -> JsonMap {
                     items
                         .into_iter()
                         .map(|it| match it {
-                            JsonValue::Number(_) | JsonValue::Null => it,
+                            JsonValue::String(_)
+                            | JsonValue::Bool(_)
+                            | JsonValue::Number(_)
+                            | JsonValue::Null => it,
                             other => JsonValue::String(other.to_string()),
                         })
                         .collect(),
@@ -966,11 +1437,18 @@ impl<O: Neo4jOps> StorageNameSpace for Neo4jGraphStorage<O> {
         {
             tracing::debug!("Fulltext index creation skipped: {e}");
         }
+
+        // Non-fatal, and cheap in steady state: once the workspace marker exists
+        // this is a single point lookup, which matters because `initialize()`
+        // reruns whenever the workspace LRU rebuilds a bundle.
+        self.migrate_source_id_to_array().await;
         Ok(())
     }
 
     async fn drop(&self, biz_id: &str) -> easyrag_core::Result<HashMap<String, String>> {
         let ws = self.ws_label();
+        // Scoped to the workspace label, so the `META_LABEL` marker node is left
+        // in place — deliberately, see its doc comment.
         match self
             .db
             .run_write_void(
@@ -1306,25 +1784,79 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
                 Self::biz_params(biz_id),
             )
             .await?;
+        Ok(records.iter().map(Self::edge_row_to_map).collect())
+    }
+
+    async fn get_nodes_by_source_ids(
+        &self,
+        chunk_ids: &[String],
+        biz_id: &str,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        if chunk_ids.is_empty() {
+            // Never a label scan: no chunks means no candidates.
+            return Ok(Vec::new());
+        }
+        // Until the backfill marker exists, both stored shapes coexist and no
+        // portable Cypher can test for them in one WHERE — see
+        // `source_id_needs_fallback`. The membership test moves to Rust over the
+        // full pull, which is exactly what the trait's default implementation
+        // does, so the pre-backfill behaviour cannot drift between backends.
+        if self.source_id_needs_fallback() {
+            let all = self.get_all_nodes(biz_id).await?;
+            return Ok(Self::filter_by_source_ids(all, chunk_ids));
+        }
+        let node = self.node_scope(biz_id);
+        let records = self
+            .db
+            .run(
+                &format!(
+                    "MATCH (n:{node}) WHERE {} RETURN n",
+                    Self::source_id_array_where("n")
+                ),
+                Self::biz_params_with(
+                    biz_id,
+                    &[("chunks", JsonValue::Array(cypher::json_ids(chunk_ids)))],
+                ),
+            )
+            .await?;
         Ok(records
             .iter()
-            .map(|r| {
-                let mut props = r
-                    .get("props")
-                    .and_then(Self::as_object)
-                    .cloned()
-                    .unwrap_or_default();
-                props.insert(
-                    "source".to_string(),
-                    JsonValue::String(Self::row_str(r, "src")),
-                );
-                props.insert(
-                    "target".to_string(),
-                    JsonValue::String(Self::row_str(r, "tgt")),
-                );
-                props
-            })
+            .filter_map(|r| r.get("n"))
+            .filter_map(Self::node_to_map)
             .collect())
+    }
+
+    async fn get_edges_by_source_ids(
+        &self,
+        chunk_ids: &[String],
+        biz_id: &str,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        if chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Same gate and same fallback as `get_nodes_by_source_ids`.
+        if self.source_id_needs_fallback() {
+            let all = self.get_all_edges(biz_id).await?;
+            return Ok(Self::filter_by_source_ids(all, chunk_ids));
+        }
+        let node = self.node_scope(biz_id);
+        let records = self
+            .db
+            .run(
+                &format!(
+                    "MATCH (a:{node}){}(b:{node}) \
+                     WHERE {} \
+                     RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props",
+                    cypher::edge_pat("r", true),
+                    Self::source_id_array_where("r")
+                ),
+                Self::biz_params_with(
+                    biz_id,
+                    &[("chunks", JsonValue::Array(cypher::json_ids(chunk_ids)))],
+                ),
+            )
+            .await?;
+        Ok(records.iter().map(Self::edge_row_to_map).collect())
     }
 
     async fn get_popular_labels(&self, limit: usize, biz_id: &str) -> easyrag_core::Result<Vec<String>> {

@@ -7,6 +7,7 @@ use easyrag_core::constants::{
 use easyrag_core::llm::service::{
     ChatMessage, LlmRequest, LlmService, MessageRole, ResponseFormat,
 };
+use easyrag_core::model::source_id::{merge_source_ids, source_ids_value};
 use easyrag_core::model::types::{
     EntityExtractionResult, ExtractedEntity, ExtractedRelationship,
 };
@@ -241,7 +242,10 @@ fn base_vars(cfg: &EntityExtractorConfig) -> HashMap<String, String> {
 /// written here. `testdata/golden/extraction/*_payload.snap` pins it.
 struct GraphUpsert {
     description: String,
-    source_id: String,
+    /// Chunk ids this payload is provenanced to — already merged, deduped and
+    /// FIFO-capped by [`merge_source_ids`]. Stored as a JSON array so that the
+    /// storage layer can test chunk membership element-wise.
+    source_id: Vec<String>,
 }
 
 impl GraphUpsert {
@@ -250,7 +254,7 @@ impl GraphUpsert {
         let mut data = JsonMap::new();
         data.insert("entity_type".into(), JsonValue::String(entity_type.into()));
         data.insert("description".into(), JsonValue::String(self.description));
-        data.insert("source_id".into(), JsonValue::String(self.source_id));
+        data.insert("source_id".into(), source_ids_value(&self.source_id));
         data
     }
 
@@ -264,7 +268,7 @@ impl GraphUpsert {
         let mut data = JsonMap::new();
         data.insert("keywords".into(), JsonValue::String(keywords.into()));
         data.insert("description".into(), JsonValue::String(self.description));
-        data.insert("source_id".into(), JsonValue::String(self.source_id));
+        data.insert("source_id".into(), source_ids_value(&self.source_id));
         data.insert("weight".into(), serde_json::json!(weight));
         data
     }
@@ -487,11 +491,10 @@ impl EntityExtractor {
 
                         let data = GraphUpsert {
                             description: final_desc,
-                            source_id: merge_source_ids_str(
-                                existing
-                                    .get("source_id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or(""),
+                            // Accepts either stored shape (array or legacy
+                            // joined string) and yields the canonical list.
+                            source_id: merge_source_ids(
+                                existing.get("source_id"),
                                 &chunk_id,
                                 self.config.max_source_ids_per_entity,
                             ),
@@ -501,7 +504,7 @@ impl EntityExtractor {
                     } else {
                         let data = GraphUpsert {
                             description: entity.entity_description.clone(),
-                            source_id: chunk_id.clone(),
+                            source_id: vec![chunk_id.clone()],
                         }
                         .node(entity.entity_type.clone());
                         self.graph_storage.upsert_node(&entity_name, data, biz_id).await?;
@@ -545,11 +548,8 @@ impl EntityExtractor {
 
                         let data = GraphUpsert {
                             description: final_desc,
-                            source_id: merge_source_ids_str(
-                                existing
-                                    .get("source_id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or(""),
+                            source_id: merge_source_ids(
+                                existing.get("source_id"),
                                 &chunk_id,
                                 self.config.max_source_ids_per_entity,
                             ),
@@ -561,7 +561,7 @@ impl EntityExtractor {
                     } else {
                         let data = GraphUpsert {
                             description: rel.relationship_description.clone(),
-                            source_id: chunk_id.clone(),
+                            source_id: vec![chunk_id.clone()],
                         }
                         .edge(rel.relationship_keywords.clone(), 1.0_f32);
                         self.graph_storage
@@ -905,27 +905,4 @@ impl EntityExtractor {
             relationships,
         }
     }
-}
-
-/// Merge source IDs, deduplicating and respecting the FIFO limit
-/// (oldest IDs dropped when exceeding `max_source_ids`).
-fn merge_source_ids_str(existing: &str, new_id: &str, max_source_ids: usize) -> String {
-    if existing.trim().is_empty() {
-        return new_id.to_string();
-    }
-    let mut ids: Vec<&str> = existing
-        .split(GRAPH_FIELD_SEP)
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !ids.contains(&new_id) {
-        ids.push(new_id);
-    }
-    // FIFO: keep only the most recent `max_source_ids` entries.
-    let trimmed = if ids.len() > max_source_ids {
-        ids.split_off(ids.len() - max_source_ids)
-    } else {
-        ids
-    };
-    trimmed.join(GRAPH_FIELD_SEP)
 }

@@ -1058,6 +1058,8 @@ async fn source_ids_are_capped_fifo() {
             ("entity_type", JsonValue::String("Person".to_string())),
             ("description", JsonValue::String("d".to_string())),
             (
+                // Legacy joined string on purpose: the merge has to read it and
+                // write back the canonical array.
                 "source_id",
                 JsonValue::String(existing.join(GRAPH_FIELD_SEP)),
             ),
@@ -1068,16 +1070,16 @@ async fn source_ids_are_capped_fifo() {
     merge(Arc::clone(&graph), &entity_result("f", "Person"), config).await;
 
     let writes = graph.node_writes();
-    let source_id = writes[0]
+    let source_ids: Vec<&str> = writes[0]
         .1
         .get("source_id")
-        .and_then(|v| v.as_str())
-        .expect("source_id");
+        .and_then(|v| v.as_array())
+        .expect("source_id must be written as an array")
+        .iter()
+        .map(|v| v.as_str().expect("chunk ids are strings"))
+        .collect();
     // Oldest dropped, the new chunk id appended last.
-    assert_eq!(
-        source_id,
-        format!("chunk-4{GRAPH_FIELD_SEP}chunk-5{GRAPH_FIELD_SEP}chunk-7")
-    );
+    assert_eq!(source_ids, ["chunk-4", "chunk-5", "chunk-7"]);
     snap("source_id_fifo_payload", &render_writes(&graph));
 }
 
@@ -1094,9 +1096,62 @@ async fn source_id_deduplicates_the_same_chunk() {
     merge(Arc::clone(&graph), &entity_result("f", "Person"), cfg(true)).await;
     let writes = graph.node_writes();
     assert_eq!(
-        writes[0].1.get("source_id").and_then(|v| v.as_str()),
-        Some("chunk-7"),
+        writes[0].1.get("source_id"),
+        Some(&JsonValue::Array(vec![JsonValue::String("chunk-7".to_string())])),
         "an already-present chunk id must not be appended twice"
+    );
+}
+
+/// The stored shape must not influence the merged result: a legacy joined
+/// string and the canonical array describing the same chunk ids have to produce
+/// byte-identical payloads. This is the "read legacy, write canonical"
+/// migration path the backfill relies on.
+#[tokio::test]
+async fn source_id_merge_is_shape_agnostic() {
+    let seeded = |source_id: JsonValue| {
+        RecordingGraph::new().with_node(
+            "Ada Lovelace",
+            vec![
+                ("entity_type", JsonValue::String("Person".to_string())),
+                ("description", JsonValue::String("d".to_string())),
+                ("source_id", source_id),
+            ],
+        )
+    };
+    let mut config = cfg(true);
+    config.max_source_ids_per_entity = 3;
+
+    // Comma-joined as well as `<SEP>`-joined: both delimiters occur in stored
+    // data because two of the three historical readers split on both.
+    let legacy = seeded(JsonValue::String(format!(
+        "chunk-4{GRAPH_FIELD_SEP}chunk-5,chunk-6"
+    )));
+    merge(
+        Arc::clone(&legacy),
+        &entity_result("f", "Person"),
+        config.clone(),
+    )
+    .await;
+
+    let canonical = seeded(JsonValue::Array(vec![
+        JsonValue::String("chunk-4".to_string()),
+        JsonValue::String("chunk-5".to_string()),
+        JsonValue::String("chunk-6".to_string()),
+    ]));
+    merge(Arc::clone(&canonical), &entity_result("f", "Person"), config).await;
+
+    assert_eq!(
+        legacy.node_writes(),
+        canonical.node_writes(),
+        "both stored shapes must converge on the same payload"
+    );
+    assert_eq!(
+        canonical.node_writes()[0].1.get("source_id"),
+        Some(&JsonValue::Array(vec![
+            JsonValue::String("chunk-5".to_string()),
+            JsonValue::String("chunk-6".to_string()),
+            JsonValue::String("chunk-7".to_string()),
+        ]))
     );
 }
 

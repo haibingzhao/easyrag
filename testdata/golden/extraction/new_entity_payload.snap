@@ -7,7 +7,9 @@ keys=[entity_type, description, source_id]
 {
   "entity_type": "Person",
   "description": "Brand new description",
-  "source_id": "chunk-7"
+  "source_id": [
+    "chunk-7"
+  ]
 }
 
 edge_writes=0

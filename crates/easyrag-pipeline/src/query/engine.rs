@@ -7,6 +7,7 @@ use easyrag_core::llm::service::{
 };
 use easyrag_core::model::document_structure::section_path_of;
 use easyrag_core::model::query_param::{QueryParam, QueryMode};
+use easyrag_core::model::source_id::parse_source_ids;
 use easyrag_core::model::verification::QualityDecision;
 use easyrag_core::prompt::{
     format_prompt, FAIL_RESPONSE, KEYWORDS_EXTRACTION, KEYWORDS_EXTRACTION_EXAMPLES,
@@ -22,7 +23,7 @@ use easyrag_core::JsonMap;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 /// Keywords extraction result.
@@ -1138,18 +1139,15 @@ impl QueryEngine {
             .await?;
 
         // 4b. Collect entity-related chunks via source_ids.
+        // `parse_source_ids` owns the split rule (array, or legacy `<SEP>`/`,`
+        // joined string); the old inline `split("<SEP>")` literal was a fourth
+        // copy of that rule and a drift source.
         let mut entity_chunk_ids: Vec<String> = Vec::new();
+        let mut seen_chunk_ids: HashSet<String> = HashSet::new();
         for entity in entities.iter().take(10) {
-            let Some(source_id) = entity.get("source_id").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            // split by either delimiter. Done in
-            // two passes since &[&str] is not a stable str::Pattern.
-            for part in source_id.split("<SEP>") {
-                for id in part.split(',').map(|s| s.trim()) {
-                    if !id.is_empty() && !entity_chunk_ids.iter().any(|x| x == id) {
-                        entity_chunk_ids.push(id.to_string());
-                    }
+            for id in parse_source_ids(entity.get("source_id")) {
+                if seen_chunk_ids.insert(id.clone()) {
+                    entity_chunk_ids.push(id);
                 }
             }
         }

@@ -8,6 +8,9 @@ keys=[keywords, description, source_id, weight]
 {
   "keywords": "collaborated with",
   "description": "d<SEP>fresh info",
-  "source_id": "chunk-1<SEP>chunk-7",
+  "source_id": [
+    "chunk-1",
+    "chunk-7"
+  ],
   "weight": 1.100000023841858
 }

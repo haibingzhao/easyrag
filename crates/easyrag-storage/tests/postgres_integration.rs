@@ -531,3 +531,239 @@ async fn pg_biz_id_not_null_enforced() {
     assert!(db.execute(&sql).await.is_err());
     storage.drop(BIZ).await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// source_id backfill (live)
+// ---------------------------------------------------------------------------
+
+/// Render an `EXPLAIN` result. The plan column's name is driver-dependent, so
+/// take every string in the row instead of guessing the key.
+fn plan_text(rows: &[JsonMap]) -> String {
+    rows.iter()
+        .flat_map(|row| row.values())
+        .filter_map(|value| value.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn scalar(db_rows: Vec<JsonMap>, key: &str) -> i64 {
+    db_rows
+        .first()
+        .and_then(|row| row.get(key))
+        .and_then(|value| value.as_i64())
+        .unwrap_or(-1)
+}
+
+/// The backfill's correctness contract, against a real server: both historical
+/// delimiters convert, element order survives, a second `initialize()` is a
+/// no-op, the probe reaches zero, and the GIN index is both present and actually
+/// chosen for `?|`.
+#[tokio::test]
+#[ignore]
+async fn pg_graph_source_id_backfill_converts_and_is_idempotent() {
+    let ws = unique_workspace("srcid");
+    let db = connect(&ws).await;
+    // A namespace of its own: graph table names derive from the namespace, not
+    // the workspace, so two live tests sharing one would race on `CREATE INDEX`
+    // and on each other's rows.
+    let graph = PgGraphStorage::new("srcid_migrate", &ws, db.clone()).unwrap();
+    graph.initialize().await.unwrap();
+
+    let (nodes, edges) = ("graph_nodes_srcid_migrate", "graph_edges_srcid_migrate");
+    let probe = |table: &str| {
+        let (db, ws, table) = (db.clone(), ws.clone(), table.to_string());
+        async move {
+            scalar(
+                db.fetch_all(&format!(
+                    "SELECT count(*) AS cnt FROM {table} WHERE workspace = '{ws}' \
+                     AND jsonb_typeof(properties -> 'source_id') = 'string'"
+                ))
+                .await
+                .unwrap(),
+                "cnt",
+            )
+        }
+    };
+
+    // Seed legacy values *behind the storage layer's back*: an old pod leaves
+    // exactly these. Both delimiter forms, plus the prefix pair that motivated
+    // the whole refactor.
+    for (id, sid) in [
+        ("Alpha", "c1<SEP>c2"),
+        ("Beta", "c1,c3"),
+        ("chunk_1", "chunk_1"),
+        ("chunk_10", "chunk_10"),
+        ("Padded", " c7 <SEP>  "),
+    ] {
+        db.execute(&format!(
+            "INSERT INTO {nodes} (id, workspace, biz_id, properties) \
+             VALUES ('{id}', '{ws}', '{BIZ}', '{{\"source_id\": \"{sid}\"}}'::jsonb)"
+        ))
+        .await
+        .unwrap();
+    }
+    db.execute(&format!(
+        "INSERT INTO {edges} (id, workspace, biz_id, source, target, properties) \
+         VALUES ('Alpha-Beta', '{ws}', '{BIZ}', 'Alpha', 'Beta', \
+                 '{{\"source_id\": \"c1<SEP>c9\"}}'::jsonb)"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(5, probe(nodes).await);
+    assert_eq!(1, probe(edges).await);
+
+    // Pre-migration the legacy arm is what makes cleanup correct: `?|` alone is
+    // false against a string scalar, so without that arm these five nodes would
+    // be silently skipped and never cleaned up.
+    let legacy_hits = graph
+        .get_nodes_by_source_ids(&["c1".to_string()], BIZ)
+        .await
+        .unwrap();
+    let mut ids: Vec<&str> = legacy_hits
+        .iter()
+        .filter_map(|n| n.get("id").and_then(|v| v.as_str()))
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(vec!["Alpha", "Beta"], ids);
+
+    graph.initialize().await.unwrap();
+
+    // Both delimiters split, padding is trimmed, empties dropped, order kept.
+    let alpha = graph.get_node("Alpha", BIZ).await.unwrap().unwrap();
+    assert_eq!(json!(["c1", "c2"]), alpha["source_id"]);
+    let beta = graph.get_node("Beta", BIZ).await.unwrap().unwrap();
+    assert_eq!(json!(["c1", "c3"]), beta["source_id"]);
+    let padded = graph.get_node("Padded", BIZ).await.unwrap().unwrap();
+    assert_eq!(json!(["c7"]), padded["source_id"]);
+    let edge = graph.get_edge("Alpha", "Beta", BIZ).await.unwrap().unwrap();
+    assert_eq!(json!(["c1", "c9"]), edge["source_id"]);
+
+    // The completion gate: zero legacy values left, on both tables.
+    assert_eq!(0, probe(nodes).await);
+    assert_eq!(0, probe(edges).await);
+
+    // Second run is a no-op on the data: the partial index makes the WHERE an
+    // index scan over zero rows, and the values are untouched.
+    let before = graph.get_node("Alpha", BIZ).await.unwrap().unwrap();
+    graph.initialize().await.unwrap();
+    assert_eq!(before, graph.get_node("Alpha", BIZ).await.unwrap().unwrap());
+    assert_eq!(0, probe(nodes).await);
+
+    // Element-level equality is the point of the array model: a substring match
+    // on the joined string would have dragged chunk_10 in with chunk_1.
+    let hits = graph
+        .get_nodes_by_source_ids(&["chunk_1".to_string()], BIZ)
+        .await
+        .unwrap();
+    assert_eq!(1, hits.len());
+    assert_eq!("chunk_1", hits[0]["id"].as_str().unwrap());
+    let hits = graph
+        .get_nodes_by_source_ids(&["c1".to_string()], BIZ)
+        .await
+        .unwrap();
+    assert_eq!(2, hits.len(), "post-backfill the array arm still finds both");
+
+    graph.drop(BIZ).await.unwrap();
+}
+
+/// R4 acceptance: `?|` has to be resolved by the expression GIN index, not a
+/// sequential scan. The index is named `_srcid` because `initialize()` already
+/// owns `idx_{edges}_src` for the btree over the edges' `source` *column* —
+/// reusing that name would make `CREATE INDEX IF NOT EXISTS` skip ours silently
+/// and leave every edge filter a seq scan with nothing in the logs to say so.
+#[tokio::test]
+#[ignore]
+async fn pg_graph_source_id_filter_uses_the_gin_index() {
+    let ws = unique_workspace("srcidx");
+    let db = connect(&ws).await;
+    let graph = PgGraphStorage::new("gin_probe", &ws, db.clone()).unwrap();
+    graph.initialize().await.unwrap();
+    let (nodes, edges) = ("graph_nodes_gin_probe", "graph_edges_gin_probe");
+
+    // Definitions first: this is what makes `?|` *eligible* for an index, and it
+    // is the assertion that catches the naming collision. Must be the default
+    // `jsonb_ops` — `jsonb_path_ops` does not support `?|` at all. The strings
+    // below are Postgres' own normalized rendering of the DDL, `::text` casts
+    // and extra parens included.
+    let defs = db
+        .fetch_all(&format!(
+            "SELECT indexdef FROM pg_indexes WHERE tablename IN ('{nodes}', '{edges}')"
+        ))
+        .await
+        .unwrap();
+    // Suffix-matched rather than `LIKE '%srcid%'`: the namespace is part of the
+    // table name, so a substring filter also picks up the primary key and the
+    // `_src`/`_tgt`/`_ws_biz` btrees.
+    let rendered: Vec<String> = defs
+        .iter()
+        .filter_map(|row| row.get("indexdef").and_then(|v| v.as_str()).map(str::to_string))
+        .filter(|def| def.contains("_srcid ON") || def.contains("_srcid_legacy ON"))
+        .collect();
+    assert_eq!(4, rendered.len(), "2 tables x (gin + legacy partial): {rendered:?}");
+    let gin = "USING gin (((properties -> 'source_id'::text)))";
+    assert_eq!(
+        2,
+        rendered.iter().filter(|d| d.contains(gin)).count(),
+        "expression GIN on both tables: {rendered:?}"
+    );
+    assert!(
+        rendered.iter().all(|d| !d.contains("jsonb_path_ops")),
+        "jsonb_path_ops cannot serve ?|: {rendered:?}"
+    );
+    let partial = "WHERE (jsonb_typeof((properties -> 'source_id'::text)) = 'string'::text)";
+    assert_eq!(
+        2,
+        rendered.iter().filter(|d| d.contains(partial)).count(),
+        "legacy partial index on both tables: {rendered:?}"
+    );
+    // The collision this naming avoids, asserted against the live catalog: `_src`
+    // is already taken by a btree on the edges' `source` *column*, so a GIN
+    // called `_src` would have been skipped by IF NOT EXISTS.
+    let clash = db
+        .fetch_all(&format!(
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'idx_{edges}_src'"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        format!(
+            "CREATE INDEX idx_{edges}_src ON public.{edges} USING btree (source, workspace, biz_id)"
+        ),
+        plan_text(&clash),
+        "the pre-existing btree still owns the _src name"
+    );
+
+    // Then the plan. A handful of rows would legitimately seq-scan, so seed
+    // enough that the planner has a reason to prefer the index, and keep the
+    // predicate selective.
+    db.execute(&format!(
+        "INSERT INTO {nodes} (id, workspace, biz_id, properties) \
+         SELECT 'bulk_' || g, '{ws}', '{BIZ}', \
+                jsonb_build_object('source_id', jsonb_build_array('chunk_' || g), \
+                                   'description', repeat('x', 200)) \
+         FROM generate_series(1, 20000) AS g"
+    ))
+    .await
+    .unwrap();
+    db.execute(&format!("ANALYZE {nodes}")).await.unwrap();
+
+    let plan = plan_text(
+        &db.fetch_all(&format!(
+            "EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM {nodes} \
+             WHERE workspace = '{ws}' AND (properties -> 'source_id') ?| ARRAY['chunk_7']::text[]"
+        ))
+        .await
+        .unwrap(),
+    );
+    assert!(
+        plan.contains(&format!("idx_{nodes}_srcid")),
+        "expected a bitmap index scan on the expression GIN, got:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Seq Scan"),
+        "the server-side filter must not degrade to a seq scan:\n{plan}"
+    );
+
+    graph.drop(BIZ).await.unwrap();
+}
+

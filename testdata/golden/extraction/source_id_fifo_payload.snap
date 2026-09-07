@@ -7,7 +7,11 @@ keys=[entity_type, description, source_id]
 {
   "entity_type": "Person",
   "description": "d<SEP>f",
-  "source_id": "chunk-4<SEP>chunk-5<SEP>chunk-7"
+  "source_id": [
+    "chunk-4",
+    "chunk-5",
+    "chunk-7"
+  ]
 }
 
 edge_writes=0

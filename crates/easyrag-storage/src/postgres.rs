@@ -1454,6 +1454,154 @@ impl<D: PgDb> PgGraphStorage<D> {
         }
     }
 
+    /// Chunk-id lists longer than this are queried in shards and unioned, so a
+    /// document with thousands of chunks cannot inflate one SQL literal without
+    /// bound. `PgDb` has no bind parameters — every value is concatenated in.
+    const SOURCE_ID_QUERY_SHARD: usize = 1000;
+
+    /// `source_id` membership predicate, rendered identically for nodes and
+    /// edges.
+    ///
+    /// Two arms, because both stored shapes are live until the backfill has run
+    /// on every deployment:
+    ///
+    /// - `(properties -> 'source_id') ?| ARRAY[...]` — the canonical array. `?|`
+    ///   is "has any of these keys", which on a jsonb *array* means element
+    ///   equality, and it is the arm served by the GIN index built in
+    ///   `migrate_source_id_to_array`. Note `jsonb_path_exists` would not be a
+    ///   substitute: the function form is not index-resolvable, only `@?`/`@@`.
+    /// - `string_to_array(...) && ARRAY[...]` — the legacy joined string. `?|`
+    ///   is *false* for a jsonb string scalar, so without this arm every
+    ///   pre-migration row (and anything an older pod writes during a rolling
+    ///   deploy) would be invisible to cleanup and leak as an orphan forever.
+    ///   `&&` is array overlap = element equality, so it is just as immune to the
+    ///   `chunk_1`/`chunk_10` collision that a `LIKE '%chunk_1%'` would cause.
+    ///
+    /// The legacy arm does not `btrim` the split parts: the write side never
+    /// emits padding, and the backfill trims every value it converts.
+    fn source_id_predicate(chunk_ids: &[String]) -> String {
+        let ids = sql_in_list(chunk_ids.iter().map(String::as_str));
+        format!(
+            "((properties -> 'source_id') ?| ARRAY[{ids}]::text[] \
+             OR (jsonb_typeof(properties -> 'source_id') = 'string' \
+             AND string_to_array(replace(properties ->> 'source_id', \
+             '{sep}', ','), ',') && ARRAY[{ids}]::text[]))",
+            ids = ids,
+            sep = easyrag_core::constants::GRAPH_FIELD_SEP,
+        )
+    }
+
+    /// Rows in `t` still holding the legacy joined-string `source_id`.
+    /// Served by the partial index created in [`Self::migrate_source_id_to_array`],
+    /// so once the backfill has run this is an empty index scan rather than a
+    /// sequential one — which is what makes repeating it on every workspace
+    /// rebuild affordable.
+    async fn count_legacy_source_ids(&self, t: &str) -> easyrag_core::Result<i64> {
+        let row = self
+            .db
+            .fetch_one(&format!(
+                "SELECT COUNT(*) as cnt FROM {t} WHERE workspace = '{ws}' \
+                 AND jsonb_typeof(properties -> 'source_id') = 'string'",
+                ws = sql_escape(&self.workspace)
+            ))
+            .await?;
+        Ok(row
+            .and_then(|r| r.get("cnt").and_then(|v| v.as_i64()))
+            .unwrap_or(0))
+    }
+
+    /// Rewrite every legacy `<SEP>`/`,`-joined `source_id` string into the
+    /// canonical JSON array, and index the field so the cleanup filters stop
+    /// scanning the table.
+    ///
+    /// Called from `initialize()`, which the workspace cache runs on *every*
+    /// bundle rebuild (LRU eviction at 32 entries, or an explicit invalidate),
+    /// so "cheap to repeat" is the design constraint rather than an
+    /// afterthought — hence the partial index first.
+    ///
+    /// Non-fatal, exactly like `initialize_full_text_search`: a failed migration
+    /// must not stop the server from serving. It is also not a correctness
+    /// dependency, because `source_id_predicate` keeps its legacy
+    /// `string_to_array(...) && ARRAY[...]` arm permanently — an unmigrated row
+    /// is still cleaned up correctly, just without index assistance.
+    async fn migrate_source_id_to_array(&self) {
+        // Index names use `_srcid`, not `_src`: `initialize()` already creates
+        // `idx_{edges}_src` as a btree over the edges' `source` *column*, and
+        // `CREATE INDEX IF NOT EXISTS` would silently skip the GIN index on that
+        // name, leaving every edge query a sequential scan with nothing in the
+        // logs to say so.
+        let result: easyrag_core::Result<()> = async {
+            for t in [&self.nodes_table, &self.edges_table] {
+                // (a) Partial index over exactly the rows that still need
+                // converting; doubles as the migration-progress probe. After a
+                // successful backfill it holds zero rows.
+                self.db
+                    .execute(&format!(
+                        "CREATE INDEX IF NOT EXISTS idx_{t}_srcid_legacy ON {t} (id) \
+                         WHERE jsonb_typeof(properties -> 'source_id') = 'string'"
+                    ))
+                    .await?;
+                // (b) Expression GIN so the `?|` arm of `source_id_predicate` is
+                // index-resolvable. Default `jsonb_ops` — `jsonb_path_ops` cannot
+                // serve `?|`, only `@>`. Not CONCURRENTLY, matching the other
+                // index DDL in `initialize()`; an operator who cannot afford the
+                // build lock can create it by hand first and `IF NOT EXISTS`
+                // short-circuits here.
+                self.db
+                    .execute(&format!(
+                        "CREATE INDEX IF NOT EXISTS idx_{t}_srcid ON {t} \
+                         USING gin ((properties -> 'source_id'))"
+                    ))
+                    .await?;
+
+                let before = self.count_legacy_source_ids(t).await?;
+
+                // (c) One set-based statement, idempotent by construction: the
+                // WHERE matches only jsonb strings and the SET turns them into
+                // arrays, so an interrupted run resumes where it stopped and a
+                // finished run rewrites nothing. Splitting on `<SEP>` *and* `,`,
+                // trimming and dropping empties is the rule in
+                // `parse_source_ids`, so a migrated value reads back as the same
+                // list the string did. `WITH ORDINALITY` + `ORDER BY` is what
+                // keeps the element order: `jsonb_agg` does not promise one, and
+                // FIFO capping in `merge_source_ids` drops from the front, so a
+                // reordered array would evict the wrong chunk ids later.
+                self.db
+                    .execute(&format!(
+                        "UPDATE {t} SET properties = jsonb_set(properties, '{{source_id}}', \
+                         COALESCE((SELECT jsonb_agg(btrim(x.part) ORDER BY x.ord) \
+                         FROM unnest(string_to_array(replace(properties ->> 'source_id', \
+                         '{sep}', ','), ',')) WITH ORDINALITY AS x(part, ord) \
+                         WHERE btrim(x.part) <> ''), '[]'::jsonb)), updated_at = NOW() \
+                         WHERE workspace = '{ws}' \
+                         AND jsonb_typeof(properties -> 'source_id') = 'string'",
+                        sep = easyrag_core::constants::GRAPH_FIELD_SEP,
+                        ws = sql_escape(&self.workspace)
+                    ))
+                    .await?;
+
+                // (d) Probe again: zero is the migration-complete gate.
+                let after = self.count_legacy_source_ids(t).await?;
+                if after == 0 {
+                    tracing::info!(
+                        "Graph source_id backfill: {before} legacy value(s) in {t} now arrays"
+                    );
+                } else {
+                    tracing::warn!(
+                        "{after} row(s) in {t} still hold a string source_id after the backfill \
+                         (concurrent writes, or a permissions problem). Cleanup stays correct via \
+                         the legacy filter arm; the next initialize() retries."
+                    );
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::warn!("Graph source_id migration failed (non-fatal): {e}");
+        }
+    }
+
     /// Read one node with an **already-rendered** scope clause, so a traversal
     /// and the per-node lookups it drives cannot disagree on tenant filtering
     /// (BC-12/A-5: `get_knowledge_graph` widens both, `get_node` widens neither).
@@ -1549,6 +1697,7 @@ impl<D: PgDb> StorageNameSpace for PgGraphStorage<D> {
             self.edges_table,
             self.workspace
         );
+        self.migrate_source_id_to_array().await;
         Ok(())
     }
 
@@ -1588,6 +1737,35 @@ impl<D: PgDb> StorageNameSpace for PgGraphStorage<D> {
         }
         Ok(drop_result(outcome, message))
     }
+}
+
+/// Render the batched graph-node upsert: one statement per batch.
+///
+/// Same columns and same `DO UPDATE SET` as the single-row `upsert_node`, which
+/// keeps its own hand-laid multi-line SQL because golden snapshots pin those
+/// bytes — this is an *additional* batch statement, not a rewrite of it. The
+/// graph cleanup trim writes every surviving node back, so without it a
+/// 200-node trim was 200 round trips.
+fn graph_nodes_upsert_sql(
+    table_name: &str,
+    workspace: &str,
+    biz_id: &str,
+    batch: &[&(String, JsonMap)],
+) -> String {
+    let upsert = PgUpsertBuilder::new(
+        table_name,
+        "id, workspace, biz_id, properties, updated_at",
+        "properties = EXCLUDED.properties, updated_at = NOW()",
+    );
+    upsert.sql(batch.iter().map(|(node_id, node_data)| {
+        format!(
+            "('{}', '{}', '{}', {}::jsonb, NOW())",
+            sql_escape(node_id),
+            sql_escape(workspace),
+            sql_escape(biz_id),
+            json_literal(node_data)
+        )
+    }))
 }
 
 #[async_trait]
@@ -1746,6 +1924,30 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
             .await
     }
 
+    async fn upsert_nodes_batch(
+        &self,
+        nodes: &[(String, JsonMap)],
+        biz_id: &str,
+    ) -> easyrag_core::Result<()> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        // Borrowed like the KV path, so the property maps (full description
+        // text) are never cloned just to be written.
+        let entries: Vec<&(String, JsonMap)> = nodes.iter().collect();
+        let (table, workspace) = (self.nodes_table.as_str(), self.workspace.as_str());
+        batched_with_fallback(
+            &self.db,
+            &entries,
+            PgBatchLimits::UPSERT_MAX_RECORDS_PER_BATCH,
+            // Nothing to prepare: the properties are already in hand, unlike the
+            // vector path which embeds per batch.
+            |batch| async move { Ok(batch.to_vec()) },
+            |rows| graph_nodes_upsert_sql(table, workspace, biz_id, rows),
+        )
+        .await
+    }
+
     async fn delete_node(&self, node_id: &str, biz_id: &str) -> easyrag_core::Result<()> {
         self.db
             .execute(&format!(
@@ -1766,8 +1968,26 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
     }
 
     async fn remove_nodes(&self, node_ids: &[String], biz_id: &str) -> easyrag_core::Result<()> {
-        for node_id in node_ids {
-            self.delete_node(node_id, biz_id).await?;
+        // Two statements per shard instead of two per node: looping
+        // `delete_node` turned a 200-node cleanup into 400 round trips. Within a
+        // shard the edges still go first, exactly like `delete_node`, so an
+        // interruption leaves no edge pointing at a node that is already gone.
+        for batch in node_ids.chunks(PgBatchLimits::DELETE_MAX_RECORDS_PER_BATCH) {
+            let ids = sql_in_list(batch.iter().map(String::as_str));
+            self.db
+                .execute(&format!(
+                    "DELETE FROM {e} WHERE {scope} AND (source IN ({ids}) OR target IN ({ids}))",
+                    e = self.edges_table,
+                    scope = self.scope_clause(biz_id),
+                ))
+                .await?;
+            self.db
+                .execute(&format!(
+                    "DELETE FROM {n} WHERE id IN ({ids}) AND {scope}",
+                    n = self.nodes_table,
+                    scope = self.scope_clause(biz_id),
+                ))
+                .await?;
         }
         Ok(())
     }
@@ -1777,15 +1997,22 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
         edge_list: &[(String, String)],
         biz_id: &str,
     ) -> easyrag_core::Result<()> {
-        for (src, tgt) in edge_list {
+        // One statement per shard instead of one per edge. The two row-value
+        // `IN (VALUES ...)` lists keep the undirected match the per-edge DELETE
+        // had — stored direction and its reverse — without repeating the whole
+        // predicate once per pair.
+        for batch in edge_list.chunks(PgBatchLimits::DELETE_MAX_RECORDS_PER_BATCH) {
+            let values = batch
+                .iter()
+                .map(|(src, tgt)| format!("('{}','{}')", sql_escape(src), sql_escape(tgt)))
+                .collect::<Vec<_>>()
+                .join(",");
             self.db
                 .execute(&format!(
                     "DELETE FROM {e} WHERE {scope}
-                     AND ((source = '{src}' AND target = '{tgt}') OR (source = '{tgt}' AND target = '{src}'))",
+                     AND ((source, target) IN (VALUES {values}) OR (target, source) IN (VALUES {values}))",
                     e = self.edges_table,
-                    scope = self.scope_clause(biz_id),
-                    src = sql_escape(src),
-                    tgt = sql_escape(tgt)
+                    scope = self.scope_clause(biz_id)
                 ))
                 .await?;
         }
@@ -1955,6 +2182,86 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
                 properties
             })
             .collect())
+    }
+
+    async fn get_nodes_by_source_ids(
+        &self,
+        chunk_ids: &[String],
+        biz_id: &str,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        if chunk_ids.is_empty() {
+            // Never a full scan: "which nodes reference none of these chunks"
+            // is an empty question, not a request for the whole graph.
+            return Ok(Vec::new());
+        }
+        // List path, exactly like `get_all_nodes`: an empty biz_id widens to the
+        // whole workspace (BC-12/A-5).
+        let scope = self.list_scope_clause(biz_id);
+        let mut out: Vec<JsonMap> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for shard in chunk_ids.chunks(Self::SOURCE_ID_QUERY_SHARD) {
+            let sql = format!(
+                "SELECT id, properties FROM {} WHERE {} AND {}",
+                self.nodes_table,
+                scope,
+                Self::source_id_predicate(shard)
+            );
+            for row in self.db.fetch_all(&sql).await? {
+                let id = row.get("id").and_then(|v| v.as_str());
+                // A node referencing chunks in two shards comes back twice.
+                if let Some(id) = id {
+                    if !seen.insert(id.to_string()) {
+                        continue;
+                    }
+                }
+                let mut properties = Self::parse_props(&row, "properties");
+                if let Some(id) = id {
+                    properties.insert("id".to_string(), JsonValue::String(id.to_string()));
+                }
+                out.push(properties);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn get_edges_by_source_ids(
+        &self,
+        chunk_ids: &[String],
+        biz_id: &str,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        if chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let scope = self.list_scope_clause(biz_id);
+        let mut out: Vec<JsonMap> = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        for shard in chunk_ids.chunks(Self::SOURCE_ID_QUERY_SHARD) {
+            let sql = format!(
+                "SELECT source, target, properties FROM {} WHERE {} AND {}",
+                self.edges_table,
+                scope,
+                Self::source_id_predicate(shard)
+            );
+            for row in self.db.fetch_all(&sql).await? {
+                let src = row.get("source").and_then(|v| v.as_str());
+                let tgt = row.get("target").and_then(|v| v.as_str());
+                if !seen.insert((
+                    src.unwrap_or_default().to_string(),
+                    tgt.unwrap_or_default().to_string(),
+                )) {
+                    continue;
+                }
+                let mut properties = Self::parse_props(&row, "properties");
+                if let Some(src) = src {
+                    properties.insert("source".to_string(), JsonValue::String(src.to_string()));
+                }
+                if let Some(tgt) = tgt {
+                    properties.insert("target".to_string(), JsonValue::String(tgt.to_string()));
+                }
+                out.push(properties);
+            }
+        }
+        Ok(out)
     }
 
     async fn get_popular_labels(&self, limit: usize, biz_id: &str) -> easyrag_core::Result<Vec<String>> {

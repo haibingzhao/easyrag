@@ -316,7 +316,9 @@ async fn create_entity(
             json!({
                 "entity_type": entity_type,
                 "description": description,
-                "source_id": "manual",
+                // Sentinel, not a chunk id: never matches any deleted chunk,
+                // so hand-made entities stay out of automatic cleanup.
+                "source_id": ["manual"],
             })
             .as_object()
             .cloned()
@@ -325,6 +327,12 @@ async fn create_entity(
         )
         .await?;
     // P1.12: write entity to vector storage for searchability (best-effort).
+    //
+    // Vector-store `source_id` stays a plain string on purpose. It is not the
+    // graph's chunk-id array: different schema, and here it holds an *entity
+    // name*, which `MemoryVectorStorage::delete_entity_relation` substring-matches
+    // via `as_str()`. An array would read back as `None` -> `""`, the match would
+    // never fire, and relation vectors would silently stop being deleted.
     let mut vector_data: HashMap<String, JsonMap> = HashMap::new();
     vector_data.insert(
         request.name.clone(),
@@ -483,7 +491,7 @@ async fn merge_entities(
             json!({
                 "entity_type": entity_type,
                 "description": descriptions.join("\n"),
-                "source_id": "merge",
+                "source_id": ["merge"],
             })
             .as_object()
             .cloned()
@@ -554,7 +562,7 @@ async fn create_relation(
             json!({
                 "keywords": keywords,
                 "description": description,
-                "source_id": "manual",
+                "source_id": ["manual"],
                 "weight": 1.0,
             })
             .as_object()
@@ -564,6 +572,9 @@ async fn create_relation(
         )
         .await?;
     // P1.12: write relation to vector storage for searchability (best-effort).
+    //
+    // Plain string for the same reason as in `create_entity`: this is the
+    // vector-store field, not the graph's chunk-id array.
     let relation_id = format!("{}<SEP>{}", request.source, request.target);
     let mut vector_data: HashMap<String, JsonMap> = HashMap::new();
     vector_data.insert(

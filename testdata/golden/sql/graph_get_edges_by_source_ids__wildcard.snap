@@ -1,0 +1,4 @@
+---
+source: crates/easyrag-storage/tests/postgres_storage.rs
+---
+SELECT source, target, properties FROM graph_edges_graph WHERE workspace = 'test_ws' AND ((properties -> 'source_id') ?| ARRAY['chunk-1','chunk-2']::text[] OR (jsonb_typeof(properties -> 'source_id') = 'string' AND string_to_array(replace(properties ->> 'source_id', '<SEP>', ','), ',') && ARRAY['chunk-1','chunk-2']::text[]))

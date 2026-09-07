@@ -13,15 +13,16 @@ use futures::FutureExt;
 use serde_json::{json, Value as JsonValue};
 use tokio::sync::Mutex as AsyncMutex;
 
-use easyrag_core::constants::{GRAPH_FIELD_SEP, STRUCTURE_INDEX_KEY_PREFIX};
+use easyrag_core::constants::STRUCTURE_INDEX_KEY_PREFIX;
 use easyrag_core::model::DocStatus;
 use easyrag_core::storage::traits::StorageBundle;
 use easyrag_core::storage::user::{UserRecord, UserStorage};
 use easyrag_core::util::hash::{compute_args_hash, compute_mdhash_id};
-use easyrag_core::JsonMap;
 use easyrag_pipeline::ingest::InsertDocumentExtras;
 use easyrag_pipeline::parser::DocumentProcessingOptions;
-use easyrag_pipeline::{IngestionPipeline, QueryEngine, StructureQueryStrategy};
+use easyrag_pipeline::{
+    cleanup_graph_by_chunks, IngestionPipeline, QueryEngine, StructureQueryStrategy,
+};
 
 use crate::auth::JwtAuthProvider;
 use crate::error::{AppError, AppResult};
@@ -308,6 +309,9 @@ impl DocumentLifecycleService {
     /// Remove graph entities/edges that reference the deleted chunks.
     /// Nodes partially referencing other chunks keep living with a trimmed
     /// source_id; fully orphaned nodes/edges are deleted.
+    ///
+    /// The sequence itself lives in [`easyrag_pipeline::graph_cleanup`], shared
+    /// with the facade's delete path so the two cannot drift apart again.
     async fn cleanup_knowledge_graph(
         &self,
         graph_storage: &dyn easyrag_core::storage::traits::GraphStorage,
@@ -315,85 +319,13 @@ impl DocumentLifecycleService {
         chunk_ids: &HashSet<String>,
         biz_id: &str,
     ) -> AppResult<()> {
-        let split_sources = |source_id: &str| -> HashSet<String> {
-            // split on either delimiter.
-            source_id
-                .split(GRAPH_FIELD_SEP)
-                .flat_map(|part| part.split(','))
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        };
-
-        let mut nodes_to_delete: Vec<String> = Vec::new();
-        let mut nodes_to_update: Vec<(String, JsonMap)> = Vec::new();
-
-        for node in graph_storage.get_all_nodes(biz_id).await? {
-            let Some(node_id) = node.get("id").and_then(JsonValue::as_str) else {
-                continue;
-            };
-            let source_id = node
-                .get("source_id")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("");
-            let mut sources = split_sources(source_id);
-
-            let before = sources.len();
-            sources.retain(|s| !chunk_ids.contains(s));
-            if sources.len() == before {
-                continue;
-            }
-
-            if sources.is_empty() {
-                nodes_to_delete.push(node_id.to_string());
-            } else {
-                let mut updated = node.clone();
-                updated.insert(
-                    "source_id".into(),
-                    JsonValue::String(sources.into_iter().collect::<Vec<_>>().join(GRAPH_FIELD_SEP)),
-                );
-                nodes_to_update.push((node_id.to_string(), updated));
-            }
-        }
-
-        let mut edges_to_delete: Vec<(String, String)> = Vec::new();
-        for edge in graph_storage.get_all_edges(biz_id).await? {
-            let Some(source) = edge.get("source").and_then(JsonValue::as_str) else {
-                continue;
-            };
-            let Some(target) = edge.get("target").and_then(JsonValue::as_str) else {
-                continue;
-            };
-            let source_id = edge
-                .get("source_id")
-                .and_then(JsonValue::as_str)
-                .unwrap_or("");
-            let sources = split_sources(source_id);
-
-            if sources.iter().any(|s| chunk_ids.contains(s))
-                || nodes_to_delete.iter().any(|n| n == source)
-                || nodes_to_delete.iter().any(|n| n == target)
-            {
-                edges_to_delete.push((source.to_string(), target.to_string()));
-            }
-        }
-
-        if !edges_to_delete.is_empty() {
-            graph_storage.remove_edges(&edges_to_delete, biz_id).await?;
-        }
-        if !nodes_to_delete.is_empty() {
-            graph_storage.remove_nodes(&nodes_to_delete, biz_id).await?;
-            // Entity description vectors live in vector storage
-            vector_storage.delete(&nodes_to_delete, biz_id).await?;
-        }
-        for (node_id, data) in nodes_to_update.iter() {
-            graph_storage.upsert_node(node_id, data.clone(), biz_id).await?;
-        }
+        let report = cleanup_graph_by_chunks(graph_storage, vector_storage, chunk_ids, biz_id)
+            .await?;
         tracing::debug!(
             "Graph cleanup: removed {} nodes, {} edges; trimmed {} nodes",
-            nodes_to_delete.len(),
-            edges_to_delete.len(),
-            nodes_to_update.len()
+            report.deleted_nodes,
+            report.deleted_edges,
+            report.trimmed_nodes
         );
         Ok(())
     }

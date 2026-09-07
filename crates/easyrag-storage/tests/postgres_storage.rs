@@ -10,10 +10,12 @@ use async_trait::async_trait;
 use easyrag_core::llm::{EmbeddingContext, EmbeddingFunc, EmbeddingFunction};
 use easyrag_core::model::DocStatus;
 use easyrag_core::storage::keyword::KeywordSearchable;
-use easyrag_core::storage::traits::{DocStatusStorage, GraphStorage, KVStorage, VectorStorage};
+use easyrag_core::storage::traits::{
+    DocStatusStorage, GraphStorage, KVStorage, StorageNameSpace, VectorStorage,
+};
 use easyrag_core::JsonMap;
 use easyrag_storage::postgres::{
-    PgConfig, PgDb, PgDocStatusStorage, PgGraphStorage, PgKVStorage, PgVectorStorage,
+    PgBatchLimits, PgConfig, PgDb, PgDocStatusStorage, PgGraphStorage, PgKVStorage, PgVectorStorage,
 };
 use parking_lot::Mutex;
 use serde_json::json;
@@ -563,6 +565,10 @@ async fn bc12_graph_list_paths_widen_on_empty_biz_id() {
         ("get_knowledge_graph(*)", 3),
         ("get_knowledge_graph(Alice)", 4),
         ("get_popular_labels", 5),
+        // Both are list paths: they widen exactly like `get_all_nodes`, whose
+        // full-graph pull they replace during document deletion.
+        ("get_nodes_by_source_ids", 6),
+        ("get_edges_by_source_ids", 7),
     ] {
         let db = Arc::new(MockPgDb::default());
         let storage = create_graph_storage(db.clone());
@@ -591,8 +597,20 @@ async fn bc12_graph_list_paths_widen_on_empty_biz_id() {
             // The `/api/graph/labels` route reaches `get_popular_labels` through
             // `read_bundle` (blank biz_id = wildcard), so it must widen like the
             // other list paths and match Neo4j's `node_scope`.
-            _ => {
+            5 => {
                 storage.get_popular_labels(10, "").await.unwrap();
+            }
+            6 => {
+                storage
+                    .get_nodes_by_source_ids(&["chunk-1".to_string()], "")
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                storage
+                    .get_edges_by_source_ids(&["chunk-1".to_string()], "")
+                    .await
+                    .unwrap();
             }
         };
         assert_wildcard_scope(&db, path);
@@ -799,6 +817,251 @@ async fn sql_golden_graph_upsert_node_and_edge() {
     assert_eq!(stmts.len(), 2, "node + edge = 2 statements");
     snap_sql("graph_upsert_node", &stmts[0]);
     snap_sql("graph_upsert_edge", &stmts[1]);
+}
+
+/// The `source_id` filters are what let document deletion stop pulling the whole
+/// graph. The SQL is hand-concatenated, so a misplaced quote returns an empty set
+/// instead of erroring and every orphaned node leaks silently — both the exact
+/// bytes and the round-trip count are pinned.
+///
+/// Each query carries two arms: jsonb `?|` for the canonical array and
+/// `string_to_array(...) && ...` for the legacy joined string, because `?|` is
+/// false for a jsonb string scalar and pre-backfill rows would otherwise be
+/// invisible to cleanup.
+#[tokio::test]
+async fn sql_golden_graph_source_id_filters() {
+    let chunks = vec!["chunk-1".to_string(), "chunk-2".to_string()];
+
+    let db = Arc::new(MockPgDb::default());
+    let storage = create_graph_storage(db.clone());
+    storage.get_nodes_by_source_ids(&chunks, BIZ).await.unwrap();
+    let stmts = db.statements();
+    assert_eq!(stmts.len(), 1, "one targeted query, not a full-graph pull");
+    snap_sql("graph_get_nodes_by_source_ids__default", &stmts[0]);
+
+    let db = Arc::new(MockPgDb::default());
+    let storage = create_graph_storage(db.clone());
+    storage.get_nodes_by_source_ids(&chunks, "").await.unwrap();
+    let stmts = db.statements();
+    assert_eq!(stmts.len(), 1);
+    snap_sql("graph_get_nodes_by_source_ids__wildcard", &stmts[0]);
+
+    let db = Arc::new(MockPgDb::default());
+    let storage = create_graph_storage(db.clone());
+    storage.get_edges_by_source_ids(&chunks, BIZ).await.unwrap();
+    let stmts = db.statements();
+    assert_eq!(stmts.len(), 1);
+    snap_sql("graph_get_edges_by_source_ids__default", &stmts[0]);
+
+    let db = Arc::new(MockPgDb::default());
+    let storage = create_graph_storage(db.clone());
+    storage.get_edges_by_source_ids(&chunks, "").await.unwrap();
+    let stmts = db.statements();
+    assert_eq!(stmts.len(), 1);
+    snap_sql("graph_get_edges_by_source_ids__wildcard", &stmts[0]);
+
+    // Empty chunk list -> empty result, zero statements. Degrading this into a
+    // full scan would be worse than the code it replaces.
+    let db = Arc::new(MockPgDb::default());
+    let storage = create_graph_storage(db.clone());
+    assert!(storage
+        .get_nodes_by_source_ids(&[], BIZ)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(storage
+        .get_edges_by_source_ids(&[], BIZ)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(db.statements().len(), 0);
+}
+
+/// The `source_id` backfill runs from `initialize()`, which the workspace cache
+/// calls on every bundle rebuild. Its SQL is hand-concatenated *and* its failures
+/// are deliberately swallowed into a `warn`, so a typo here would not error — it
+/// would just leave every legacy row invisible to the array filter. Both the
+/// bytes and the idempotence guards are pinned.
+#[tokio::test]
+async fn sql_golden_graph_source_id_migration() {
+    let db = Arc::new(MockPgDb::default());
+    let storage = create_graph_storage(db.clone());
+    storage.initialize().await.unwrap();
+
+    let stmts = db.statements();
+    // 2 CREATE TABLE + 4 pre-existing indexes, then (2 indexes + probe + UPDATE +
+    // probe) for each of the two tables.
+    assert_eq!(stmts.len(), 16, "{stmts:#?}");
+    let migration: Vec<&str> = stmts.iter().skip(6).map(String::as_str).collect();
+    snap_sql("graph_migrate_source_id", &migration.join("\n"));
+
+    // The trap this is really about: `initialize()` already owns
+    // `idx_graph_edges_graph_src` as a btree over the edges' `source` *column*.
+    // A GIN index under that same name would be skipped by `IF NOT EXISTS`, and
+    // every edge filter would silently stay a sequential scan.
+    assert!(
+        stmts.iter().any(|s| s.contains("idx_graph_edges_graph_src ON")),
+        "the pre-existing btree on the source column must still be created"
+    );
+    assert!(
+        stmts.iter().any(|s| s.contains("idx_graph_edges_graph_srcid ON")),
+        "the GIN index must not collide with it"
+    );
+    assert!(
+        !stmts
+            .iter()
+            .any(|s| s.contains("USING gin") && s.contains("idx_graph_edges_graph_src ON")),
+        "GIN must never reuse the btree name"
+    );
+
+    // Order gate: indexes exist before the rows are rewritten, so the UPDATE and
+    // every later filter are index-assisted from the first run.
+    let first_index = stmts.iter().position(|s| s.contains("_srcid_legacy ON")).unwrap();
+    let first_update = stmts.iter().position(|s| s.starts_with("UPDATE ")).unwrap();
+    assert!(first_index < first_update, "indexes must precede the backfill");
+
+    // `jsonb_ops`, not `jsonb_path_ops`: only the former can serve `?|`.
+    assert!(
+        stmts.iter().any(|s| s.contains("USING gin ((properties -> 'source_id'))")),
+        "{stmts:#?}"
+    );
+    assert!(!stmts.iter().any(|s| s.contains("jsonb_path_ops")));
+
+    for t in ["graph_nodes_graph", "graph_edges_graph"] {
+        let update = stmts
+            .iter()
+            .find(|s| s.starts_with(&format!("UPDATE {t} ")))
+            .unwrap_or_else(|| panic!("no backfill for {t}: {stmts:#?}"));
+        // Idempotent: only jsonb strings are rewritten, so a finished run matches
+        // nothing and an interrupted one resumes.
+        assert!(
+            update.contains("jsonb_typeof(properties -> 'source_id') = 'string'"),
+            "{update}"
+        );
+        // Both legacy delimiters, matching `parse_source_ids`.
+        assert!(
+            update.contains("replace(properties ->> 'source_id', '<SEP>', ',')"),
+            "{update}"
+        );
+        // Element order must survive: FIFO capping drops from the front, so a
+        // reordered array would evict the wrong chunk ids later.
+        assert!(update.contains("ORDER BY x.ord"), "{update}");
+        assert!(update.contains("btrim"), "{update}");
+        // Workspace-wide (initialize has no biz context), and never unscoped.
+        assert!(update.contains("workspace = 'test_ws'"), "{update}");
+    }
+
+    // Re-running is the normal case, not an edge case: every statement is guarded
+    // so the second run is a no-op rather than a rewrite.
+    let db2 = Arc::new(MockPgDb::default());
+    let storage2 = create_graph_storage(db2.clone());
+    storage2.initialize().await.unwrap();
+    storage2.initialize().await.unwrap();
+    assert_eq!(
+        db2.statements().len(),
+        32,
+        "a second initialize() repeats the same guarded statements, no extra DDL"
+    );
+}
+
+/// The cleanup write path. Deleting a document used to issue two statements per
+/// node (`remove_nodes` looping `delete_node`) and one per edge, so a 200-node /
+/// 600-edge cleanup was ~1000 round trips *after* the full-graph pull was already
+/// gone. These pin the batched replacements — both the SQL bytes, which are
+/// hand-concatenated so a misplaced quote silently deletes nothing, and the
+/// round-trip counts, which must not go back up.
+#[tokio::test]
+async fn sql_golden_graph_cleanup_writes_are_set_based() {
+    // remove_nodes: edges first, then nodes. Both statements live in ONE
+    // snapshot because their order is the semantics — flipping them would leave
+    // an edge pointing at a node that is already gone.
+    let db = Arc::new(MockPgDb::default());
+    let storage = create_graph_storage(db.clone());
+    let ids: Vec<String> = ["Alice", "Bob", "Carol"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    storage.remove_nodes(&ids, BIZ).await.unwrap();
+    let stmts = db.statements();
+    assert_eq!(stmts.len(), 2, "3 nodes = 2 statements, not 6");
+    assert!(stmts[0].starts_with("DELETE FROM graph_edges_graph"), "{}", stmts[0]);
+    assert!(stmts[1].starts_with("DELETE FROM graph_nodes_graph"), "{}", stmts[1]);
+    snap_sql("graph_remove_nodes_set", &stmts.join("\n"));
+
+    // remove_edges: one statement, still undirected (both column orders).
+    let db = Arc::new(MockPgDb::default());
+    let storage = create_graph_storage(db.clone());
+    storage
+        .remove_edges(
+            &[
+                ("Alice".to_string(), "Bob".to_string()),
+                ("Bob".to_string(), "Carol".to_string()),
+            ],
+            BIZ,
+        )
+        .await
+        .unwrap();
+    let stmts = db.statements();
+    assert_eq!(stmts.len(), 1, "2 edges = 1 statement, not 2");
+    snap_sql("graph_remove_edges_set", &stmts[0]);
+
+    // upsert_nodes_batch: the trim write-back, one statement per batch. The
+    // single-row `upsert_node` above keeps its own golden — this is an added
+    // batch statement, not a rewrite of it.
+    let db = Arc::new(MockPgDb::default());
+    let storage = create_graph_storage(db.clone());
+    let nodes: Vec<(String, JsonMap)> = ["Alice", "Bob"]
+        .iter()
+        .map(|id| ((*id).to_string(), json_map(json!({"entity_type": "person"}))))
+        .collect();
+    storage.upsert_nodes_batch(&nodes, BIZ).await.unwrap();
+    let stmts = db.statements();
+    assert_eq!(stmts.len(), 1, "2 nodes = 1 statement, not 2");
+    snap_sql("graph_upsert_nodes_batch", &stmts[0]);
+
+    // Sharding keeps a huge delete from building one unbounded statement, but
+    // only whole batches are added: one id over the limit = 2 shards.
+    let over = PgBatchLimits::DELETE_MAX_RECORDS_PER_BATCH + 1;
+    let db = Arc::new(MockPgDb::default());
+    let storage = create_graph_storage(db.clone());
+    let many: Vec<String> = (0..over).map(|i| format!("n{i}")).collect();
+    storage.remove_nodes(&many, BIZ).await.unwrap();
+    assert_eq!(db.statements().len(), 4, "2 shards x (edges + nodes)");
+
+    let db = Arc::new(MockPgDb::default());
+    let storage = create_graph_storage(db.clone());
+    let pairs: Vec<(String, String)> = (0..over).map(|i| (format!("a{i}"), format!("b{i}"))).collect();
+    storage.remove_edges(&pairs, BIZ).await.unwrap();
+    assert_eq!(db.statements().len(), 2, "2 shards x 1 statement");
+}
+
+/// The graph trim is the newest caller of `batched_with_fallback`, so it inherits
+/// — and must not quietly lose — the per-record failure granularity the KV and
+/// vector upserts promise: one bad row must not take the whole batch down.
+#[tokio::test]
+async fn graph_upsert_nodes_batch_replays_a_failed_batch_row_by_row() {
+    let db = Arc::new(MockPgDb::default());
+    let failing = FailingPgDb::failing_batches(db.clone());
+    let failures = failing.failures.clone();
+    let storage =
+        PgGraphStorage::with_options("graph", "test_ws", JsonMap::new(), None, failing).unwrap();
+
+    let nodes: Vec<(String, JsonMap)> = ["Alice", "Bob", "Carol"]
+        .iter()
+        .map(|id| ((*id).to_string(), json_map(json!({"entity_type": "person"}))))
+        .collect();
+    storage.upsert_nodes_batch(&nodes, BIZ).await.unwrap();
+
+    assert_eq!(
+        failures.load(Ordering::SeqCst),
+        1,
+        "exactly one batched statement failed"
+    );
+    assert_eq!(
+        db.total_calls(),
+        4,
+        "1 failed batch + 3 single-row replays"
+    );
 }
 
 #[tokio::test]
