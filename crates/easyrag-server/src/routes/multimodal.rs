@@ -65,7 +65,7 @@ fn rag_anything(state: &AppServices) -> AppResult<&easyrag_pipeline::RAGAnything
     state
         .rag_anything
         .as_deref()
-        .ok_or_else(|| AppError::status(404, "Multimodal processing is not configured"))
+        .ok_or_else(|| AppError::not_found("Multimodal processing is not configured"))
 }
 
 fn kwargs_from(parse_method: Option<&String>, output_dir: Option<&String>) -> JsonMap {

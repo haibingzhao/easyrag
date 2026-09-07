@@ -1,0 +1,20 @@
+---
+source: crates/easyrag-pipeline/tests/extraction_golden.rs
+---
+---Task---
+Extract entities and relationships from the `---Input Text---` section below.
+
+---Instructions---
+1. **Strict Adherence to JSON Format:** Your output MUST be a valid JSON object with `entities` and `relationships` arrays. Do not include any introductory or concluding remarks, explanations, markdown code fences, or any other text before or after the JSON.
+2. **Quantity Limits:** In this response, output at most 41 total records and at most 23 entity objects. Output fewer records if fewer high-value items are present. Only output relationship objects whose `source` and `target` are both included in this response.
+3. **Output Language:** Ensure the output language is Klingon. Proper nouns (e.g., personal names, place names, organization names) must be kept in their original language and not translated.
+
+---Entity Types---
+GUIDANCE-SENTINEL
+
+---Input Text---
+```
+Ada Lovelace collaborated with Charles Babbage on the Analytical Engine.
+```
+
+---Output---

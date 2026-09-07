@@ -1,0 +1,5 @@
+---
+source: crates/easyrag-pipeline/tests/modal_processor_fallback.rs
+---
+description: some generic content body
+entity: {entity_name="chart_dd2179d34e7f1289d85dd25d29821a19", entity_type="chart", summary="chart content: some generic content body"}

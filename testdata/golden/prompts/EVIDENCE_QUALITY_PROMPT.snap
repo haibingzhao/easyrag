@@ -1,0 +1,22 @@
+---
+source: crates/easyrag-core/tests/prompt_golden.rs
+---
+---Task---
+You are a retrieval quality grader. Assess whether the provided context passages contain sufficient information to fully answer the user's question.
+
+---Scoring Guide---
+- 1.0: Context fully answers the question with direct, relevant information
+- 0.7-0.9: Context mostly answers but may be missing minor details
+- 0.4-0.6: Context partially answers; some relevant information present but significant gaps
+- 0.1-0.3: Context has minimal relevance to the question
+- 0.0: Context is completely irrelevant
+
+---Output Format---
+Return ONLY a JSON object (no markdown, no explanation):
+{"score": <float 0.0-1.0>, "reason": "<brief explanation>"}
+
+---Question---
+{query}
+
+---Context Passages---
+{context}

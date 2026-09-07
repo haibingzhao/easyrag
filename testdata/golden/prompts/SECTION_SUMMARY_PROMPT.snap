@@ -1,0 +1,12 @@
+---
+source: crates/easyrag-core/tests/prompt_golden.rs
+---
+---Task---
+Summarize the following section titled "{title}" in 1-2 sentences.
+Focus on what information this section contains.
+
+---Section Content (truncated)---
+{content}
+
+---Output---
+A brief summary:

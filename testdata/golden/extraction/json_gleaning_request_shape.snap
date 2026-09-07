@@ -1,0 +1,6 @@
+---
+source: crates/easyrag-pipeline/tests/extraction_golden.rs
+---
+requests=2
+[0] response_format=Some(JsonObject) temperature=0 max_tokens=None system_prompt=present prompt_len=972 history=[]
+[1] response_format=Some(JsonObject) temperature=0 max_tokens=None system_prompt=present prompt_len=1486 history=[User:972, Assistant:663]

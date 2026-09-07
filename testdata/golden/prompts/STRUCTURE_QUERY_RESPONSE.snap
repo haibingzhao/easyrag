@@ -1,0 +1,23 @@
+---
+source: crates/easyrag-core/tests/prompt_golden.rs
+---
+---Task---
+Answer the query based ONLY on the retrieved document sections below.
+Cite section paths when referencing information.
+
+---Query---
+{query}
+
+---Retrieved Sections---
+{section_content}
+
+---Retrieval Reasoning---
+{retrieval_reasoning}
+
+---Response Type---
+{response_type}
+
+---Instructions---
+- Base your answer strictly on the provided sections
+- Reference section paths like [Chapter 1 > Section 1.2] when citing
+- If sections are insufficient, state what's missing

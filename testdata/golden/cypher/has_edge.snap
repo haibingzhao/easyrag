@@ -1,0 +1,11 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+MATCH (a:`test` {entity_id: $src, biz_id: $biz})-[r:DIRECTED]-(b:`test` {entity_id: $tgt, biz_id: $biz}) RETURN count(r) > 0 AS exists
+--- params[0] ---
+{
+  "biz": "default",
+  "src": "A",
+  "tgt": "B"
+}

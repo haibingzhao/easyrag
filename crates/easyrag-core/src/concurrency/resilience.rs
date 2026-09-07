@@ -200,6 +200,24 @@ impl<E: IsRetryable> IsRetryable for BreakerError<E> {
     }
 }
 
+/// Collapse a breaker outcome back into the crate's `Result`.
+///
+/// `CircuitBreaker::execute` reports "the breaker rejected this call" and "the
+/// call itself failed" as two variants of [`BreakerError`], but every caller
+/// wants a single `CoreError` to hand upstream. Keeping the mapping here (it
+/// lived privately in `easyrag-llm/src/openai.rs` before Phase 4.3) means any
+/// crate that adopts a breaker maps `Open` to the same
+/// `CoreError::CircuitBreakerOpen` instead of inventing its own wording.
+pub fn breaker_result<T>(
+    result: Result<T, BreakerError<crate::CoreError>>,
+) -> crate::Result<T> {
+    match result {
+        Ok(v) => Ok(v),
+        Err(BreakerError::Open(msg)) => Err(crate::CoreError::CircuitBreakerOpen(msg)),
+        Err(BreakerError::Inner(e)) => Err(e),
+    }
+}
+
 /// Circuit breaker to prevent cascading failures.
 ///
 /// When the failure count exceeds `failure_threshold` within the
@@ -628,5 +646,36 @@ mod tests {
             cb.execute(|| async { Ok("recovered") }).await;
         assert_eq!("recovered", result.unwrap());
         assert_eq!(CircuitBreakerState::Closed, cb.current_state());
+    }
+
+    /// Phase 4.3: `breaker_result` moved here from `easyrag-llm/src/openai.rs`.
+    /// These pin the mapping the OpenAI client already relied on — `Open`
+    /// becomes `CoreError::CircuitBreakerOpen` carrying the breaker's message
+    /// verbatim, `Inner` is passed through untouched, `Ok` is untouched.
+    #[test]
+    fn breaker_result_maps_open_to_circuit_breaker_open() {
+        let outcome: Result<u8, BreakerError<crate::CoreError>> =
+            Err(BreakerError::Open("llm-openai".to_string()));
+        let err = breaker_result(outcome).unwrap_err();
+        assert!(
+            matches!(&err, crate::CoreError::CircuitBreakerOpen(msg) if msg == "llm-openai"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn breaker_result_passes_the_inner_error_through_unchanged() {
+        let outcome: Result<u8, BreakerError<crate::CoreError>> =
+            Err(BreakerError::Inner(crate::CoreError::ApiTimeout));
+        assert!(matches!(
+            breaker_result(outcome),
+            Err(crate::CoreError::ApiTimeout)
+        ));
+    }
+
+    #[test]
+    fn breaker_result_keeps_success_values() {
+        let outcome: Result<u8, BreakerError<crate::CoreError>> = Ok(7);
+        assert_eq!(7u8, breaker_result(outcome).unwrap());
     }
 }

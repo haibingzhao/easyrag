@@ -1,0 +1,4 @@
+---
+source: crates/easyrag-llm/tests/openai_client.rs
+---
+{"model":"test-model","input":["a","b"]}

@@ -1,0 +1,5 @@
+---
+source: crates/easyrag-pipeline/tests/modal_processor_fallback.rs
+---
+description: E = mc^2
+entity: {entity_name="equation_281a70c20b16a38d7781189936e1ac9f", entity_type="equation", summary="Equation content: E = mc^2"}

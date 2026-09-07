@@ -1,0 +1,20 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+MATCH path = (start:`test` {entity_id: $label, biz_id: $biz})-[:DIRECTED*0..2]-(connected:`test`) UNWIND nodes(path) AS n WHERE n.biz_id = $biz WITH DISTINCT n LIMIT $maxNodes RETURN n
+--- params[0] ---
+{
+  "biz": "default",
+  "label": "A",
+  "maxNodes": 10
+}
+--- query[1] ---
+UNWIND $ids AS srcId MATCH (a:`test` {entity_id: srcId, biz_id: $biz})-[r:DIRECTED]-(b:`test` {biz_id: $biz}) WHERE b.entity_id IN $ids RETURN DISTINCT a.entity_id AS src, b.entity_id AS tgt, r
+--- params[1] ---
+{
+  "biz": "default",
+  "ids": [
+    "A"
+  ]
+}

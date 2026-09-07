@@ -9,11 +9,25 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::drop_result::drop_success;
+
 const EDGE_SEP: &str = "<SEP>";
 
 /// Business-line tag stored inside each node/edge property map.
 fn props_biz(props: &JsonMap) -> Option<&str> {
     props.get("biz_id").and_then(|v| v.as_str())
+}
+
+/// Read-path scope predicate for **collection** reads (list/count/search/
+/// knowledge-graph). An empty `biz_id` is the wildcard that spans every biz
+/// line of the workspace (BC-12/A-5), matching `PgGraphStorage`'s
+/// `list_scope_clause`, `Neo4jGraphStorage`'s `node_scope` and the in-memory
+/// doc-status backend's `biz_id.is_empty() || ...` filter. Single-record reads
+/// (`get_node`/`has_node`/degrees) and every write keep the exact
+/// `props_biz(props) == Some(biz_id)` filter, so a status write can never land
+/// on the wrong biz line.
+fn props_in_list_scope(props: &JsonMap, biz_id: &str) -> bool {
+    biz_id.is_empty() || props_biz(props) == Some(biz_id)
 }
 
 /// In-memory graph storage. Edge keys are normalized alphabetically so that
@@ -85,10 +99,6 @@ impl StorageNameSpace for InMemoryGraphStorage {
         &self.global_config
     }
 
-    async fn index_done_callback(&self) -> easyrag_core::Result<()> {
-        Ok(())
-    }
-
     async fn drop(&self, biz_id: &str) -> easyrag_core::Result<HashMap<String, String>> {
         let removed_nodes = {
             let mut nodes = self.nodes.lock();
@@ -101,13 +111,9 @@ impl StorageNameSpace for InMemoryGraphStorage {
             edges.retain(|_, props| props_biz(props) != Some(biz_id));
         }
         // Adjacency is shared structural data; pruned lazily by reads.
-        let mut result = HashMap::new();
-        result.insert("status".to_string(), "success".to_string());
-        result.insert(
-            "message".to_string(),
-            format!("data dropped ({removed_nodes} nodes for biz {biz_id})"),
-        );
-        Ok(result)
+        Ok(drop_success(format!(
+            "data dropped ({removed_nodes} nodes for biz {biz_id})"
+        )))
     }
 }
 
@@ -333,6 +339,10 @@ impl GraphStorage for InMemoryGraphStorage {
             .nodes
             .lock()
             .iter()
+            // EXACT scope, not the list wildcard: `PgGraphStorage::get_all_labels`
+            // pins the exact biz line (locked by
+            // `bc12_graph_single_record_reads_and_writes_stay_exact`), and no route
+            // calls this with a blank biz_id, so memory matches postgres here.
             .filter(|(_, props)| props_biz(props) == Some(biz_id))
             .map(|(id, _)| id.clone())
             .collect();
@@ -354,7 +364,7 @@ impl GraphStorage for InMemoryGraphStorage {
         let nodes = self.nodes.lock();
         let edges = self.edges.lock();
         let adjacency = self.adjacency.lock();
-        let in_biz = |props: &JsonMap| props_biz(props) == Some(biz_id);
+        let in_biz = |props: &JsonMap| props_in_list_scope(props, biz_id);
 
         if node_label == "*" {
             // Return all nodes up to max_nodes.
@@ -364,28 +374,29 @@ impl GraphStorage for InMemoryGraphStorage {
                 .take(max_nodes)
                 .collect();
             for (id, props) in visible {
-                graph_nodes.push(KnowledgeGraphNode {
-                    id: id.clone(),
-                    labels: vec![id.clone()],
-                    properties: super::stringify_props(props),
-                });
+                graph_nodes.push(KnowledgeGraphNode::self_labeled(
+                    id.clone(),
+                    super::stringify_props(props),
+                ));
             }
             for (key, props) in edges.iter().filter(|(_, props)| in_biz(props)) {
                 let parts: Vec<&str> = key.split(EDGE_SEP).collect();
                 if parts.len() == 2 {
-                    graph_edges.push(KnowledgeGraphEdge {
-                        id: format!("{}-{}", parts[0], parts[1]),
-                        edge_type: None,
-                        source: parts[0].to_string(),
-                        target: parts[1].to_string(),
-                        properties: super::stringify_props(props),
-                    });
+                    graph_edges.push(KnowledgeGraphEdge::untyped(
+                        parts[0],
+                        parts[1],
+                        super::stringify_props(props),
+                    ));
                 }
             }
             return Ok(KnowledgeGraph {
                 nodes: graph_nodes,
                 edges: graph_edges,
-                is_truncated: nodes.iter().filter(|(_, p)| in_biz(p)).count() > max_nodes,
+                // BC-1/A-6: `>=`, not `>`. A graph that exactly fills the
+                // budget is reported truncated, matching this backend's BFS
+                // path and the Postgres/Neo4j backends. The previous `>` made
+                // the two paths of this same backend contradict each other.
+                is_truncated: nodes.iter().filter(|(_, p)| in_biz(p)).count() >= max_nodes,
             });
         }
 
@@ -408,11 +419,10 @@ impl GraphStorage for InMemoryGraphStorage {
             }
 
             if let Some(props) = nodes.get(&current).filter(|p| in_biz(p)) {
-                graph_nodes.push(KnowledgeGraphNode {
-                    id: current.clone(),
-                    labels: vec![current.clone()],
-                    properties: super::stringify_props(props),
-                });
+                graph_nodes.push(KnowledgeGraphNode::self_labeled(
+                    current.clone(),
+                    super::stringify_props(props),
+                ));
             }
 
             if depth < max_depth {
@@ -428,13 +438,11 @@ impl GraphStorage for InMemoryGraphStorage {
                     // Add edge.
                     let key = Self::edge_key(&current, neighbor);
                     if let Some(edge_props) = edges.get(&key).filter(|p| in_biz(p)) {
-                        graph_edges.push(KnowledgeGraphEdge {
-                            id: format!("{current}-{neighbor}"),
-                            edge_type: None,
-                            source: current.clone(),
-                            target: neighbor.clone(),
-                            properties: super::stringify_props(edge_props),
-                        });
+                        graph_edges.push(KnowledgeGraphEdge::untyped(
+                            current.clone(),
+                            neighbor.clone(),
+                            super::stringify_props(edge_props),
+                        ));
                     }
                 }
             }
@@ -451,7 +459,7 @@ impl GraphStorage for InMemoryGraphStorage {
         let nodes = self.nodes.lock();
         Ok(nodes
             .iter()
-            .filter(|(_, props)| props_biz(props) == Some(biz_id))
+            .filter(|(_, props)| props_in_list_scope(props, biz_id))
             .map(|(id, props)| {
                 let mut result = props.clone();
                 result.insert("id".to_string(), serde_json::Value::String(id.clone()));
@@ -465,7 +473,7 @@ impl GraphStorage for InMemoryGraphStorage {
             .edges
             .lock()
             .values()
-            .filter(|props| props_biz(props) == Some(biz_id))
+            .filter(|props| props_in_list_scope(props, biz_id))
             .cloned()
             .collect())
     }
@@ -475,7 +483,7 @@ impl GraphStorage for InMemoryGraphStorage {
         let adjacency = self.adjacency.lock();
         let mut degrees: Vec<(String, usize)> = nodes
             .iter()
-            .filter(|(_, props)| props_biz(props) == Some(biz_id))
+            .filter(|(_, props)| props_in_list_scope(props, biz_id))
             .map(|(id, _)| {
                 let degree = adjacency
                     .get(id)
@@ -484,7 +492,7 @@ impl GraphStorage for InMemoryGraphStorage {
                             .filter(|n| {
                                 nodes
                                     .get(*n)
-                                    .is_some_and(|props| props_biz(props) == Some(biz_id))
+                                    .is_some_and(|props| props_in_list_scope(props, biz_id))
                             })
                             .count()
                     })
@@ -506,7 +514,7 @@ impl GraphStorage for InMemoryGraphStorage {
         let lower_query = query.to_lowercase();
         Ok(nodes
             .iter()
-            .filter(|(_, props)| props_biz(props) == Some(biz_id))
+            .filter(|(_, props)| props_in_list_scope(props, biz_id))
             .map(|(k, _)| k)
             .filter(|k| k.to_lowercase().contains(&lower_query))
             .take(limit)

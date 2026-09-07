@@ -14,7 +14,7 @@ use easyrag_core::storage::traits::{
     DocStatusStorage, GraphStorage, KVStorage, StorageBundle, VectorStorage,
 };
 use easyrag_pipeline::{
-    EasyRAG, EasyRAGConfigBuilder, IngestionPipeline, ParserRegistry, QueryEngine,
+    EasyRAG, EasyRAGConfigBuilder, IngestionPipeline, TextParserRegistry, QueryEngine,
     StructureQueryStrategy, TreeSearchEngine,
 };
 use easyrag_server::auth::{JwtAuthProvider, LoginRateLimiter};
@@ -22,7 +22,7 @@ use easyrag_server::service::{
     AuthService, DocumentLifecycleService, ResolvedScope, WorkspaceContext, WorkspaceResolver,
 };
 use easyrag_server::state::AppServices;
-use easyrag_server::{build_router, AppResult, ServerConfig};
+use easyrag_server::{build_router, AppResult, AutoScanStats, ServerConfig};
 use easyrag_storage::memory::{
     InMemoryDocStatusStorage, InMemoryGraphStorage, InMemoryKVStorage,
     InMemoryTenantConfigStorage, InMemoryUserStorage, InMemoryVectorStorage,
@@ -219,7 +219,7 @@ async fn build_env(auth_enabled: bool, with_structure: bool) -> Env {
         graph_storage: graph as Arc<dyn GraphStorage>,
         kv_storage: kv as Arc<dyn KVStorage>,
         doc_status_storage: doc_status as Arc<dyn DocStatusStorage>,
-        parser_registry: Arc::new(ParserRegistry::default()),
+        parser_registry: Arc::new(TextParserRegistry::default()),
         lifecycle_service,
         workspace_resolver,
         rag_anything: None,
@@ -227,6 +227,7 @@ async fn build_env(auth_enabled: bool, with_structure: bool) -> Env {
         rate_limiter: Arc::new(LoginRateLimiter::new(5, 1000)),
         auth_service,
         tenant_config_storage: Arc::new(InMemoryTenantConfigStorage::new()),
+        auto_scan_stats: Arc::new(AutoScanStats::new()),
     });
     Env {
         router: build_router(services),
@@ -497,6 +498,67 @@ async fn pipeline_status_reports_idle_with_counts() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "idle");
     assert!(body["counts"].is_object());
+}
+
+#[tokio::test]
+async fn auto_scan_status_reports_disabled_with_empty_tasks() {
+    let env = build_env(false, false).await;
+    // BC-11 observability endpoint. The scanner is disabled by default in the
+    // test config, so the always-available route reports enabled=false with
+    // empty tasks/cycles. Also proves the literal path wins over the
+    // `/api/documents/{docId}` wildcard (otherwise this would 404 as a doc id).
+    let (status, body) = get_json(&env, "/api/documents/auto_scan_status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["enabled"], false);
+    assert!(body["tasks"].as_array().unwrap().is_empty());
+    assert!(body["cycles"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn scan_dedups_unchanged_files_and_reinserts_changed_ones() {
+    let env = build_env(false, false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("note.txt");
+    std::fs::write(&file, "first version").unwrap();
+
+    let scan = json!({"inputDir": dir.path().to_string_lossy(), "maxFiles": 10});
+    let uri = "/api/documents/scan";
+
+    // First scan ingests the only file.
+    let (status, body) = post_json(&env, uri, scan.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "success");
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["doc_ids"].as_array().unwrap().len(), 1);
+    assert_eq!(body["message"], "Scanned 1 files, inserted 1 documents");
+
+    // BC-8 (A-3): rescanning an unchanged directory must insert nothing.
+    // Before the endpoint delegated to `pipeline::dir_scan::scan_directory`
+    // this returned count=1 again, re-ingesting every file on every call.
+    let (status, body) = post_json(&env, uri, scan.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "success");
+    assert_eq!(body["count"], 0);
+    assert!(body["doc_ids"].as_array().unwrap().is_empty());
+    // `files_seen` still reports the directory contents; only inserts shrink.
+    assert_eq!(body["message"], "Scanned 1 files, inserted 0 documents");
+
+    // Changed content is a new version and must be re-inserted.
+    std::fs::write(&file, "second version").unwrap();
+    let (status, body) = post_json(&env, uri, scan).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 1);
+
+    // Missing directory keeps its pre-existing error shape.
+    let (status, body) = post_json(
+        &env,
+        uri,
+        json!({"inputDir": dir.path().join("nope").to_string_lossy()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "error");
+    assert!(body["message"].as_str().unwrap().starts_with("Directory not found:"));
 }
 
 // ---------------------------------------------------------------------
@@ -791,4 +853,237 @@ async fn biz_id_flows_from_query_and_graph_routes_to_resolver() {
     let normalized = env.resolver.normalized.lock().unwrap();
     assert!(normalized.contains(&"bizX".to_string()), "{normalized:?}");
     assert!(normalized.contains(&"bizY".to_string()), "{normalized:?}");
+}
+
+// ---------------------------------------------------------------------
+// Tenant config admin API (Phase 6.8 guardrail)
+//
+// These lock the DTO layer in `routes/tenant_config.rs` — the camelCase wire,
+// the api-key mask (first 4 chars + `****`, short keys fully masked), the
+// upsert merge (`.or()` for plain fields, masked/empty sentinel preserves the
+// stored key) and the create-time filter — so a `macro_rules!` regeneration of
+// Request/Response/merge can be proven byte-for-byte equivalent.
+// ---------------------------------------------------------------------
+
+/// DELETE helper mirroring the inline style used elsewhere in this file.
+async fn delete_json(env: &Env, uri: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let resp = env.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn tenant_config_create_masks_keys_and_uses_camel_case_wire() {
+    let env = build_env(false, false).await;
+    let (status, body) = post_json(
+        &env,
+        "/api/admin/tenant-config",
+        json!({
+            "workspace": "acme",
+            "llmModel": "gpt-4o",
+            "llmApiKey": "sk-secret-123456",
+            "embeddingApiKey": "emb-key-999",
+            "chunkSize": 800,
+            "llmTemperature": 0.5,
+            "llmMaxTokens": 2048,
+            "rerankEnabled": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["workspace"], "acme");
+    assert_eq!(body["llmModel"], "gpt-4o");
+    // Mask = first 4 chars + "****".
+    assert_eq!(body["llmApiKey"], "sk-s****");
+    assert_eq!(body["embeddingApiKey"], "emb-****");
+    assert_eq!(body["chunkSize"], 800);
+    assert_eq!(body["llmTemperature"], 0.5);
+    assert_eq!(body["llmMaxTokens"], 2048);
+    assert_eq!(body["rerankEnabled"], true);
+    // Timestamps are present as RFC3339 strings (values are non-deterministic).
+    assert!(body["createdAt"].is_string());
+    assert!(body["updatedAt"].is_string());
+    // snake_case must not leak onto the wire.
+    assert!(body.get("llm_api_key").is_none());
+
+    // GET single returns the same masked projection.
+    let (status, got) = get_json(&env, "/api/admin/tenant-config?workspace=acme").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got["llmApiKey"], "sk-s****");
+    assert_eq!(got["llmModel"], "gpt-4o");
+}
+
+#[tokio::test]
+async fn tenant_config_merge_preserves_unset_fields_and_masked_key() {
+    let env = build_env(false, false).await;
+    let (status, _) = post_json(
+        &env,
+        "/api/admin/tenant-config",
+        json!({
+            "workspace": "acme",
+            "llmModel": "gpt-4o",
+            "llmApiKey": "sk-original-key",
+            "chunkSize": 800
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Update sends the masked sentinel for the key (must preserve the stored
+    // one), omits llmModel/chunkSize (must preserve via `.or`), adds a field.
+    let (status, body) = post_json(
+        &env,
+        "/api/admin/tenant-config",
+        json!({
+            "workspace": "acme",
+            "llmApiKey": "****",
+            "embeddingModel": "text-embedding-3-large"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Stored key preserved (masks to the ORIGINAL prefix, not the sentinel).
+    assert_eq!(body["llmApiKey"], "sk-o****");
+    assert_eq!(body["llmModel"], "gpt-4o");
+    assert_eq!(body["chunkSize"], 800);
+    assert_eq!(body["embeddingModel"], "text-embedding-3-large");
+}
+
+#[tokio::test]
+async fn tenant_config_update_with_real_key_overwrites_stored_key() {
+    let env = build_env(false, false).await;
+    // Create with an original key.
+    let (status, body) = post_json(
+        &env,
+        "/api/admin/tenant-config",
+        json!({"workspace": "acme", "llmApiKey": "sk-original-key"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["llmApiKey"], "sk-o****");
+
+    // Update sends a REAL new key (not the masked sentinel): it must
+    // OVERWRITE the stored one. This is the third merge branch — distinct
+    // from create-filter (sentinel->null) and update-preserve
+    // (sentinel/empty->keep old) — so a macro regeneration of the merge that
+    // collapsed it into "always preserve" or "always overwrite" is caught.
+    let (status, body) = post_json(
+        &env,
+        "/api/admin/tenant-config",
+        json!({"workspace": "acme", "llmApiKey": "sk-rotated-999"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Mask now reflects the ROTATED prefix, proving overwrite not preserve.
+    assert_eq!(body["llmApiKey"], "sk-r****");
+}
+
+#[tokio::test]
+async fn tenant_config_short_key_fully_masked_and_empty_key_preserves() {
+    let env = build_env(false, false).await;
+    // A key of <= 4 chars masks to "****" with no prefix leak.
+    let (status, body) = post_json(
+        &env,
+        "/api/admin/tenant-config",
+        json!({"workspace": "acme", "llmApiKey": "abc"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["llmApiKey"], "****");
+
+    // An empty-string key on update preserves the existing value.
+    let (status, body) = post_json(
+        &env,
+        "/api/admin/tenant-config",
+        json!({"workspace": "acme", "llmApiKey": ""}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["llmApiKey"], "****");
+}
+
+#[tokio::test]
+async fn tenant_config_create_filters_sentinel_and_absent_keys_to_null() {
+    let env = build_env(false, false).await;
+    // On CREATE (no existing row) a "****"/"" key is filtered to None, and an
+    // omitted key stays None — both serialize as null.
+    let (status, body) = post_json(
+        &env,
+        "/api/admin/tenant-config",
+        json!({"workspace": "acme", "llmApiKey": "****", "embeddingApiKey": ""}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["llmApiKey"].is_null());
+    assert!(body["embeddingApiKey"].is_null());
+
+    let (status, body) = post_json(
+        &env,
+        "/api/admin/tenant-config",
+        json!({"workspace": "beta"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["llmApiKey"].is_null());
+}
+
+#[tokio::test]
+async fn tenant_config_get_absent_is_404_and_list_returns_all() {
+    let env = build_env(false, false).await;
+    let (status, body) = get_json(&env, "/api/admin/tenant-config?workspace=ghost").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["status"], 404);
+
+    // Empty list before any config exists.
+    let (status, body) = get_json(&env, "/api/admin/tenant-config").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 0);
+
+    post_json(&env, "/api/admin/tenant-config", json!({"workspace": "acme"})).await;
+    post_json(&env, "/api/admin/tenant-config", json!({"workspace": "beta"})).await;
+    let (status, body) = get_json(&env, "/api/admin/tenant-config").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn tenant_config_delete_removes_config() {
+    let env = build_env(false, false).await;
+    post_json(
+        &env,
+        "/api/admin/tenant-config",
+        json!({"workspace": "acme", "llmModel": "gpt-4o"}),
+    )
+    .await;
+    let (status, _) = delete_json(&env, "/api/admin/tenant-config?workspace=acme").await;
+    assert_eq!(status, StatusCode::OK);
+    // Gone: a subsequent GET is 404.
+    let (status, _) = get_json(&env, "/api/admin/tenant-config?workspace=acme").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn tenant_config_rejects_default_workspace() {
+    let env = build_env(false, false).await;
+    // The default workspace always uses the global config; writes are rejected
+    // with 400 so a silent no-op write cannot happen.
+    let (status, body) = post_json(
+        &env,
+        "/api/admin/tenant-config",
+        json!({"workspace": "default"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["status"], 400);
+
+    let (status, body) =
+        delete_json(&env, "/api/admin/tenant-config?workspace=default").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["status"], 400);
 }

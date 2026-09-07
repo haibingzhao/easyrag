@@ -1,0 +1,4 @@
+---
+source: crates/easyrag-storage/tests/postgres_storage.rs
+---
+SELECT id, properties FROM graph_nodes_graph WHERE id = 'Alice' AND workspace = 'test_ws' AND biz_id = 'default'

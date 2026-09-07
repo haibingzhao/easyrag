@@ -16,11 +16,12 @@ use easyrag_core::storage::traits::StorageNameSpace;
 use easyrag_core::util::hash::compute_args_hash;
 use easyrag_core::JsonMap;
 use easyrag_pipeline::parser::DocumentProcessingOptions;
-use easyrag_pipeline::IngestionPipeline;
 
 use crate::error::{AppError, AppResult};
-use crate::service::{LifecycleOps, ResolvedScope};
+use crate::pagination::Paginated;
+use crate::service::{check_pipeline_busy, LifecycleOps, ResolvedScope};
 use crate::state::{AppServices, AppState};
+use crate::util::success_response;
 
 const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100 MB
 
@@ -46,6 +47,10 @@ pub fn router() -> Router<Arc<AppServices>> {
         .route("/api/documents/{docId}/reprocess", post(reprocess_document))
         .route("/api/documents/batch_delete", post(batch_delete_documents))
         .route("/api/documents/pipeline_status", get(pipeline_status))
+        .route(
+            "/api/documents/auto_scan_status",
+            get(auto_scan_status),
+        )
         .route("/api/documents/status_counts", get(status_counts))
         .route("/api/documents/track_status/{trackId}", get(track_status))
         .route("/api/documents/reprocess_failed", post(reprocess_failed))
@@ -243,24 +248,6 @@ async fn read_scope(state: &AppServices, q: &ScopeQuery) -> AppResult<ResolvedSc
     Ok(scope)
 }
 
-/// P2.16 pipeline concurrency guard: 409 while the pipeline is busy.
-/// Checks the target workspace's pipeline so cross-workspace requests
-/// are not blocked by the default workspace's busy state.
-fn check_pipeline_busy_or_raise(pipeline: &IngestionPipeline) -> AppResult<()> {
-    let busy = pipeline
-        .pipeline_status()
-        .get("busy")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if busy {
-        return Err(AppError::status(
-            409,
-            "Pipeline is busy processing documents. Please wait or cancel first.",
-        ));
-    }
-    Ok(())
-}
-
 /// Spawn the pipeline on a background task
 /// pending documents of the given business line.
 fn spawn_pipeline(pipeline: Arc<easyrag_pipeline::IngestionPipeline>, biz_id: String) {
@@ -407,7 +394,7 @@ async fn process_documents(
 ) -> AppResult<Json<Value>> {
     let scope = query_scope(&state, &q).await?;
     spawn_pipeline(Arc::clone(&state.pipeline), scope.biz_id);
-    Ok(Json(json!({ "status": "success", "message": "Pipeline started" })))
+    Ok(Json(success_response("Pipeline started", None)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -495,12 +482,9 @@ async fn list_documents(
             })
         })
         .collect();
-    Ok(Json(json!({
-        "documents": documents,
-        "total": total,
-        "page": page,
-        "pageSize": page_size,
-    })))
+    Ok(Json(serde_json::to_value(Paginated::new(
+        documents, total, page, page_size,
+    ))?))
 }
 
 /// R5: full document text plus status meta. Literal routes (/status,
@@ -579,15 +563,15 @@ async fn delete_document(
 ) -> AppResult<Json<Value>> {
     let (ops, biz_id) =
         ops_for(&state, query.workspace.as_deref(), query.biz_id.as_deref()).await?;
-    check_pipeline_busy_or_raise(&ops.pipeline)?;
+    check_pipeline_busy(&ops.pipeline)?;
     state
         .lifecycle_service
         .cascade_delete_document(&doc_id, query.delete_file, query.delete_llm_cache, &ops, &biz_id)
         .await?;
-    Ok(Json(json!({
-        "status": "success",
-        "message": "Document deleted with cascade cleanup",
-    })))
+    Ok(Json(success_response(
+        "Document deleted with cascade cleanup",
+        None,
+    )))
 }
 
 async fn batch_delete_documents(
@@ -596,7 +580,7 @@ async fn batch_delete_documents(
 ) -> AppResult<Json<Value>> {
     let (ops, biz_id) =
         ops_for(&state, request.workspace.as_deref(), request.biz_id.as_deref()).await?;
-    check_pipeline_busy_or_raise(&ops.pipeline)?;
+    check_pipeline_busy(&ops.pipeline)?;
     let mut success_count = 0usize;
     let mut errors: Vec<String> = Vec::new();
     for doc_id in &request.doc_ids {
@@ -634,6 +618,18 @@ async fn pipeline_status(
         .get_status_counts(&scope.biz_id)
         .await?;
     Ok(Json(json!({ "status": "idle", "counts": counts })))
+}
+
+/// Background auto-scanner observability (BC-11). Reports whether the scanner
+/// is enabled, the effective task list (derived from config at startup), and
+/// the latest cycle stats per task. Workspace-agnostic: the scanner is a
+/// process-wide background service, so this reads global stats, not a scope.
+async fn auto_scan_status(state: AppState) -> Json<Value> {
+    Json(json!({
+        "enabled": state.config.auto_scan_enabled,
+        "tasks": state.auto_scan_stats.task_specs(),
+        "cycles": state.auto_scan_stats.snapshot(),
+    }))
 }
 
 async fn status_counts(
@@ -765,35 +761,6 @@ async fn insert_batch(
     Ok(Json(json!({ "status": "success", "doc_ids": doc_ids, "count": count })))
 }
 
-/// Collect files recursively, capped at max_files.
-fn collect_files(dir: &Path, extensions: &[String], max_files: usize) -> Vec<std::path::PathBuf> {
-    let mut files = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&current) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if files.len() >= max_files {
-                return files;
-            }
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.is_file() {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_lowercase())
-                    .unwrap_or_default();
-                if extensions.iter().any(|ext| name.ends_with(ext)) {
-                    files.push(path);
-                }
-            }
-        }
-    }
-    files
-}
-
 async fn scan_input_dir(
     state: AppState,
     Json(request): Json<ScanRequest>,
@@ -813,37 +780,30 @@ async fn scan_input_dir(
         .map(|e| e.trim().to_lowercase())
         .collect();
     let max_files = request.max_files.unwrap_or(100);
-    let files = collect_files(dir, &extensions, max_files);
-
-    let mut doc_ids = Vec::new();
     let scope = default_scope(&state).await?;
-    for file in &files {
-        // Skip unreadable files.
-        let Ok(content) = std::fs::read_to_string(file) else {
-            continue;
-        };
-        let absolute = file
-            .canonicalize()
-            .unwrap_or_else(|_| file.to_path_buf())
-            .to_string_lossy()
-            .to_string();
-        if let Ok(doc_id) = state
-            .pipeline
-            .insert_document(&content, &absolute, None, None, &scope.biz_id)
-            .await
-        {
-            doc_ids.push(doc_id);
-        }
-    }
+    // Shared scanner: identical content_hash for a known path is skipped,
+    // changed content is re-inserted. This endpoint used to carry a private
+    // copy of `collect_files` plus an insert loop with no dedup at all, so
+    // every rescan re-ingested the whole directory.
+    let outcome = easyrag_pipeline::scan_directory(
+        &state.pipeline,
+        &state.doc_status_storage,
+        dir,
+        &extensions,
+        max_files,
+        &scope.biz_id,
+    )
+    .await?;
 
     // Auto-start pipeline.
+    let doc_ids = outcome.inserted_doc_ids;
     if !doc_ids.is_empty() {
         spawn_pipeline(Arc::clone(&state.pipeline), scope.biz_id);
     }
     let count = doc_ids.len();
     Ok(Json(json!({
         "status": "success",
-        "message": format!("Scanned {} files, inserted {} documents", files.len(), count),
+        "message": format!("Scanned {} files, inserted {} documents", outcome.files_seen, count),
         "doc_ids": doc_ids,
         "count": count,
     })))
@@ -851,14 +811,11 @@ async fn scan_input_dir(
 
 async fn cancel_pipeline(state: AppState) -> Json<Value> {
     state.pipeline.cancel();
-    Json(json!({
-        "status": "success",
-        "message": "Pipeline cancellation requested",
-    }))
+    Json(success_response("Pipeline cancellation requested", None))
 }
 
 async fn clear_cache(state: AppState) -> AppResult<Json<Value>> {
-    check_pipeline_busy_or_raise(&state.pipeline)?;
+    check_pipeline_busy(&state.pipeline)?;
     let scope = default_scope(&state).await?;
     let biz_id = scope.biz_id.as_str();
     // Full destructive clear: all storage + graph. Errors are propagated
@@ -867,8 +824,5 @@ async fn clear_cache(state: AppState) -> AppResult<Json<Value>> {
     StorageNameSpace::drop(&*state.kv_storage as &dyn StorageNameSpace, biz_id).await?;
     StorageNameSpace::drop(&*state.graph_storage as &dyn StorageNameSpace, biz_id).await?;
     StorageNameSpace::drop(&*state.doc_status_storage as &dyn StorageNameSpace, biz_id).await?;
-    Ok(Json(json!({
-        "status": "success",
-        "message": "All data cleared successfully",
-    })))
+    Ok(Json(success_response("All data cleared successfully", None)))
 }

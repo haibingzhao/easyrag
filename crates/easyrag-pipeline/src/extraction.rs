@@ -81,6 +81,195 @@ impl Default for EntityExtractorConfig {
     }
 }
 
+/// Which wire format the extractor asks the model for.
+///
+/// Collapses the `if cfg.use_json_extraction` branches that used to be
+/// scattered through [`EntityExtractor::extract`]: the examples block, the
+/// three prompt templates, the per-mode prompt variables, `response_format`,
+/// and the parser. Both arms stay reachable — `use_json_extraction` is a
+/// public config field — even though every production assembly site leaves it
+/// at the `true` default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtractionMode {
+    /// Structured JSON output, requested through `response_format`.
+    Json,
+    /// Delimiter-separated tuples, parsed positionally.
+    Tuple,
+}
+
+impl ExtractionMode {
+    fn of(cfg: &EntityExtractorConfig) -> Self {
+        if cfg.use_json_extraction {
+            Self::Json
+        } else {
+            Self::Tuple
+        }
+    }
+
+    fn examples(&self) -> String {
+        match self {
+            Self::Json => ENTITY_EXTRACTION_JSON_EXAMPLES.join("\n"),
+            Self::Tuple => ENTITY_EXTRACTION_EXAMPLES.join("\n"),
+        }
+    }
+
+    fn system_prompt_template(&self) -> &'static str {
+        match self {
+            Self::Json => ENTITY_EXTRACTION_JSON_SYSTEM_PROMPT.as_str(),
+            Self::Tuple => ENTITY_EXTRACTION_SYSTEM_PROMPT.as_str(),
+        }
+    }
+
+    fn user_prompt_template(&self) -> &'static str {
+        match self {
+            Self::Json => ENTITY_EXTRACTION_JSON_USER_PROMPT.as_str(),
+            Self::Tuple => ENTITY_EXTRACTION_USER_PROMPT.as_str(),
+        }
+    }
+
+    fn gleaning_template(&self) -> &'static str {
+        match self {
+            Self::Json => ENTITY_CONTINUE_EXTRACTION_JSON_USER_PROMPT,
+            Self::Tuple => ENTITY_CONTINUE_EXTRACTION_USER_PROMPT,
+        }
+    }
+
+    /// Only JSON mode constrains the response shape; tuple mode leaves it
+    /// unset so the model emits free-form delimited lines.
+    fn response_format(&self) -> Option<ResponseFormat> {
+        match self {
+            Self::Json => Some(ResponseFormat::JsonObject),
+            Self::Tuple => None,
+        }
+    }
+
+    fn parse(&self, response: &str) -> ExtractionResult {
+        match self {
+            Self::Json => EntityExtractor::parse_json_extraction(response),
+            Self::Tuple => EntityExtractor::parse_tuple_extraction(
+                response,
+                DEFAULT_TUPLE_DELIMITER,
+                DEFAULT_COMPLETION_DELIMITER,
+            ),
+        }
+    }
+
+    /// System-prompt variables. Both modes supply the same seven keys: the
+    /// delimiters are inert in JSON mode (its template never mentions them)
+    /// but must still be present, because `format_prompt` substitutes by
+    /// iteration and a missing key would leave the placeholder behind.
+    fn system_vars(&self, cfg: &EntityExtractorConfig) -> HashMap<String, String> {
+        let mut vars = base_vars(cfg);
+        vars.insert(
+            "entity_types_guidance".to_string(),
+            cfg.entity_types_guidance.clone(),
+        );
+        vars.insert("examples".to_string(), self.examples());
+        vars.insert(
+            "tuple_delimiter".to_string(),
+            DEFAULT_TUPLE_DELIMITER.to_string(),
+        );
+        vars.insert(
+            "completion_delimiter".to_string(),
+            DEFAULT_COMPLETION_DELIMITER.to_string(),
+        );
+        vars
+    }
+
+    /// User-prompt variables. The per-mode extra is not cosmetic: the JSON
+    /// user template carries `{entity_types_guidance}` (its system template
+    /// does not), while the tuple user template inlines
+    /// `{completion_delimiter}`.
+    fn user_vars(
+        &self,
+        cfg: &EntityExtractorConfig,
+        input_text: &str,
+        heading_context_block: String,
+    ) -> HashMap<String, String> {
+        let mut vars = base_vars(cfg);
+        vars.insert("input_text".to_string(), input_text.to_string());
+        match self {
+            Self::Json => vars.insert(
+                "entity_types_guidance".to_string(),
+                cfg.entity_types_guidance.clone(),
+            ),
+            Self::Tuple => vars.insert(
+                "completion_delimiter".to_string(),
+                DEFAULT_COMPLETION_DELIMITER.to_string(),
+            ),
+        };
+        vars.insert("heading_context_block".to_string(), heading_context_block);
+        vars
+    }
+
+    /// Gleaning-prompt variables. The JSON gleaning template mentions neither
+    /// the guidance nor a delimiter, so JSON adds nothing here; only the tuple
+    /// template inlines `{completion_delimiter}`.
+    fn gleaning_vars(&self, cfg: &EntityExtractorConfig) -> HashMap<String, String> {
+        let mut vars = base_vars(cfg);
+        if let Self::Tuple = self {
+            vars.insert(
+                "completion_delimiter".to_string(),
+                DEFAULT_COMPLETION_DELIMITER.to_string(),
+            );
+        }
+        vars
+    }
+}
+
+/// The prompt variables every extraction template shares verbatim. The
+/// remaining keys are mode- or role-specific and stay with their callers.
+fn base_vars(cfg: &EntityExtractorConfig) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+    vars.insert(
+        "max_total_records".to_string(),
+        cfg.max_total_records.to_string(),
+    );
+    vars.insert(
+        "max_entity_records".to_string(),
+        cfg.max_entity_records.to_string(),
+    );
+    vars.insert("language".to_string(), cfg.language.clone());
+    vars
+}
+
+/// A graph payload, built once and shared by the four
+/// `upsert_node`/`upsert_edge` sites in [`EntityExtractor::merge_to_graph`].
+///
+/// Insertion order is observable: `serde_json` compiles with `preserve_order`,
+/// so `JsonMap` is an `IndexMap` and every backend sees the keys in the order
+/// written here. `testdata/golden/extraction/*_payload.snap` pins it.
+struct GraphUpsert {
+    description: String,
+    source_id: String,
+}
+
+impl GraphUpsert {
+    /// Node payload, key order `[entity_type, description, source_id]`.
+    fn node(self, entity_type: impl Into<String>) -> JsonMap {
+        let mut data = JsonMap::new();
+        data.insert("entity_type".into(), JsonValue::String(entity_type.into()));
+        data.insert("description".into(), JsonValue::String(self.description));
+        data.insert("source_id".into(), JsonValue::String(self.source_id));
+        data
+    }
+
+    /// Edge payload, key order `[keywords, description, source_id, weight]`.
+    ///
+    /// `weight` is `f32` deliberately. The bump in `merge_to_graph` is
+    /// computed in `f32`, and widening the result to `f64` would change the
+    /// serialised number (`1.1` instead of `1.100000023841858`) — pinned by
+    /// `existing_relation_weight_precision_payload.snap`.
+    fn edge(self, keywords: impl Into<String>, weight: f32) -> JsonMap {
+        let mut data = JsonMap::new();
+        data.insert("keywords".into(), JsonValue::String(keywords.into()));
+        data.insert("description".into(), JsonValue::String(self.description));
+        data.insert("source_id".into(), JsonValue::String(self.source_id));
+        data.insert("weight".into(), serde_json::json!(weight));
+        data
+    }
+}
+
 /// Entity and relationship extraction from text chunks using LLM.
 pub struct EntityExtractor {
     llm_service: Arc<dyn LlmService>,
@@ -127,40 +316,10 @@ impl EntityExtractor {
         heading_path: &str,
     ) -> easyrag_core::Result<ExtractionResult> {
         let cfg = &self.config;
-        let tuple_delimiter = DEFAULT_TUPLE_DELIMITER;
-        let completion_delimiter = DEFAULT_COMPLETION_DELIMITER;
+        let mode = ExtractionMode::of(cfg);
 
-        let examples = if cfg.use_json_extraction {
-            ENTITY_EXTRACTION_JSON_EXAMPLES.join("\n")
-        } else {
-            ENTITY_EXTRACTION_EXAMPLES.join("\n")
-        };
-
-        let mut sys_vars = HashMap::new();
-        sys_vars.insert(
-            "entity_types_guidance".to_string(),
-            cfg.entity_types_guidance.clone(),
-        );
-        sys_vars.insert("examples".to_string(), examples);
-        sys_vars.insert("max_total_records".to_string(), cfg.max_total_records.to_string());
-        sys_vars.insert(
-            "max_entity_records".to_string(),
-            cfg.max_entity_records.to_string(),
-        );
-        sys_vars.insert("language".to_string(), cfg.language.clone());
-        sys_vars.insert("tuple_delimiter".to_string(), tuple_delimiter.to_string());
-        sys_vars.insert(
-            "completion_delimiter".to_string(),
-            completion_delimiter.to_string(),
-        );
-        let system_prompt = format_prompt(
-            if cfg.use_json_extraction {
-                ENTITY_EXTRACTION_JSON_SYSTEM_PROMPT
-            } else {
-                ENTITY_EXTRACTION_SYSTEM_PROMPT
-            },
-            &sys_vars,
-        );
+        let system_prompt =
+            format_prompt(mode.system_prompt_template(), &mode.system_vars(cfg));
 
         let heading_context_block = if !heading_path.is_empty() {
             let mut vars = HashMap::new();
@@ -170,49 +329,15 @@ impl EntityExtractor {
             String::new()
         };
 
-        let mut user_vars = HashMap::new();
-        user_vars.insert("input_text".to_string(), chunk_content.to_string());
-        if cfg.use_json_extraction {
-            user_vars.insert(
-                "entity_types_guidance".to_string(),
-                cfg.entity_types_guidance.clone(),
-            );
-        }
-        user_vars.insert("max_total_records".to_string(), cfg.max_total_records.to_string());
-        user_vars.insert(
-            "max_entity_records".to_string(),
-            cfg.max_entity_records.to_string(),
-        );
-        user_vars.insert("language".to_string(), cfg.language.clone());
-        if !cfg.use_json_extraction {
-            user_vars.insert(
-                "completion_delimiter".to_string(),
-                completion_delimiter.to_string(),
-            );
-        }
-        user_vars.insert("heading_context_block".to_string(), heading_context_block);
         let user_prompt = format_prompt(
-            if cfg.use_json_extraction {
-                ENTITY_EXTRACTION_JSON_USER_PROMPT
-            } else {
-                ENTITY_EXTRACTION_USER_PROMPT
-            },
-            &user_vars,
+            mode.user_prompt_template(),
+            &mode.user_vars(cfg, chunk_content, heading_context_block),
         );
 
         // First round extraction.
-        let mut request = LlmRequest::new(user_prompt.clone())
-            .with_system_prompt(system_prompt.clone());
-        if cfg.use_json_extraction {
-            request.response_format = Some(ResponseFormat::JsonObject);
-        }
-        let response = self.llm_service.complete(&request).await?;
-
-        let mut result = if cfg.use_json_extraction {
-            Self::parse_json_extraction(&response)
-        } else {
-            Self::parse_tuple_extraction(&response, tuple_delimiter, completion_delimiter)
-        };
+        let (response, mut result) = self
+            .run_round(mode, user_prompt.clone(), &system_prompt, None)
+            .await?;
 
         // Gleaning: multi-round extraction to recover missed
         // entities/relationships.
@@ -248,48 +373,12 @@ impl EntityExtractor {
                     break;
                 }
 
-                let mut gleaning_vars = HashMap::new();
-                gleaning_vars.insert(
-                    "max_total_records".to_string(),
-                    cfg.max_total_records.to_string(),
-                );
-                gleaning_vars.insert(
-                    "max_entity_records".to_string(),
-                    cfg.max_entity_records.to_string(),
-                );
-                gleaning_vars.insert("language".to_string(), cfg.language.clone());
-                if !cfg.use_json_extraction {
-                    gleaning_vars.insert(
-                        "completion_delimiter".to_string(),
-                        completion_delimiter.to_string(),
-                    );
-                }
-                let gleaning_prompt = format_prompt(
-                    if cfg.use_json_extraction {
-                        ENTITY_CONTINUE_EXTRACTION_JSON_USER_PROMPT
-                    } else {
-                        ENTITY_CONTINUE_EXTRACTION_USER_PROMPT
-                    },
-                    &gleaning_vars,
-                );
+                let gleaning_prompt =
+                    format_prompt(mode.gleaning_template(), &mode.gleaning_vars(cfg));
 
-                let mut gleaning_request = LlmRequest::new(gleaning_prompt)
-                    .with_system_prompt(system_prompt.clone());
-                gleaning_request.history = history.clone();
-                if cfg.use_json_extraction {
-                    gleaning_request.response_format = Some(ResponseFormat::JsonObject);
-                }
-                let gleaning_response = self.llm_service.complete(&gleaning_request).await?;
-
-                let gleaning_result = if cfg.use_json_extraction {
-                    Self::parse_json_extraction(&gleaning_response)
-                } else {
-                    Self::parse_tuple_extraction(
-                        &gleaning_response,
-                        tuple_delimiter,
-                        completion_delimiter,
-                    )
-                };
+                let (gleaning_response, gleaning_result) = self
+                    .run_round(mode, gleaning_prompt, &system_prompt, Some(history.clone()))
+                    .await?;
 
                 // Stop if no new entities/relationships found.
                 if gleaning_result.entities.is_empty()
@@ -333,6 +422,30 @@ impl EntityExtractor {
         Ok(result)
     }
 
+    /// One extraction round: build the request, constrain the response shape
+    /// when the mode asks for it, call the model, then parse.
+    ///
+    /// The first round and every gleaning round are these same four steps and
+    /// differ only in `history`, which gleaning carries and the first round
+    /// leaves empty. The raw response is returned alongside the parsed result
+    /// because gleaning appends it to the conversation history verbatim.
+    async fn run_round(
+        &self,
+        mode: ExtractionMode,
+        prompt: String,
+        system_prompt: &str,
+        history: Option<Vec<ChatMessage>>,
+    ) -> easyrag_core::Result<(String, ExtractionResult)> {
+        let mut request = LlmRequest::new(prompt).with_system_prompt(system_prompt);
+        if let Some(history) = history {
+            request.history = history;
+        }
+        request.response_format = mode.response_format();
+        let response = self.llm_service.complete(&request).await?;
+        let result = mode.parse(&response);
+        Ok((response, result))
+    }
+
     /// Merge extracted entities and relationships into the knowledge graph.
     /// Uses KeyedMutex for entity-level locking to prevent concurrent
     /// modifications. Entity type uses stability voting; source IDs are
@@ -372,32 +485,25 @@ impl EntityExtractor {
                         let voted_type =
                             Self::vote_entity_type(existing_type, &entity.entity_type);
 
-                        let mut data = JsonMap::new();
-                        data.insert("entity_type".into(), JsonValue::String(voted_type));
-                        data.insert("description".into(), JsonValue::String(final_desc));
-                        data.insert(
-                            "source_id".into(),
-                            JsonValue::String(merge_source_ids_str(
+                        let data = GraphUpsert {
+                            description: final_desc,
+                            source_id: merge_source_ids_str(
                                 existing
                                     .get("source_id")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or(""),
                                 &chunk_id,
                                 self.config.max_source_ids_per_entity,
-                            )),
-                        );
+                            ),
+                        }
+                        .node(voted_type);
                         self.graph_storage.upsert_node(&entity_name, data, biz_id).await?;
                     } else {
-                        let mut data = JsonMap::new();
-                        data.insert(
-                            "entity_type".into(),
-                            JsonValue::String(entity.entity_type.clone()),
-                        );
-                        data.insert(
-                            "description".into(),
-                            JsonValue::String(entity.entity_description.clone()),
-                        );
-                        data.insert("source_id".into(), JsonValue::String(chunk_id.clone()));
+                        let data = GraphUpsert {
+                            description: entity.entity_description.clone(),
+                            source_id: chunk_id.clone(),
+                        }
+                        .node(entity.entity_type.clone());
                         self.graph_storage.upsert_node(&entity_name, data, biz_id).await?;
                     }
                     Ok::<(), easyrag_core::CoreError>(())
@@ -437,42 +543,27 @@ impl EntityExtractor {
                             .and_then(|v| v.as_f64())
                             .unwrap_or(1.0) as f32;
 
-                        let mut data = JsonMap::new();
-                        data.insert(
-                            "keywords".into(),
-                            JsonValue::String(rel.relationship_keywords.clone()),
-                        );
-                        data.insert("description".into(), JsonValue::String(final_desc));
-                        data.insert(
-                            "source_id".into(),
-                            JsonValue::String(merge_source_ids_str(
+                        let data = GraphUpsert {
+                            description: final_desc,
+                            source_id: merge_source_ids_str(
                                 existing
                                     .get("source_id")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or(""),
                                 &chunk_id,
                                 self.config.max_source_ids_per_entity,
-                            )),
-                        );
-                        data.insert(
-                            "weight".into(),
-                            serde_json::json!(existing_weight + 1.0),
-                        );
+                            ),
+                        }
+                        .edge(rel.relationship_keywords.clone(), existing_weight + 1.0);
                         self.graph_storage
                             .upsert_edge(&rel.source_entity, &rel.target_entity, data, biz_id)
                             .await?;
                     } else {
-                        let mut data = JsonMap::new();
-                        data.insert(
-                            "keywords".into(),
-                            JsonValue::String(rel.relationship_keywords.clone()),
-                        );
-                        data.insert(
-                            "description".into(),
-                            JsonValue::String(rel.relationship_description.clone()),
-                        );
-                        data.insert("source_id".into(), JsonValue::String(chunk_id.clone()));
-                        data.insert("weight".into(), serde_json::json!(1.0_f32));
+                        let data = GraphUpsert {
+                            description: rel.relationship_description.clone(),
+                            source_id: chunk_id.clone(),
+                        }
+                        .edge(rel.relationship_keywords.clone(), 1.0_f32);
                         self.graph_storage
                             .upsert_edge(&rel.source_entity, &rel.target_entity, data, biz_id)
                             .await?;

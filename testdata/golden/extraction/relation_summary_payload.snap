@@ -1,0 +1,13 @@
+---
+source: crates/easyrag-pipeline/tests/extraction_golden.rs
+---
+node_writes=0
+edge_writes=1
+edge "Ada Lovelace" -> "Charles Babbage"
+keys=[keywords, description, source_id, weight]
+{
+  "keywords": "collaborated with",
+  "description": "Relation summary.",
+  "source_id": "chunk-1<SEP>chunk-7",
+  "weight": 2.0
+}

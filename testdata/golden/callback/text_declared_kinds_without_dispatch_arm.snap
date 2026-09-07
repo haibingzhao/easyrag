@@ -1,0 +1,14 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+typed_and_on_event_calls:
+on_event(chunk_start)
+on_event(extraction_start)
+on_event(embedding_start)
+on_event(embedding_end)
+on_event(graph_merge_start)
+on_event(graph_merge_end)
+on_event(multimodal_start)
+on_event(multimodal_end)
+logged_event_count=8
+logged_event_types=["chunk_start", "extraction_start", "embedding_start", "embedding_end", "graph_merge_start", "graph_merge_end", "multimodal_start", "multimodal_end"]

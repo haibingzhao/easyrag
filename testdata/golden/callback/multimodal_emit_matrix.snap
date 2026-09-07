@@ -1,0 +1,15 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+on_parse_start(file_path=fp-1, parser=parser-1)
+on_parse_complete(file_path=fp-2, content_blocks=22, doc_id=doc-2, duration_ms=222)
+on_text_insert_start(doc_id=doc-3, content_length=33)
+on_text_insert_complete(doc_id=doc-4, chunks_created=44, duration_ms=444)
+on_modal_process_start(file_path=fp-5, modal_type=image, item_count=55)
+on_modal_process_complete(file_path=fp-6, processed_count=66, failed_count=67, duration_ms=666)
+on_query_start(query=q-7, mode=hybrid)
+on_query_complete(query=q-8, response_length=88, duration_ms=888)
+on_error(stage=stage-9, error=err-9, file_path=Some(fp-9), doc_id=Some(doc-9))
+on_error(stage=stage-9b, error=err-9b, file_path=None, doc_id=None)
+on_batch_start(folder_path=folder-10, total_files=100)
+on_batch_complete(successful=111, failed=112, skipped=113, duration_ms=114)

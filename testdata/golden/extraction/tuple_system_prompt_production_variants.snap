@@ -1,0 +1,6 @@
+---
+source: crates/easyrag-pipeline/tests/extraction_golden.rs
+---
+distinct_variants=4
+hashes=["2a4f3e73a07eed04", "5ce17f24c50895ba", "d3d240229800528c", "ffd8097bbe292b28"]
+leaks=["tuple_delimiter_leaked=false completion_delimiter_leaked=false", "tuple_delimiter_leaked=false completion_delimiter_leaked=true", "tuple_delimiter_leaked=true completion_delimiter_leaked=false", "tuple_delimiter_leaked=true completion_delimiter_leaked=true"]

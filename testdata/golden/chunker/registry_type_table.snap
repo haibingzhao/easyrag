@@ -1,0 +1,17 @@
+---
+source: crates/easyrag-pipeline/tests/chunker_golden.rs
+---
+"token_size" -> ok(token_size)
+"default" -> ok(token_size)
+"recursive_character" -> ok(recursive_character)
+"semantic_vector" -> err(semantic_vector chunker requires 'embedding_func' in config)
+"paragraph_semantic" -> err(paragraph_semantic chunker requires 'embedding_func' in config)
+"p" -> err(paragraph_semantic chunker requires 'embedding_func' in config)
+"structure_aware" -> ok(structure_aware)
+"s" -> ok(structure_aware)
+"TOKEN_SIZE" -> ok(token_size)
+"no_such_chunker" -> ok(token_size)
+"" -> ok(token_size)
+"semantic_vector" +embedding -> ok(semantic_vector)
+"paragraph_semantic" +embedding -> ok(paragraph_semantic)
+"p" +embedding -> ok(paragraph_semantic)

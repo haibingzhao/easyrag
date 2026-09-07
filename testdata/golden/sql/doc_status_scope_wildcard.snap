@@ -1,0 +1,4 @@
+---
+source: crates/easyrag-storage/tests/postgres_storage.rs
+---
+SELECT id, biz_id, content, status, created_at, updated_at FROM doc_status_doc_status WHERE workspace = 'test_ws' AND status = 'processed'

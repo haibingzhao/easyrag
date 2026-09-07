@@ -52,12 +52,43 @@ apiClient.interceptors.response.use(
   (response) => response,
   (error) => {
     if (error.response?.status === 401) {
-      localStorage.removeItem('easyrag_token')
-      window.location.href = '/login'
+      handleUnauthorized()
     }
     return Promise.reject(error)
   }
 )
+
+/**
+ * Shared 401 recovery: drop the stale token and bounce to the login page.
+ * Single source of truth for the axios response interceptor and for raw
+ * `fetch` callers that cannot go through `apiClient` (SSE streaming needs a
+ * ReadableStream, which axios does not expose in the browser).
+ */
+export function handleUnauthorized(): void {
+  localStorage.removeItem('easyrag_token')
+  window.location.href = '/login'
+}
+
+/**
+ * Headers for raw `fetch` calls, mirroring the apiClient request interceptor.
+ * The Authorization header is omitted entirely when no token is stored, so
+ * unauthenticated deployments never send a bare `Bearer `.
+ */
+export function authHeaders(): Record<string, string> {
+  const token = localStorage.getItem('easyrag_token')
+  return token
+    ? { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }
+    : { 'Content-Type': 'application/json' }
+}
+
+/**
+ * Attaches the active workspace to a JSON request body, mirroring the
+ * apiClient request interceptor's POST/PUT/PATCH branch.
+ */
+export function withWorkspace<T extends Record<string, unknown>>(body: T): T {
+  const workspace = getCurrentWorkspace()
+  return workspace && workspace !== 'default' ? { ...body, workspace } : body
+}
 
 export interface QueryRequest {
   query: string

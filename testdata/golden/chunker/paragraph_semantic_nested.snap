@@ -1,0 +1,16 @@
+---
+source: crates/easyrag-pipeline/tests/chunker_golden.rs
+---
+chunks=6
+order=0 tokens=9 doc_id="doc-1" content="# Top Level\nShort intro under top."
+  metadata: heading="Top Level" level=1 parent_headings=[]
+order=1 tokens=4 doc_id="doc-1" content="# Empty Top"
+  metadata: heading="Empty Top" level=1 parent_headings=[]
+order=2 tokens=13 doc_id="doc-1" content="## Nested Section\nSentence number 0 discusses topic 0."
+  metadata: heading="Nested Section" level=2 parent_headings=["Empty Top"]
+order=3 tokens=40 doc_id="doc-1" content="## Nested Section\nSentence number 1 discusses topic 1. Sentence number 2 discusses topic 2. Sentence number 3 discusses topic 3. Sentence number 4 discusses topic 0."
+  metadata: heading="Nested Section" level=2 parent_headings=["Empty Top"]
+order=4 tokens=13 doc_id="doc-1" content="## Nested Section\nSentence number 5 discusses topic 1."
+  metadata: heading="Nested Section" level=2 parent_headings=["Empty Top"]
+order=5 tokens=22 doc_id="doc-1" content="## Nested Section\nSentence number 6 discusses topic 2. Sentence number 7 discusses topic 3."
+  metadata: heading="Nested Section" level=2 parent_headings=["Empty Top"]

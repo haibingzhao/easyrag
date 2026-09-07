@@ -8,7 +8,7 @@ use easyrag_server::{ServerConfig, DEFAULT_JWT_SECRET};
 
 /// Workspace name guard (P2.17, direct):
 /// prevents SQL injection through workspace-derived table names.
-pub(crate) fn validate_workspace(workspace: &str) -> anyhow::Result<()> {
+pub fn validate_workspace(workspace: &str) -> anyhow::Result<()> {
     let pattern = regex::Regex::new(r"^[a-zA-Z0-9_\-][a-zA-Z0-9_\-.]{0,63}$").unwrap();
     if !pattern.is_match(workspace) {
         bail!(
@@ -59,7 +59,7 @@ fn env_bool(
 
 /// Build the server configuration from environment variables. Defaults
 /// mirror `easyrag-app/src/main/resources/application.yml`.
-pub(crate) fn build_config(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<ServerConfig> {
+pub fn build_config(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<ServerConfig> {
     let mut config = ServerConfig::default();
     config.port = env_parse(get, "PORT", 8020)?;
 
@@ -144,6 +144,26 @@ pub(crate) fn build_config(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Resu
     );
 
     config.cache_enabled = env_bool(get, "CACHE_ENABLED", true)?;
+
+    // Background auto scanner (A-9 wiring, BC-11). Default-disabled gradual
+    // rollout: `AUTO_SCAN_ENABLED=false` keeps the production binary behaving
+    // exactly as before (no scanner spawned). The scalar fields feed
+    // `scanner::build_scan_tasks`, which synthesizes an implicit pending-poll
+    // task and (when `AUTO_SCAN_INPUT_DIR` is non-empty) a dir-scan task.
+    // Defaults mirror `ServerConfig::default()`.
+    config.auto_scan_enabled = env_bool(get, "AUTO_SCAN_ENABLED", false)?;
+    config.auto_scan_interval_seconds = env_parse(get, "AUTO_SCAN_INTERVAL_SECONDS", 60u64)?;
+    config.auto_scan_input_dir = env_get(get, "AUTO_SCAN_INPUT_DIR", "");
+    config.auto_scan_extensions = env_get(get, "AUTO_SCAN_EXTENSIONS", ".txt,.md,.pdf");
+    config.auto_scan_max_files_per_cycle =
+        env_parse(get, "AUTO_SCAN_MAX_FILES_PER_CYCLE", 100usize)?;
+    // Optional explicit task list (JSON array of ScanTaskSpec); when present it
+    // wins over the implicit tasks derived above (see `build_scan_tasks`).
+    if let Some(raw) = get("AUTO_SCAN_TASKS").filter(|v| !v.trim().is_empty()) {
+        config.auto_scan_tasks = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("invalid JSON for AUTO_SCAN_TASKS: {e}"))?;
+    }
+
     Ok(config)
 }
 
@@ -195,6 +215,13 @@ mod tests {
         assert_eq!(config.keyword_search_language, "simple");
         assert_eq!(config.hybrid_rrf_k, 60);
         assert_eq!(config.neo4j_max_pool_size, 100);
+        // Auto scanner defaults (BC-11 gradual rollout: disabled by default).
+        assert!(!config.auto_scan_enabled);
+        assert!(config.auto_scan_tasks.is_empty());
+        assert_eq!(config.auto_scan_interval_seconds, 60);
+        assert_eq!(config.auto_scan_input_dir, "");
+        assert_eq!(config.auto_scan_extensions, ".txt,.md,.pdf");
+        assert_eq!(config.auto_scan_max_files_per_cycle, 100);
     }
 
     #[test]
@@ -248,5 +275,42 @@ mod tests {
         let mut vars: HashMap<&str, String> = HashMap::new();
         vars.insert("PORT", "".into());
         assert_eq!(build_config(&getter(vars)).unwrap().port, 8020);
+    }
+
+    #[test]
+    fn config_reads_auto_scan_env() {
+        let mut vars: HashMap<&str, String> = HashMap::new();
+        vars.insert("AUTO_SCAN_ENABLED", "true".into());
+        vars.insert("AUTO_SCAN_INTERVAL_SECONDS", "30".into());
+        vars.insert("AUTO_SCAN_INPUT_DIR", "/data/inbox".into());
+        vars.insert("AUTO_SCAN_EXTENSIONS", ".txt,.pdf".into());
+        vars.insert("AUTO_SCAN_MAX_FILES_PER_CYCLE", "25".into());
+        let config = build_config(&getter(vars)).unwrap();
+        assert!(config.auto_scan_enabled);
+        assert_eq!(config.auto_scan_interval_seconds, 30);
+        assert_eq!(config.auto_scan_input_dir, "/data/inbox");
+        assert_eq!(config.auto_scan_extensions, ".txt,.pdf");
+        assert_eq!(config.auto_scan_max_files_per_cycle, 25);
+    }
+
+    #[test]
+    fn config_parses_explicit_auto_scan_tasks_json() {
+        let mut vars: HashMap<&str, String> = HashMap::new();
+        vars.insert(
+            "AUTO_SCAN_TASKS",
+            r#"[{"task_id":"t1","kind":"dir_scan","workspace":"ws","interval_secs":15,"input_dir":"/d","extensions":[".md"],"max_files_per_cycle":5}]"#
+                .into(),
+        );
+        let config = build_config(&getter(vars)).unwrap();
+        assert_eq!(config.auto_scan_tasks.len(), 1);
+        assert_eq!(config.auto_scan_tasks[0].task_id, "t1");
+    }
+
+    #[test]
+    fn config_rejects_invalid_auto_scan_tasks_json() {
+        // Set-but-invalid JSON fails fast (mirrors env_parse semantics).
+        let mut vars: HashMap<&str, String> = HashMap::new();
+        vars.insert("AUTO_SCAN_TASKS", "not-json".into());
+        assert!(build_config(&getter(vars)).is_err());
     }
 }

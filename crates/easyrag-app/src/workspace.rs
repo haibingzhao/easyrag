@@ -13,10 +13,6 @@ use easyrag_core::storage::tenant_config::TenantConfigStorage;
 use easyrag_core::storage::traits::{
     DocStatusStorage, GraphStorage, KVStorage, StorageBundle, StorageNameSpace, VectorStorage,
 };
-use easyrag_pipeline::{
-    IngestionPipeline, QueryEngine, StructureAgentStrategy, StructureQueryStrategy,
-    TreeSearchEngine,
-};
 use easyrag_server::service::{ResolvedScope, WorkspaceContext, WorkspaceResolver};
 use easyrag_server::{AppError, AppResult, ServerConfig};
 use easyrag_storage::memory::{
@@ -25,6 +21,7 @@ use easyrag_storage::memory::{
 
 use crate::config::validate_workspace;
 use crate::embedding::make_embedding_func;
+use crate::factory;
 
 /// R2: upper bound of cached per-workspace contexts (LRU eviction).
 const MAX_CACHED_WORKSPACES: usize = 32;
@@ -37,17 +34,17 @@ const MAX_CACHED_WORKSPACES: usize = 32;
 /// and DDL is idempotent). biz_id is never part of the cache key: it is
 /// a per-call filter value, normalized in resolve and returned to the
 /// caller alongside the context.
-pub(crate) struct WorkspaceResolverImpl {
-    pub(crate) default_workspace: String,
-    pub(crate) default_biz_id: String,
-    pub(crate) default_context: WorkspaceContext,
-    pub(crate) llm: Arc<dyn LlmService>,
-    pub(crate) tool_calling_llm: Option<Arc<dyn ToolCallingLlmService>>,
-    pub(crate) config: ServerConfig,
-    pub(crate) tenant_config_storage: Arc<dyn TenantConfigStorage>,
-    pub(crate) pg_db: Option<easyrag_storage::postgres::PgDatabase>,
-    pub(crate) neo4j_db: Option<easyrag_storage::neo4j::Neo4jDatabase>,
-    pub(crate) cache: tokio::sync::Mutex<
+pub struct WorkspaceResolverImpl {
+    default_workspace: String,
+    default_biz_id: String,
+    default_context: WorkspaceContext,
+    llm: Arc<dyn LlmService>,
+    tool_calling_llm: Option<Arc<dyn ToolCallingLlmService>>,
+    config: ServerConfig,
+    tenant_config_storage: Arc<dyn TenantConfigStorage>,
+    pg_db: Option<easyrag_storage::postgres::PgDatabase>,
+    neo4j_db: Option<easyrag_storage::neo4j::Neo4jDatabase>,
+    cache: tokio::sync::Mutex<
         Vec<(
             String,
             WorkspaceContext,
@@ -57,6 +54,40 @@ pub(crate) struct WorkspaceResolverImpl {
 }
 
 impl WorkspaceResolverImpl {
+    /// Construct the resolver. Fields are private on purpose: the LRU `cache`
+    /// and the shared `pg_db`/`neo4j_db` pools carry a lifecycle invariant
+    /// (eviction must run `finalize_entry` — close the tantivy directory lock,
+    /// then finalize each storage), so callers go through `resolve` /
+    /// `finalize_all` / `invalidate_cached_workspace` instead of touching the
+    /// raw state. This constructor exists because the binary is a separate
+    /// crate from this library, where `pub(crate)` fields are invisible to
+    /// `main`; keeping the fields private still blocks *external* crates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        default_workspace: String,
+        default_biz_id: String,
+        default_context: WorkspaceContext,
+        llm: Arc<dyn LlmService>,
+        tool_calling_llm: Option<Arc<dyn ToolCallingLlmService>>,
+        config: ServerConfig,
+        tenant_config_storage: Arc<dyn TenantConfigStorage>,
+        pg_db: Option<easyrag_storage::postgres::PgDatabase>,
+        neo4j_db: Option<easyrag_storage::neo4j::Neo4jDatabase>,
+    ) -> Self {
+        Self {
+            default_workspace,
+            default_biz_id,
+            default_context,
+            llm,
+            tool_calling_llm,
+            config,
+            tenant_config_storage,
+            pg_db,
+            neo4j_db,
+            cache: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+
     async fn build_context(
         &self,
         workspace: &str,
@@ -202,69 +233,41 @@ impl WorkspaceResolverImpl {
             Some(search as Arc<dyn KeywordSearchable>)
         };
 
-        // Per-workspace extractor wiring: tenant-resolved extraction
-        // settings flow into the pipeline's EntityExtractor (same shared
-        // override policy as EasyRAG / the global pipeline).
-        let mut extractor_config =
-            easyrag_pipeline::extraction::EntityExtractorConfig::default();
-        extractor_config.apply_ingest_settings(
-            resolved_config.language.clone(),
-            resolved_config.entity_extract_max_gleaning,
-            &resolved_config.entity_types_guidance,
-        );
-
-        let mut pipeline = IngestionPipeline::new(
+        // Pipeline / query engine / structure strategy are assembled through
+        // `app::factory` — the same wiring matrix the default path in `main`
+        // uses, so the two paths cannot drift apart. The per-workspace path
+        // passes `rerank = None` (a per-workspace reranker is BC-10 and is
+        // intentionally not wired) and threads its own `keyword` handle; the
+        // tenant-resolved `resolved_config` feeds the extractor settings.
+        let pipeline = factory::build_pipeline(
             self.llm.clone(),
+            &resolved_config,
             kv.clone(),
             vector.clone(),
             graph.clone(),
             doc_status.clone(),
             Arc::new(make_embedding_func(&resolved_config)?),
-        )
-        .with_extractor(easyrag_pipeline::extraction::EntityExtractor::new(
-            self.llm.clone(),
-            graph.clone(),
-            vector.clone(),
-            kv.clone(),
-            extractor_config,
-        ))
-        .with_language(resolved_config.language.clone())
-        .with_max_concurrency(resolved_config.llm_max_async);
-        if let Some(keyword) = &keyword {
-            pipeline = pipeline.with_keyword_search(keyword.clone());
-        }
-        let pipeline = Arc::new(pipeline);
-
-        let agent_strategy = self.tool_calling_llm.as_ref().map(|tc_llm| {
-            Arc::new(
-                StructureAgentStrategy::new(tc_llm.clone(), kv.clone(), vector.clone())
-                    .with_doc_status_storage(doc_status.clone()),
-            )
-        });
-        let structure = Arc::new(
-            StructureQueryStrategy::new(
-                TreeSearchEngine::new(self.llm.clone()),
-                agent_strategy,
-                kv.clone(),
-                vector.clone(),
-                self.llm.clone(),
-            )
-            .with_doc_status_storage(doc_status.clone()),
+            keyword.clone(),
         );
 
-        let mut engine = QueryEngine::new(
+        let structure = factory::build_structure_strategy(
             self.llm.clone(),
+            self.tool_calling_llm.clone(),
+            kv.clone(),
+            vector.clone(),
+            doc_status.clone(),
+        );
+
+        let engine = factory::build_query_engine(
+            self.llm.clone(),
+            &resolved_config,
             vector.clone(),
             graph.clone(),
             kv.clone(),
-        )
-        .with_language(resolved_config.language.clone())
-        .with_rrf_k(resolved_config.hybrid_rrf_k);
-        if let Some(keyword) = &keyword {
-            engine = engine.with_keyword_search(keyword.clone());
-        }
-        engine = engine.with_structure_strategy(structure.clone());
-        let engine = Arc::new(engine);
+            keyword.clone(),
+            None, // rerank: per-workspace reranker is BC-10, intentionally not wired.
+            Some(structure.clone()),
+        );
 
         tracing::info!("Created workspace context: {workspace}");
         Ok((
@@ -315,7 +318,7 @@ impl WorkspaceResolverImpl {
 
     /// Shutdown hook: finalize every cached context
     /// `extraLucene.forEach { runCatching { it.close } }`).
-    pub(crate) async fn finalize_all(&self) {
+    pub async fn finalize_all(&self) {
         let mut cache = self.cache.lock().await;
         for (workspace, context, keyword) in cache.drain(..) {
             self.finalize_entry(&workspace, &context, keyword).await;

@@ -1,0 +1,11 @@
+---
+source: crates/easyrag-pipeline/tests/extraction_golden.rs
+---
+entities=4
+  entity name="ada lovelace" type="Person" desc="A much longer description that must win the merge because it has more characters than the first round's."
+  entity name="Charles Babbage" type="Other" desc="Designed the Analytical Engine"
+  entity name="NoType" type="" desc="explicit empty type is kept"
+  entity name="Analytical Engine" type="Machine" desc="A new entity from round two."
+relationships=2
+  rel src="Ada Lovelace" tgt="Charles Babbage" kw="collaborated with" desc="Worked on the Analytical Engine"
+  rel src="Analytical Engine" tgt="Charles Babbage" kw="designed by" desc="Round two relationship."

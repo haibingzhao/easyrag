@@ -5,16 +5,12 @@
 //! backend matrix, and serves the axum
 //! router plus the webui static bundle on port 8020.
 //!
-//! Assembly code lives in sibling modules:
+//! Assembly code lives in the `easyrag_app` library modules (shared by this
+//! binary and the integration tests, so assembly drift is compiler-checked):
 //! - `config` : env loading + `ServerConfig` build
 //! - `embedding` : OpenAI-compatible embedding adapter
 //! - `storage` : backend selection matrix (`assemble_storage`)
 //! - `workspace` : R2 per-workspace context resolver
-
-mod config;
-mod embedding;
-mod storage;
-mod workspace;
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -23,19 +19,17 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 
+use easyrag_app::{config, embedding, factory, scanner, storage, workspace};
 use easyrag_core::llm::service::{LlmService, ToolCallingLlmService};
 use easyrag_core::storage::tenant_config::TenantConfigStorage;
 use easyrag_core::storage::traits::StorageBundle;
 use easyrag_core::storage::user::UserStorage;
-use easyrag_llm::openai::{OpenAiClient, OpenAiConfig};
-use easyrag_llm::rerank::{RerankClient, RerankConfig, RerankProvider};
+use easyrag_llm::openai::OpenAiClient;
+use easyrag_llm::rerank::RerankClient;
 use easyrag_pipeline::multimodal::{RagAnythingConfig, RAGAnything, TextQueryBackend};
-use easyrag_pipeline::{
-    EasyRAGConfigBuilder, EasyRAG, IngestionPipeline, ParserRegistry, QueryEngine,
-    StructureAgentStrategy, StructureQueryStrategy, TreeSearchEngine,
-};
+use easyrag_pipeline::{EasyRAGConfigBuilder, EasyRAG, TextParserRegistry};
 use easyrag_server::auth::{JwtAuthProvider, LoginRateLimiter};
-use easyrag_server::service::{DocumentLifecycleService, WorkspaceContext};
+use easyrag_server::service::{DocumentLifecycleService, WorkspaceContext, WorkspaceResolver};
 use easyrag_server::state::AppServices;
 use easyrag_server::{build_router, AppError, DEFAULT_JWT_SECRET};
 
@@ -75,18 +69,9 @@ async fn main() -> anyhow::Result<()> {
     if config.llm_api_key.is_empty() {
         tracing::warn!("LLM_BINDING_API_KEY is not set; LLM calls will fail until configured");
     }
-    let llm_api_key = if config.llm_api_key.is_empty() {
-        "sk-placeholder".to_string()
-    } else {
-        config.llm_api_key.clone()
-    };
-    let mut llm_config = OpenAiConfig::new(llm_api_key);
-    llm_config.base_url = config.llm_base_url.clone();
-    llm_config.model = config.llm_model.clone();
-    // Slow reasoning models (e.g. qwen3.8-max) can exceed the 120s default.
-    llm_config.timeout = Duration::from_secs(config.llm_timeout_secs);
-    // LLM_ENABLE_THINKING=false is what keeps reasoning models fast enough.
-    llm_config.enable_thinking = config.llm_enable_thinking;
+    // Field-by-field assembly lives in `app::llm` so this path and the embedding
+    // path read the same mapping (Phase 4.4).
+    let llm_config = easyrag_app::llm::chat_config(&config);
     // One client, two trait views: plain completion + tool calling.
     let openai_client = Arc::new(OpenAiClient::new(llm_config)?);
     let llm: Arc<dyn LlmService> = openai_client.clone();
@@ -98,18 +83,11 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Optional reranker ----------------------------------------------
     let rerank: Option<Arc<dyn easyrag_core::llm::service::RerankService>> =
-        if config.rerank_enabled {
-            let provider = match config.rerank_provider.to_lowercase().as_str() {
-                "cohere" => RerankProvider::Cohere,
-                "custom" => RerankProvider::Custom,
-                _ => RerankProvider::Jina,
-            };
-            let mut rerank_config = RerankConfig::new(provider);
-            rerank_config.api_key = config.rerank_api_key.clone();
-            rerank_config.model = config.rerank_model.clone();
-            Some(Arc::new(RerankClient::new(rerank_config)?))
-        } else {
-            None
+        match easyrag_app::llm::rerank_config(&config) {
+            // `RerankClient::new` still rejects a `Custom` provider with no
+            // base URL, so a bad configuration fails startup as before.
+            Some(rerank_config) => Some(Arc::new(RerankClient::new(rerank_config)?)),
+            None => None,
         };
 
     // --- EasyRAG facade --------------------------------------------------
@@ -138,75 +116,41 @@ async fn main() -> anyhow::Result<()> {
     ));
     easy_rag.initialize().await.context("EasyRAG initialize")?;
 
-    // --- Structure strategy -------
-    let agent_strategy = Some(Arc::new(
-        StructureAgentStrategy::new(
-            tool_calling_llm.clone(),
-            storage.kv.clone(),
-            storage.vector.clone(),
-        )
-        .with_doc_status_storage(storage.doc_status.clone()),
-    ));
-    let structure_strategy = Some(Arc::new(
-        StructureQueryStrategy::new(
-            TreeSearchEngine::new(llm.clone()),
-            agent_strategy,
-            storage.kv.clone(),
-            storage.vector.clone(),
-            llm.clone(),
-        )
-        .with_doc_status_storage(storage.doc_status.clone()),
-    ));
-
-    // --- Query engine -----------------------------------------------------
-    let mut query_engine = QueryEngine::new(
+    // --- Structure strategy + query engine (Phase 6.5 factory) -------------
+    // Both are assembled through `app::factory` so this default path and the
+    // per-workspace path in `WorkspaceResolverImpl::build_context` share one
+    // wiring matrix. The reranker is threaded here (default path only); the
+    // per-workspace path passes `None` — that asymmetry is BC-10, tracked
+    // separately, and is now an explicit argument instead of a silent omission.
+    let structure_strategy = Some(factory::build_structure_strategy(
         llm.clone(),
+        Some(tool_calling_llm.clone()),
+        storage.kv.clone(),
+        storage.vector.clone(),
+        storage.doc_status.clone(),
+    ));
+    let query_engine = factory::build_query_engine(
+        llm.clone(),
+        &config,
         storage.vector.clone(),
         storage.graph.clone(),
         storage.kv.clone(),
-    )
-    .with_language(config.language.clone())
-    .with_rrf_k(config.hybrid_rrf_k);
-    if let Some(keyword) = &storage.keyword {
-        query_engine = query_engine.with_keyword_search(keyword.clone());
-    }
-    if let Some(rerank) = &rerank {
-        query_engine = query_engine.with_rerank(rerank.clone());
-    }
-    if let Some(strategy) = &structure_strategy {
-        query_engine = query_engine.with_structure_strategy(strategy.clone());
-    }
-    let query_engine = Arc::new(query_engine);
-
-    // --- Ingestion pipeline ------------------------------------------------
-    let mut extractor_config =
-        easyrag_pipeline::extraction::EntityExtractorConfig::default();
-    extractor_config.apply_ingest_settings(
-        config.language.clone(),
-        config.entity_extract_max_gleaning,
-        &config.entity_types_guidance,
+        storage.keyword.clone(),
+        rerank.clone(),
+        structure_strategy.clone(),
     );
-    let mut pipeline = IngestionPipeline::new(
+
+    // --- Ingestion pipeline (Phase 6.5 factory) ---------------------------
+    let pipeline = factory::build_pipeline(
         llm.clone(),
+        &config,
         storage.kv.clone(),
         storage.vector.clone(),
         storage.graph.clone(),
         storage.doc_status.clone(),
         embedding_func.clone(),
-    )
-    .with_extractor(easyrag_pipeline::extraction::EntityExtractor::new(
-        llm.clone(),
-        storage.graph.clone(),
-        storage.vector.clone(),
-        storage.kv.clone(),
-        extractor_config,
-    ))
-    .with_language(config.language.clone())
-    .with_max_concurrency(config.llm_max_async);
-    if let Some(keyword) = &storage.keyword {
-        pipeline = pipeline.with_keyword_search(keyword.clone());
-    }
-    let pipeline = Arc::new(pipeline);
+        storage.keyword.clone(),
+    );
 
     // --- Document lifecycle service + R2 workspace resolver ---------------
     let lifecycle_service = Arc::new(DocumentLifecycleService::new(
@@ -237,18 +181,25 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(easyrag_storage::memory::InMemoryTenantConfigStorage::new())
     };
 
-    let workspace_resolver = Arc::new(workspace::WorkspaceResolverImpl {
-        default_workspace: config.workspace.clone(),
-        default_biz_id: config.biz_id.clone(),
+    let workspace_resolver = Arc::new(workspace::WorkspaceResolverImpl::new(
+        config.workspace.clone(),
+        config.biz_id.clone(),
         default_context,
-        llm: llm.clone(),
-        tool_calling_llm: Some(tool_calling_llm.clone()),
-        config: config.clone(),
-        tenant_config_storage: tenant_config_storage.clone(),
-        pg_db: storage.pg_db.clone(),
-        neo4j_db: storage.neo4j_db.clone(),
-        cache: tokio::sync::Mutex::new(Vec::new()),
-    });
+        llm.clone(),
+        Some(tool_calling_llm.clone()),
+        config.clone(),
+        tenant_config_storage.clone(),
+        storage.pg_db.clone(),
+        storage.neo4j_db.clone(),
+    ));
+
+    // Auto-scan stats are built here because `AppServices` below consumes the
+    // handle. The scanner task itself is spawned only AFTER the HTTP listener
+    // binds (see the spawn site after `serve_task`), so a fallible startup
+    // step — tenant/user storage init, the admin seed, or the port bind — can
+    // never leave an immediate first scan cycle racing a failed boot or
+    // writing to storage that is about to be finalized on the way out.
+    let scan_stats = Arc::new(easyrag_server::AutoScanStats::new());
 
     // --- Multimodal (RAGAnything) -------------------------------------------
     let rag_anything_config = RagAnythingConfig {
@@ -313,7 +264,7 @@ async fn main() -> anyhow::Result<()> {
         graph_storage: storage.graph.clone(),
         kv_storage: storage.kv.clone(),
         doc_status_storage: storage.doc_status.clone(),
-        parser_registry: Arc::new(ParserRegistry::default()),
+        parser_registry: Arc::new(TextParserRegistry::default()),
         lifecycle_service,
         workspace_resolver: workspace_resolver.clone(),
         rag_anything: Some(rag_anything),
@@ -324,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
         )),
         auth_service,
         tenant_config_storage,
+        auto_scan_stats: Arc::clone(&scan_stats),
     });
 
     let mut app = build_router(services);
@@ -363,8 +315,53 @@ async fn main() -> anyhow::Result<()> {
         .await
     });
 
+    // --- Background auto scanner (A-9 wiring, BC-11) ------------------------
+    // Default-disabled gradual rollout: when AUTO_SCAN_ENABLED=false (the
+    // default) nothing is spawned and the binary behaves exactly as before.
+    // When enabled, tasks are derived from config (`build_scan_tasks`) and run
+    // on a 1s ticker with MissedTickBehavior::Delay; dir-scan reuses the shared
+    // content_hash dedup (`scan_directory`) and both task kinds coordinate with
+    // foreground work through the pipeline's re-entrancy guard + busy check.
+    // Spawned only now — after every fallible startup step (tenant/user init,
+    // admin seed, port bind) has succeeded — so the first immediate cycle can
+    // never race a bind failure. The `JoinHandle` is kept so shutdown waits
+    // for an in-flight cycle before finalizing storage.
+    let scanner_task = if config.auto_scan_enabled {
+        let scan_tasks = scanner::build_scan_tasks(&config);
+        let task_count = scan_tasks.len();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let auto_scanner = scanner::AutoScanner::new(
+            scan_tasks,
+            workspace_resolver.clone() as Arc<dyn WorkspaceResolver>,
+            storage.kv.clone(),
+            Arc::clone(&scan_stats),
+            stop_rx,
+        );
+        let handle = tokio::spawn(auto_scanner.run());
+        tracing::info!("Auto scanner spawned with {task_count} task(s)");
+        Some((stop_tx, handle))
+    } else {
+        tracing::debug!("Auto scanner disabled (AUTO_SCAN_ENABLED not set/false)");
+        None
+    };
+
     shutdown_signal().await;
     tracing::info!("Shutdown signal received; draining connections...");
+    // Stop the background scanner and WAIT for the in-flight cycle to finish
+    // before draining HTTP and finalizing storage. `run()` only observes
+    // `stop_rx` at the top of its loop, so a cycle already executing would
+    // otherwise keep writing to the tantivy writer / pg pool after
+    // `finalize_all()` and `pg_db.close()` below.
+    if let Some((stop_tx, handle)) = scanner_task {
+        let _ = stop_tx.send(());
+        tracing::info!("Auto scanner stop signal sent");
+        match tokio::time::timeout(Duration::from_secs(5), handle).await {
+            Ok(_) => tracing::info!("Auto scanner stopped"),
+            Err(_) => tracing::warn!(
+                "Auto scanner did not stop within 5s; proceeding with shutdown"
+            ),
+        }
+    }
     let _ = shutdown_tx.send(());
     match tokio::time::timeout(Duration::from_secs(10), serve_task).await {
         Ok(Ok(Ok(()))) => {}

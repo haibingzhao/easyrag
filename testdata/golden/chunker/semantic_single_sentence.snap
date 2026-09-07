@@ -1,0 +1,5 @@
+---
+source: crates/easyrag-pipeline/tests/chunker_golden.rs
+---
+chunks=1
+order=0 tokens=5 doc_id="doc-1" content="Just one sentence here."

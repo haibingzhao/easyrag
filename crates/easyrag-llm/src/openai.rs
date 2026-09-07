@@ -2,17 +2,25 @@
 //! Supports OpenAI, Azure OpenAI, Aliyun Bailian, and any
 //! OpenAI-compatible API.
 
-use easyrag_core::concurrency::resilience::{BreakerError, CircuitBreaker};
+use easyrag_core::concurrency::resilience::CircuitBreaker;
 use easyrag_core::llm::service::{
     ChatMessage, EmbeddingService, LlmRequest, LlmService, LlmToolResponse, MessageRole,
     ResponseFormat, ToolCall, ToolCallingLlmService, ToolDefinition,
 };
+use easyrag_core::util::text::truncate_with_ellipsis;
 use futures::stream::BoxStream;
-use futures::StreamExt;
 use serde_json::{json, Value as JsonValue};
 use std::time::Duration;
 
+use crate::transport::{
+    build_chat_messages, execute_with_retry, f32_array, role_str, stream_chat, ChatWireFormat,
+    HttpEndpointConfig, LlmTransport, PostFlavour, RetryPolicy, StreamAuth,
+};
 use crate::{parse_arguments_json, parse_tool_result_message, serialize_tools};
+
+/// Embeddings endpoint (the chat endpoint is [`ChatWireFormat::CHAT_PATH`]).
+/// OpenAI-compatible servers expose both under the same base URL.
+const EMBEDDINGS_PATH: &str = "/embeddings";
 
 /// Configuration for [`OpenAiClient`].
 #[derive(Clone, Debug)]
@@ -31,8 +39,9 @@ pub struct OpenAiConfig {
     /// None = send nothing (provider default); Some(false) disables the
     /// reasoning phase so long prompts don't blow past the request timeout.
     pub enable_thinking: Option<bool>,
-    /// Base for the quadratic retry delay `base * attempt^2` ms
-    ///
+    /// Base for the retry backoff, in milliseconds. The curve is exponential
+    /// with equal jitter — see [`crate::transport::RetryPolicy`], and `[BC-3]`
+    /// for the change away from the original quadratic `base * attempt^2`.
     pub retry_delay_base_ms: u64,
 }
 
@@ -50,13 +59,20 @@ impl OpenAiConfig {
             retry_delay_base_ms: 1000,
         }
     }
+
+    /// The transport-relevant slice of this config (Phase 4.4). Feeding this to
+    /// [`HttpEndpointConfig::build_transport`] is what replaced the hand-written
+    /// `reqwest::Client::builder()` block that all three clients duplicated.
+    pub fn endpoint(&self) -> HttpEndpointConfig {
+        HttpEndpointConfig::new(self.base_url.clone(), self.timeout, self.connect_timeout)
+    }
 }
 
 /// OpenAI-compatible client implementing both chat completion
 /// (incl. streaming and vision) and embeddings.
 pub struct OpenAiClient {
     config: OpenAiConfig,
-    http: reqwest::Client,
+    transport: LlmTransport,
     /// Circuit breaker for LLM completion calls — opens after 5
     /// consecutive transient failures.
     llm_breaker: CircuitBreaker,
@@ -66,38 +82,20 @@ pub struct OpenAiClient {
 
 impl OpenAiClient {
     pub fn new(config: OpenAiConfig) -> easyrag_core::Result<Self> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(config.connect_timeout)
-            .timeout(config.timeout)
-            .build()
-            .map_err(|e| easyrag_core::CoreError::Internal(format!("http client: {e}")))?;
+        let transport = config.endpoint().build_transport()?;
         Ok(Self {
             llm_breaker: CircuitBreaker::new(5, Duration::from_secs(60), "llm-openai"),
             embedding_breaker: CircuitBreaker::new(5, Duration::from_secs(60), "embedding-openai"),
             config,
-            http,
+            transport,
         })
     }
 
     // ===== request body builders (1:1 port) =====
-
-    /// Build the message list (system prompt + history + final user message).
-    fn build_messages(request: &LlmRequest, user_message: JsonValue) -> Vec<JsonValue> {
-        let mut messages = Vec::new();
-        if let Some(sp) = &request.system_prompt {
-            messages.push(json!({ "role": "system", "content": sp }));
-        }
-        for msg in &request.history {
-            let role = match msg.role {
-                MessageRole::System => "system",
-                MessageRole::User => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            messages.push(json!({ "role": role, "content": msg.content }));
-        }
-        messages.push(user_message);
-        messages
-    }
+    //
+    // The system+history prefix comes from the shared `build_chat_messages`;
+    // only the final user message differs per caller (plain string for chat,
+    // content array for vision).
 
     /// Apply shared completion parameters (temperature, max tokens,
     /// response format)..
@@ -131,7 +129,7 @@ impl OpenAiClient {
         body.insert("model".to_string(), json!(self.config.model));
         body.insert(
             "messages".to_string(),
-            JsonValue::Array(Self::build_messages(request, user_message)),
+            JsonValue::Array(build_chat_messages(request, user_message)),
         );
         body.insert("stream".to_string(), json!(stream));
         Self::apply_common_params(&mut body, request, &self.config);
@@ -159,7 +157,7 @@ impl OpenAiClient {
         body.insert("model".to_string(), json!(self.config.model));
         body.insert(
             "messages".to_string(),
-            JsonValue::Array(Self::build_messages(request, user_message)),
+            JsonValue::Array(build_chat_messages(request, user_message)),
         );
         body.insert("stream".to_string(), json!(false));
         Self::apply_common_params(&mut body, request, &self.config);
@@ -168,82 +166,68 @@ impl OpenAiClient {
 
     // ===== transport helpers =====
 
-    /// POST a JSON body; non-2xx responses become `ApiStatus` errors whose
-    /// message embeds the status code (so the keyword-based retry matcher
-    /// can see "502"/"503" etc.).
+    /// POST a JSON body through the shared transport (bearer auth, status
+    /// checked). Non-2xx responses become `ApiStatus` errors whose message
+    /// embeds the status code, so the keyword-based retry matcher below can
+    /// still see "502"/"503".
     async fn post_json(&self, path: &str, body: &JsonValue) -> easyrag_core::Result<String> {
-        let url = format!("{}{}", self.config.base_url, path);
-        let response = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.config.api_key)
-            .json(body)
-            .send()
+        self.transport
+            .post_bearer(path, &self.config.api_key, body, "OpenAI")
             .await
-            .map_err(map_reqwest_error)?;
-        let status = response.status();
-        let text = response.text().await.map_err(map_reqwest_error)?;
-        if !status.is_success() {
-            return Err(easyrag_core::CoreError::api_status(
-                status.as_u16(),
-                format!(
-                    "OpenAI API returned status {}: {}",
-                    status.as_u16(),
-                    truncate(&text, 500)
-                ),
-                None,
-            ));
-        }
-        Ok(text)
     }
 
-    /// Execute a request with retry-on-transient-failure semantics
-    ///: delay `retry_delay_base_ms * attempt^2`.
-    async fn execute_with_retry<T, F, Fut>(
+    /// Retry budget for every OpenAI call, read from the two config fields
+    /// `openai.rs` has always used. The curve itself is [`RetryPolicy`]:
+    /// exponential (`base * 2^(attempt-1)`, capped at 60s) with equal jitter,
+    /// which is what `[BC-3]` changed it to from the original quadratic
+    /// `base * attempt^2`.
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy {
+            max_retries: self.config.max_retries,
+            delay_base_ms: self.config.retry_delay_base_ms,
+        }
+    }
+
+    /// Auth flavour handed to the shared transport's resilient path.
+    fn post_flavour(&self) -> PostFlavour {
+        PostFlavour::Bearer {
+            api_key: self.config.api_key.clone(),
+            provider: "OpenAI",
+        }
+    }
+
+    /// Circuit breaker + retry in one call (Phase 4.3).
+    ///
+    /// The nesting used to be spelled out three times here (`complete`,
+    /// `complete_with_tools`, `embed`); it now lives once in
+    /// [`LlmTransport::execute_resilient`] and this is a thin delegation, so a
+    /// second provider can adopt the same resilience without re-deriving it.
+    ///
+    /// `parse` is a bare `fn` pointer rather than a closure: it captures
+    /// nothing, so this stays monomorphized with no allocation per attempt.
+    ///
+    /// Vision (`complete_with_image`) deliberately does NOT route through here —
+    /// it was retried but never wrapped by the breaker, and that asymmetry is
+    /// preserved.
+    async fn execute_resilient<T>(
         &self,
+        breaker: &CircuitBreaker,
         request_name: &str,
-        mut block: F,
-    ) -> easyrag_core::Result<T>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = easyrag_core::Result<T>>,
-    {
-        let max = self.config.max_retries.max(1) as u64;
-        let mut last_error: Option<easyrag_core::CoreError> = None;
-        for attempt in 1..=max {
-            match block().await {
-                Ok(value) => return Ok(value),
-                Err(e) => {
-                    last_error = Some(e);
-                    let err = last_error.as_ref().unwrap();
-                    if is_retryable_message(&err.to_string()) && attempt < max {
-                        let delay = self.config.retry_delay_base_ms * attempt * attempt;
-                        tracing::warn!(
-                            "{request_name} request failed (attempt {attempt}/{max}), \
-                             retrying in {delay}ms: {err}"
-                        );
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-        Err(last_error.unwrap_or_else(|| {
-            easyrag_core::CoreError::Internal(format!("{request_name} request failed"))
-        }))
-    }
-
-    /// Parse `choices[0].message.content` from a chat completion response.
-    fn parse_completion(response: &str) -> String {
-        serde_json::from_str::<JsonValue>(response)
-            .ok()
-            .and_then(|json| {
-                json.pointer("/choices/0/message/content")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_default()
+        path: &str,
+        body: JsonValue,
+        parse: fn(&str) -> easyrag_core::Result<T>,
+    ) -> easyrag_core::Result<T> {
+        self.transport
+            .execute_resilient(
+                &self.post_flavour(),
+                breaker,
+                &self.retry_policy(),
+                request_name,
+                path,
+                body,
+                parse,
+            )
+            .await
     }
 
     // ===== tool-calling support =====
@@ -292,12 +276,7 @@ impl OpenAiClient {
                     // through and send it as a plain user message.
                 }
             }
-            let role = match msg.role {
-                MessageRole::System => "system",
-                MessageRole::User => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            out.push(json!({ "role": role, "content": msg.content }));
+            out.push(json!({ "role": role_str(msg.role), "content": msg.content }));
         }
         out
     }
@@ -361,37 +340,6 @@ impl OpenAiClient {
     }
 }
 
-///: message contains rate limit / timeout /
-/// connection / 503 / 502.
-fn is_retryable_message(message: &str) -> bool {
-    let msg = message.to_lowercase();
-    msg.contains("rate limit")
-        || msg.contains("timeout")
-        || msg.contains("connection")
-        || msg.contains("503")
-        || msg.contains("502")
-}
-
-fn map_reqwest_error(e: reqwest::Error) -> easyrag_core::CoreError {
-    if e.is_timeout() {
-        easyrag_core::CoreError::ApiTimeout
-    } else {
-        easyrag_core::CoreError::ApiConnection(e.to_string())
-    }
-}
-
-/// Char-boundary-safe truncation for error messages.
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
-}
-
 /// SSE line handling (: only lines with the exact `"data: "` prefix;
 /// `[DONE]` and empty payloads are skipped; parse failures are logged).
 fn strip_data_prefix(line: &str) -> Option<&str> {
@@ -421,13 +369,68 @@ fn parse_sse_chunk(data: &str) -> Option<String> {
     }
 }
 
-fn breaker_result<T>(
-    result: Result<T, BreakerError<easyrag_core::CoreError>>,
-) -> easyrag_core::Result<T> {
-    match result {
-        Ok(v) => Ok(v),
-        Err(BreakerError::Open(msg)) => Err(easyrag_core::CoreError::CircuitBreakerOpen(msg)),
-        Err(BreakerError::Inner(e)) => Err(e),
+/// Parse an `/embeddings` response into vectors.
+///
+/// Unlike Ollama's `/api/embed`, this treats a missing `data` array, an empty
+/// one, or an item with no `embedding` array as a hard error rather than
+/// silently yielding nothing: an ingestion run that stores empty vectors
+/// corrupts the index without ever reporting a failure, so failing loudly is
+/// the point. The two providers' differing tolerance is therefore kept (Phase
+/// 4.2 shares only the transport and the `f32` conversion, not the policy).
+///
+/// A free function so it can be handed to `execute_resilient` as a `fn` pointer.
+fn parse_embedding_response(response: &str) -> easyrag_core::Result<Vec<Vec<f32>>> {
+    let json: JsonValue = serde_json::from_str(response)?;
+    let data = json.get("data").and_then(|d| d.as_array());
+    match data {
+        Some(items) if !items.is_empty() => items
+            .iter()
+            .map(|item| {
+                item.get("embedding")
+                    .and_then(|e| e.as_array())
+                    .map(|arr| f32_array(arr))
+                    .ok_or_else(|| {
+                        easyrag_core::CoreError::Internal(
+                            "embedding item missing 'embedding' array".to_string(),
+                        )
+                    })
+            })
+            .collect(),
+        _ => Err(easyrag_core::CoreError::Internal(format!(
+            "Embedding API returned empty data: {}",
+            truncate_with_ellipsis(response, 200)
+        ))),
+    }
+}
+
+/// The OpenAI-compatible half of the shared transport (Phase 4.1).
+///
+/// Only framing and pointers live here; the request body, tool-call pairing and
+/// vision shape stay on `OpenAiClient` because they are genuinely
+/// provider-specific.
+impl ChatWireFormat for OpenAiClient {
+    const CHAT_PATH: &'static str = "/chat/completions";
+    const CONTENT_POINTER: &'static str = "/choices/0/message/content";
+    const STREAM_FAILURE_LOG: &'static str = "SSE connection failed";
+
+    fn transport(&self) -> &LlmTransport {
+        &self.transport
+    }
+
+    fn stream_auth(&self) -> StreamAuth {
+        StreamAuth::Bearer(self.config.api_key.clone())
+    }
+
+    fn build_chat_body(&self, request: &LlmRequest, stream: bool) -> JsonValue {
+        self.build_request_body(request, stream)
+    }
+
+    /// SSE framing. `is_tail` is ignored: the unterminated remainder goes
+    /// through exactly the same handling as a newline-terminated line, which is
+    /// what this client did before Phase 4.1.
+    fn parse_stream_line(line: &str, _is_tail: bool) -> Option<String> {
+        let line = line.trim_end_matches(['\r', '\n']);
+        strip_data_prefix(line).and_then(parse_sse_chunk)
     }
 }
 
@@ -435,67 +438,21 @@ fn breaker_result<T>(
 impl LlmService for OpenAiClient {
     async fn complete(&self, request: &LlmRequest) -> easyrag_core::Result<String> {
         let body = self.build_request_body(request, false);
-        let result = self
-            .llm_breaker
-            .execute(|| {
-                let body = body.clone();
-                async move {
-                    self.execute_with_retry("OpenAI", || {
-                        let body = body.clone();
-                        async move {
-                            let response = self.post_json("/chat/completions", &body).await?;
-                            Ok(Self::parse_completion(&response))
-                        }
-                    })
-                    .await
-                }
-            })
-            .await;
-        breaker_result(result)
+        self.execute_resilient(
+            &self.llm_breaker,
+            "OpenAI",
+            Self::CHAT_PATH,
+            body,
+            |response| Ok(Self::parse_completion(response)),
+        )
+        .await
     }
 
     fn complete_stream(&self, request: LlmRequest) -> BoxStream<'static, String> {
-        let http = self.http.clone();
-        let url = format!("{}/chat/completions", self.config.base_url);
-        let api_key = self.config.api_key.clone();
-        let body = self.build_request_body(&request, true);
-        Box::pin(async_stream::stream! {
-            let response = match http
-                .post(&url)
-                .bearer_auth(&api_key)
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("SSE connection failed: {e}");
-                    return;
-                }
-            };
-            let mut chunks = response.bytes_stream();
-            let mut buffer = String::new();
-            while let Some(chunk) = chunks.next().await {
-                let Ok(bytes) = chunk else { break };
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                while let Some(pos) = buffer.find('\n') {
-                    let line: String = buffer.drain(..=pos).collect();
-                    let line = line.trim_end_matches(['\r', '\n']);
-                    if let Some(data) = strip_data_prefix(line) {
-                        if let Some(content) = parse_sse_chunk(data) {
-                            yield content;
-                        }
-                    }
-                }
-            }
-            // Tail without trailing newline.
-            let tail = buffer.trim_end_matches(['\r', '\n']);
-            if let Some(data) = strip_data_prefix(tail) {
-                if let Some(content) = parse_sse_chunk(data) {
-                    yield content;
-                }
-            }
-        })
+        // The SSE skeleton (POST → warn-and-return on connect failure →
+        // `bytes_stream()` split on `\n` → unterminated tail) is shared with
+        // Ollama; only `parse_stream_line` above is OpenAI-specific.
+        stream_chat(self, request)
     }
 
     async fn complete_with_image(
@@ -506,10 +463,10 @@ impl LlmService for OpenAiClient {
     ) -> easyrag_core::Result<String> {
         // vision is retried but not wrapped by the circuit breaker.
         let body = self.build_vision_body(request, image_base64, image_mime_type);
-        self.execute_with_retry("Vision", || {
+        execute_with_retry(&self.retry_policy(), "Vision", || {
             let body = body.clone();
             async move {
-                let response = self.post_json("/chat/completions", &body).await?;
+                let response = self.post_json(Self::CHAT_PATH, &body).await?;
                 Ok(Self::parse_completion(&response))
             }
         })
@@ -525,23 +482,16 @@ impl ToolCallingLlmService for OpenAiClient {
         tools: Vec<ToolDefinition>,
     ) -> easyrag_core::Result<LlmToolResponse> {
         let body = self.build_tool_call_body(&messages, &tools);
-        let result = self
-            .llm_breaker
-            .execute(|| {
-                let body = body.clone();
-                async move {
-                    self.execute_with_retry("OpenAI-tools", || {
-                        let body = body.clone();
-                        async move {
-                            let response = self.post_json("/chat/completions", &body).await?;
-                            Ok(Self::parse_tool_response(&response))
-                        }
-                    })
-                    .await
-                }
-            })
-            .await;
-        breaker_result(result)
+        // Shares the completion breaker: a tool call is the same upstream
+        // dependency, and opening the breaker on one must protect the other.
+        self.execute_resilient(
+            &self.llm_breaker,
+            "OpenAI-tools",
+            Self::CHAT_PATH,
+            body,
+            |response| Ok(Self::parse_tool_response(response)),
+        )
+        .await
     }
 }
 
@@ -552,49 +502,14 @@ impl EmbeddingService for OpenAiClient {
             return Ok(Vec::new());
         }
         let body = json!({ "model": self.config.model, "input": texts });
-        let result = self
-            .embedding_breaker
-            .execute(|| {
-                let body = body.clone();
-                async move {
-                    self.execute_with_retry("Embedding", || {
-                        let body = body.clone();
-                        async move {
-                            let response = self.post_json("/embeddings", &body).await?;
-                            let json: JsonValue = serde_json::from_str(&response)?;
-                            let data = json.get("data").and_then(|d| d.as_array());
-                            match data {
-                                Some(items) if !items.is_empty() => items
-                                    .iter()
-                                    .map(|item| {
-                                        item.get("embedding")
-                                            .and_then(|e| e.as_array())
-                                            .map(|arr| {
-                                                arr.iter()
-                                                    .filter_map(|v| v.as_f64())
-                                                    .map(|f| f as f32)
-                                                    .collect::<Vec<f32>>()
-                                            })
-                                            .ok_or_else(|| {
-                                                easyrag_core::CoreError::Internal(
-                                                    "embedding item missing 'embedding' array"
-                                                        .to_string(),
-                                                )
-                                            })
-                                    })
-                                    .collect(),
-                                _ => Err(easyrag_core::CoreError::Internal(format!(
-                                    "Embedding API returned empty data: {}",
-                                    truncate(&response, 200)
-                                ))),
-                            }
-                        }
-                    })
-                    .await
-                }
-            })
-            .await;
-        breaker_result(result)
+        self.execute_resilient(
+            &self.embedding_breaker,
+            "Embedding",
+            EMBEDDINGS_PATH,
+            body,
+            parse_embedding_response,
+        )
+        .await
     }
 
     fn embedding_dimension(&self) -> usize {

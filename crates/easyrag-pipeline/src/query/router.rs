@@ -7,6 +7,7 @@
 use easyrag_core::llm::service::{LlmRequest, LlmService, ResponseFormat};
 use easyrag_core::model::verification::{QueryRoute, QueryRouteType};
 use easyrag_core::prompt::{format_prompt, QUERY_ROUTING_PROMPT};
+use easyrag_core::util::json::parse_json;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -72,10 +73,10 @@ impl QueryRouter {
 
 /// Parse the LLM JSON response into a QueryRoute.
 fn parse_route_response(response: &str) -> easyrag_core::Result<QueryRoute> {
-    // Try to extract JSON from the response (may be wrapped in markdown)
-    let json_str = extract_json(response);
-
-    let json: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_else(|_| {
+    // Shared multi-strategy parser (lenient JSON, thinking-tag/markdown fence
+    // stripping, quote repair, brace-matched extraction) — same one used by
+    // engine.rs / agent.rs / tree_search.rs.
+    let json: serde_json::Value = parse_json(response).unwrap_or_else(|| {
         tracing::warn!("Failed to parse query routing response as JSON: {response}");
         serde_json::json!({"query_type": "single_hop", "sub_queries": [], "has_false_premise": false})
     });
@@ -110,18 +111,6 @@ fn parse_route_response(response: &str) -> easyrag_core::Result<QueryRoute> {
         sub_queries,
         has_false_premise,
     })
-}
-
-/// Extract JSON from a response that may be wrapped in markdown code blocks.
-fn extract_json(response: &str) -> String {
-    let trimmed = response.trim();
-    // Handle ```json ... ``` wrapping
-    if let Some(start) = trimmed.find('{') {
-        if let Some(end) = trimmed.rfind('}') {
-            return trimmed[start..=end].to_string();
-        }
-    }
-    trimmed.to_string()
 }
 
 #[cfg(test)]
@@ -179,5 +168,16 @@ mod tests {
         let route = parse_route_response(response).unwrap();
         // Should default to single_hop
         assert_eq!(route.route_type, QueryRouteType::SingleHop);
+    }
+
+    #[test]
+    fn parse_route_tolerates_trailing_brace_prose() {
+        // BC-13 (A-11): first-`{`-to-last-`}` slicing broke whenever prose
+        // after the payload contained braces, and the route silently degraded
+        // to the single_hop fallback.
+        let response = "```json\n{\"query_type\": \"multi_hop\", \"sub_queries\": [\"What is X?\"], \"has_false_premise\": false}\n```\nRationale {because Y}.";
+        let route = parse_route_response(response).unwrap();
+        assert_eq!(route.route_type, QueryRouteType::MultiHop);
+        assert_eq!(route.sub_queries, vec!["What is X?".to_string()]);
     }
 }

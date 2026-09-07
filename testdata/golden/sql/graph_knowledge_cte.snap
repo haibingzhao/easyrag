@@ -1,0 +1,13 @@
+---
+source: crates/easyrag-storage/tests/postgres_storage.rs
+---
+WITH RECURSIVE graph_traversal AS (
+                SELECT source, target, 1 as depth FROM graph_edges_graph
+                WHERE workspace = 'test_ws' AND biz_id = 'default' AND (source = 'Alice' OR target = 'Alice')
+                UNION
+                SELECT e.source, e.target, gt.depth + 1
+                FROM graph_edges_graph e
+                JOIN graph_traversal gt ON (e.source = gt.target OR e.target = gt.source)
+                WHERE e.workspace = 'test_ws' AND e.biz_id = 'default' AND gt.depth < 2
+            )
+            SELECT DISTINCT source, target FROM graph_traversal LIMIT 50

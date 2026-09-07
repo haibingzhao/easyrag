@@ -1,28 +1,23 @@
 //! In-memory KV storage.
+//!
+//! A thin wrapper over [`MemKvTable`]: the shared table owns the record map and
+//! every `StorageNameSpace` / `KVStorage` behaviour, so this file only keeps the
+//! public constructors and the testing utilities.
 
 use async_trait::async_trait;
 use easyrag_core::llm::EmbeddingFunc;
 use easyrag_core::storage::traits::{KVStorage, StorageNameSpace};
 use easyrag_core::JsonMap;
-use parking_lot::Mutex;
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-/// Business-line tag stored inside each record.
-fn record_biz(record: &JsonMap) -> Option<&str> {
-    record.get("biz_id").and_then(|v| v.as_str())
-}
+use super::kv_table::MemKvTable;
 
 /// In-memory KV storage implementation.
 /// Uses a mutex-guarded HashMap for thread-safe operations.
 /// Data is shared across biz lines within a workspace; `biz_id` is a
 /// per-record filter rather than instance state.
 pub struct InMemoryKVStorage {
-    namespace: String,
-    workspace: String,
-    global_config: JsonMap,
-    embedding_func: Option<EmbeddingFunc>,
-    data: Mutex<HashMap<String, JsonMap>>,
+    table: MemKvTable,
 }
 
 impl InMemoryKVStorage {
@@ -37,86 +32,55 @@ impl InMemoryKVStorage {
         embedding_func: Option<EmbeddingFunc>,
     ) -> Self {
         Self {
-            namespace: namespace.into(),
-            workspace: workspace.into(),
-            global_config,
-            embedding_func,
-            data: Mutex::new(HashMap::new()),
+            table: MemKvTable::new(namespace, workspace, global_config, embedding_func),
         }
     }
 
     /// Get all keys in storage (utility for testing).
     pub fn get_all_keys(&self) -> HashSet<String> {
-        self.data.lock().keys().cloned().collect()
+        self.table.get_all_keys()
     }
 
     /// Get total count of entries.
     pub fn size(&self) -> usize {
-        self.data.lock().len()
+        self.table.size()
     }
 }
 
 #[async_trait]
 impl StorageNameSpace for InMemoryKVStorage {
     fn namespace(&self) -> &str {
-        &self.namespace
+        self.table.namespace()
     }
 
     fn workspace(&self) -> &str {
-        &self.workspace
+        self.table.workspace()
     }
 
     fn global_config(&self) -> &JsonMap {
-        &self.global_config
+        self.table.global_config()
     }
 
-    // initialize / finalize / index_done_callback: no-op for in-memory storage.
-    async fn index_done_callback(&self) -> easyrag_core::Result<()> {
-        Ok(())
-    }
+    // initialize / finalize / index_done_callback: no-op for in-memory storage
+    // (the trait default covers all three).
 
     async fn drop(&self, biz_id: &str) -> easyrag_core::Result<HashMap<String, String>> {
-        let removed = {
-            let mut data = self.data.lock();
-            let before = data.len();
-            data.retain(|_, v| record_biz(v) != Some(biz_id));
-            before - data.len()
-        };
-        let mut result = HashMap::new();
-        result.insert("status".to_string(), "success".to_string());
-        result.insert(
-            "message".to_string(),
-            format!("data dropped ({removed} records for biz {biz_id})"),
-        );
-        Ok(result)
+        StorageNameSpace::drop(&self.table, biz_id).await
     }
 }
 
 #[async_trait]
 impl KVStorage for InMemoryKVStorage {
     fn embedding_func(&self) -> Option<&EmbeddingFunc> {
-        self.embedding_func.as_ref()
+        self.table.embedding_func()
     }
 
     async fn get_by_id(&self, id: &str, biz_id: &str) -> easyrag_core::Result<Option<JsonMap>> {
-        Ok(self
-            .data
-            .lock()
-            .get(id)
-            .filter(|v| record_biz(v) == Some(biz_id))
-            .cloned())
+        self.table.get_by_id(id, biz_id).await
     }
 
     async fn get_by_ids(&self, ids: &[String], biz_id: &str) -> easyrag_core::Result<Vec<JsonMap>> {
-        let data = self.data.lock();
-        Ok(ids
-            .iter()
-            .filter_map(|id| {
-                data.get(id)
-                    .filter(|v| record_biz(v) == Some(biz_id))
-                    .cloned()
-            })
-            .collect())
+        self.table.get_by_ids(ids, biz_id).await
     }
 
     async fn filter_keys(
@@ -124,38 +88,20 @@ impl KVStorage for InMemoryKVStorage {
         keys: &HashSet<String>,
         biz_id: &str,
     ) -> easyrag_core::Result<HashSet<String>> {
-        let data = self.data.lock();
-        Ok(keys
-            .iter()
-            .filter(|k| !data.get(*k).is_some_and(|v| record_biz(v) == Some(biz_id)))
-            .cloned()
-            .collect())
+        self.table.filter_keys(keys, biz_id).await
     }
 
+    /// Plain KV semantics: the incoming record replaces the stored one.
     async fn upsert(&self, data: HashMap<String, JsonMap>, biz_id: &str) -> easyrag_core::Result<()> {
-        let mut store = self.data.lock();
-        for (k, mut v) in data {
-            v.insert("biz_id".to_string(), Value::String(biz_id.to_string()));
-            store.insert(k, v);
-        }
+        self.table.upsert_replace(data, biz_id);
         Ok(())
     }
 
     async fn delete(&self, ids: &[String], biz_id: &str) -> easyrag_core::Result<()> {
-        let mut data = self.data.lock();
-        for id in ids {
-            if data.get(id).is_some_and(|v| record_biz(v) == Some(biz_id)) {
-                data.remove(id);
-            }
-        }
-        Ok(())
+        self.table.delete(ids, biz_id).await
     }
 
     async fn is_empty(&self, biz_id: &str) -> easyrag_core::Result<bool> {
-        Ok(!self
-            .data
-            .lock()
-            .values()
-            .any(|v| record_biz(v) == Some(biz_id)))
+        self.table.is_empty(biz_id).await
     }
 }

@@ -1,0 +1,15 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+UNWIND $items AS item OPTIONAL MATCH (a:`test` {entity_id: item.src, biz_id: $biz})-[ra:DIRECTED]-(ma:`test` {biz_id: $biz}) WITH item, count(ra) AS srcDeg OPTIONAL MATCH (b:`test` {entity_id: item.tgt, biz_id: $biz})-[rb:DIRECTED]-(mb:`test` {biz_id: $biz}) RETURN item.src AS src, item.tgt AS tgt, srcDeg + count(rb) AS degree
+--- params[0] ---
+{
+  "biz": "default",
+  "items": [
+    {
+      "src": "A",
+      "tgt": "B"
+    }
+  ]
+}

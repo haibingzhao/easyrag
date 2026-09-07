@@ -20,7 +20,7 @@ use serde_json::Value as JsonValue;
 
 use super::config::RagAnythingConfig;
 use super::prompt_manager;
-use super::util::encode_image_to_base64;
+use super::util::{encode_image_to_base64, take_chars};
 
 /// Minimal text-query backend the multimodal engine delegates to
 /// (implemented by the `EasyRAG` facade).
@@ -402,9 +402,4 @@ fn value_display(value: &JsonValue) -> String {
 /// Raw lowercase MD5 hex.
 fn md5_hex(input: &str) -> String {
     compute_mdhash_id(input, "")
-}
-
-/// Take the first `n` chars.
-fn take_chars(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
 }

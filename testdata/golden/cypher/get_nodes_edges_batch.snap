@@ -1,0 +1,13 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+UNWIND $ids AS id MATCH (a:`test` {entity_id: id, biz_id: $biz})-[r:DIRECTED]-(b:`test` {biz_id: $biz}) RETURN id, a.entity_id AS src, b.entity_id AS tgt
+--- params[0] ---
+{
+  "biz": "default",
+  "ids": [
+    "a",
+    "b"
+  ]
+}

@@ -1,9 +1,28 @@
 import { useState, useEffect, useCallback } from 'react'
 import Button from '@/components/ui/Button'
 import DocumentContentViewer from '@/components/documents/DocumentContentViewer'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/AlertDialog'
 import { documentApi, type DocumentInfo, type PaginatedResponse } from '@/api/easyrag'
 import { errorMessage } from '@/lib/utils'
+import { useAsyncAction } from '@/hooks/useAsyncAction'
 import { UploadIcon, TrashIcon, RefreshCwIcon, FileTextIcon, RotateCcwIcon, RotateCwIcon, EyeIcon } from 'lucide-react'
+
+// A pending native-confirm() replacement: the dialog renders title/description
+// and runs `onConfirm` only when the user accepts.
+interface ConfirmRequest {
+  title: string
+  description: string
+  onConfirm: () => void
+}
 
 export default function DocumentManager() {
   const [documents, setDocuments] = useState<DocumentInfo[]>([])
@@ -11,13 +30,25 @@ export default function DocumentManager() {
   const [page, setPage] = useState(1)
   const [pageSize] = useState(10)
   const [isLoading, setIsLoading] = useState(false)
-  const [isUploading, setIsUploading] = useState(false)
-  const [isResetting, setIsResetting] = useState(false)
-  const [isRetrying, setIsRetrying] = useState(false)
   const [retryingDocId, setRetryingDocId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [pipelineStatus, setPipelineStatus] = useState<any>(null)
   const [viewingDoc, setViewingDoc] = useState<DocumentInfo | null>(null)
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null)
+
+  // Shared options for every one-shot action: clear the banner on start, surface
+  // a normalized message on failure. Each action keeps its own `isPending` so
+  // buttons track busy state independently.
+  const actionOptions = {
+    onStart: () => setError(null),
+    onError: (message: string) => setError(message),
+  }
+  const { run: runUpload, isPending: isUploading } = useAsyncAction(actionOptions)
+  const { run: runProcess } = useAsyncAction(actionOptions)
+  const { run: runReset, isPending: isResetting } = useAsyncAction(actionOptions)
+  const { run: runRetryFailed, isPending: isRetrying } = useAsyncAction(actionOptions)
+  const { run: runDelete } = useAsyncAction(actionOptions)
+  const { run: runRetry } = useAsyncAction(actionOptions)
 
   const fetchDocuments = useCallback(async () => {
     setIsLoading(true)
@@ -47,52 +78,50 @@ export default function DocumentManager() {
     fetchPipelineStatus()
   }, [fetchDocuments, fetchPipelineStatus])
 
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files
     if (!files || files.length === 0) return
+    const input = e.target
 
-    setIsUploading(true)
-    setError(null)
-    try {
-      for (const file of Array.from(files)) {
-        await documentApi.uploadFile(file)
+    runUpload(async () => {
+      try {
+        for (const file of Array.from(files)) {
+          await documentApi.uploadFile(file)
+        }
+        await fetchDocuments()
+      } finally {
+        input.value = ''
       }
-      await fetchDocuments()
-    } catch (err: any) {
-      setError(errorMessage(err))
-    } finally {
-      setIsUploading(false)
-      e.target.value = ''
-    }
+    })
   }
 
-  const handleProcess = async () => {
-    setIsLoading(true)
-    setError(null)
-    try {
-      await documentApi.processDocuments()
-      await fetchDocuments()
-      await fetchPipelineStatus()
-    } catch (err: any) {
-      setError(errorMessage(err))
-    } finally {
-      setIsLoading(false)
-    }
+  const handleProcess = () => {
+    // `isLoading` is shared with `fetchDocuments` (it drives both the table
+    // placeholder and the Process button), so it stays managed inline to
+    // preserve the exact loading timeline instead of using runProcess's flag.
+    runProcess(async () => {
+      setIsLoading(true)
+      try {
+        await documentApi.processDocuments()
+        await fetchDocuments()
+        await fetchPipelineStatus()
+      } finally {
+        setIsLoading(false)
+      }
+    })
   }
 
-  const handleReset = async () => {
-    if (!confirm('Reset all stuck "processing" documents back to pending?')) return
-    setIsResetting(true)
-    setError(null)
-    try {
-      await documentApi.resetProcessing()
-      await fetchDocuments()
-      await fetchPipelineStatus()
-    } catch (err: any) {
-      setError(errorMessage(err))
-    } finally {
-      setIsResetting(false)
-    }
+  const handleReset = () => {
+    setConfirmRequest({
+      title: 'Reset stuck documents',
+      description: 'Reset all stuck "processing" documents back to pending?',
+      onConfirm: () =>
+        runReset(async () => {
+          await documentApi.resetProcessing()
+          await fetchDocuments()
+          await fetchPipelineStatus()
+        }),
+    })
   }
 
   // Failed count from status counts (covers pages that show no failed rows);
@@ -101,44 +130,44 @@ export default function DocumentManager() {
     pipelineStatus?.counts?.failed ??
     documents.filter((d) => d.status === 'failed').length
 
-  const handleRetryFailed = async () => {
-    if (!confirm(`Reprocess ${failedTotal} failed document(s)? They will be reset to pending and processed again.`)) return
-    setIsRetrying(true)
-    setError(null)
-    try {
-      await documentApi.reprocessFailed()
-      await fetchDocuments()
-      await fetchPipelineStatus()
-    } catch (err: any) {
-      setError(errorMessage(err))
-    } finally {
-      setIsRetrying(false)
-    }
+  const handleRetryFailed = () => {
+    setConfirmRequest({
+      title: 'Reprocess failed documents',
+      description: `Reprocess ${failedTotal} failed document(s)? They will be reset to pending and processed again.`,
+      onConfirm: () =>
+        runRetryFailed(async () => {
+          await documentApi.reprocessFailed()
+          await fetchDocuments()
+          await fetchPipelineStatus()
+        }),
+    })
   }
 
-  const handleDelete = async (docId: string) => {
-    if (!confirm('Are you sure you want to delete this document?')) return
-    setError(null)
-    try {
-      await documentApi.deleteDocument(docId)
-      await fetchDocuments()
-    } catch (err: any) {
-      setError(errorMessage(err))
-    }
+  const handleDelete = (docId: string) => {
+    setConfirmRequest({
+      title: 'Delete document',
+      description: 'Are you sure you want to delete this document?',
+      onConfirm: () =>
+        runDelete(async () => {
+          await documentApi.deleteDocument(docId)
+          await fetchDocuments()
+        }),
+    })
   }
 
-  const handleRetry = async (doc: DocumentInfo) => {
+  const handleRetry = (doc: DocumentInfo) => {
+    // The per-row spinner is keyed by document id, so it stays managed inline;
+    // runRetry only centralizes the error banner.
     setRetryingDocId(doc.id)
-    setError(null)
-    try {
-      await documentApi.reprocessDocument(doc.id, doc.bizId)
-      await fetchDocuments()
-      await fetchPipelineStatus()
-    } catch (err: any) {
-      setError(errorMessage(err))
-    } finally {
-      setRetryingDocId(null)
-    }
+    runRetry(async () => {
+      try {
+        await documentApi.reprocessDocument(doc.id, doc.bizId)
+        await fetchDocuments()
+        await fetchPipelineStatus()
+      } finally {
+        setRetryingDocId(null)
+      }
+    })
   }
 
   const totalPages = Math.ceil(total / pageSize)
@@ -342,6 +371,27 @@ export default function DocumentManager() {
           </div>
         </div>
       )}
+
+      {/* Confirmation dialog (replaces the native confirm() calls) */}
+      <AlertDialog
+        open={!!confirmRequest}
+        onOpenChange={(o) => {
+          if (!o) setConfirmRequest(null)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{confirmRequest?.title}</AlertDialogTitle>
+            <AlertDialogDescription>{confirmRequest?.description}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={() => confirmRequest?.onConfirm()}>
+              Confirm
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Document content preview */}
       <DocumentContentViewer

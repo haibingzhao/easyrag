@@ -5,17 +5,18 @@
 use crate::chunker::{Chunker, ChunkerConfig, ChunkerRegistry};
 use crate::extraction::{EntityExtractor, EntityExtractorConfig};
 use crate::parser::DocumentProcessingOptions;
+use crate::repository::{DocStatusRepository, StructureIndexRepository};
 use crate::structure::StructureTreeBuilder;
 use crate::summarizer::DocumentSummarizer;
-use easyrag_core::constants::STRUCTURE_INDEX_KEY_PREFIX;
 use easyrag_core::llm::embedding_func::EmbeddingFunc;
 use easyrag_core::llm::service::LlmService;
 use easyrag_core::model::doc_status::DocStatus;
+use easyrag_core::model::document_structure::section_path_of;
 use easyrag_core::storage::keyword::KeywordSearchable;
 use easyrag_core::storage::traits::{
     DocStatusStorage, GraphStorage, KVStorage, VectorStorage,
 };
-use easyrag_core::util::hash::{compute_args_hash, compute_mdhash_id};
+use easyrag_core::util::hash::compute_mdhash_id;
 use easyrag_core::util::json::to_json;
 use easyrag_core::util::text::clean_text_for_extraction;
 use easyrag_core::JsonMap;
@@ -60,7 +61,7 @@ pub struct IngestionPipeline {
     kv_storage: Arc<dyn KVStorage>,
     vector_storage: Arc<dyn VectorStorage>,
     graph_storage: Arc<dyn GraphStorage>,
-    doc_status_storage: Arc<dyn DocStatusStorage>,
+    doc_status_repo: DocStatusRepository,
     embedding_func: Arc<EmbeddingFunc>,
     chunker: Arc<dyn Chunker>,
     #[allow(dead_code)]
@@ -103,7 +104,7 @@ impl IngestionPipeline {
             kv_storage,
             vector_storage,
             graph_storage,
-            doc_status_storage,
+            doc_status_repo: DocStatusRepository::new(doc_status_storage),
             embedding_func,
             chunker: ChunkerRegistry::create("default", ChunkerConfig::default())
                 .expect("default chunker"),
@@ -247,32 +248,9 @@ impl IngestionPipeline {
         self.kv_storage.upsert(kv_batch, biz_id).await?;
 
         // Update doc status.
-        let mut status_data = JsonMap::new();
-        status_data.insert(
-            "content_summary".into(),
-            JsonValue::String(content.chars().take(100).collect()),
-        );
-        status_data.insert(
-            "content_length".into(),
-            JsonValue::from(content.chars().count() as u64),
-        );
-        status_data.insert("file_path".into(), JsonValue::String(file_path.to_string()));
-        status_data.insert(
-            "status".into(),
-            JsonValue::String(DocStatus::Pending.value().to_string()),
-        );
-        status_data.insert("created_at".into(), JsonValue::String(create_time_iso));
-        status_data.insert("updated_at".into(), JsonValue::String(now_iso()));
-        status_data.insert(
-            "content_hash".into(),
-            JsonValue::String(compute_args_hash([content])),
-        );
-        if let Some(ext) = external_id {
-            status_data.insert("external_id".into(), JsonValue::String(ext.to_string()));
-        }
-        let mut status_batch = HashMap::new();
-        status_batch.insert(doc_id.clone(), status_data);
-        self.doc_status_storage.upsert(status_batch, biz_id).await?;
+        self.doc_status_repo
+            .mark_pending(&doc_id, content, file_path, &create_time_iso, external_id, biz_id)
+            .await?;
 
         Ok(doc_id)
     }
@@ -472,23 +450,11 @@ impl IngestionPipeline {
                         ..index
                     }
                 };
-                let mut structure_data = JsonMap::new();
-                structure_data.insert("doc_id".into(), JsonValue::String(doc_id.to_string()));
-                structure_data.insert(
-                    "structure".into(),
-                    JsonValue::String(to_json(&index)),
-                );
-                structure_data.insert("created_at".into(), JsonValue::String(now_iso()));
-                let mut batch = HashMap::new();
-                batch.insert(format!("{STRUCTURE_INDEX_KEY_PREFIX}{doc_id}"), structure_data);
-                self.kv_storage.upsert(batch, biz_id).await?;
+                StructureIndexRepository::new(&self.kv_storage)
+                    .save(doc_id, &to_json(&index), biz_id)
+                    .await?;
                 // M5: mark document in the registry as structure-indexed.
-                let mut status_mark = JsonMap::new();
-                status_mark.insert("has_structure".into(), JsonValue::Bool(true));
-                status_mark.insert("updated_at".into(), JsonValue::String(now_iso()));
-                let mut status_batch = HashMap::new();
-                status_batch.insert(doc_id.to_string(), status_mark);
-                self.doc_status_storage.upsert(status_batch, biz_id).await?;
+                self.doc_status_repo.mark_has_structure(doc_id, biz_id).await?;
                 tracing::info!(
                     "Document {doc_id} structure index built ({} top-level sections)",
                     index.sections.len()
@@ -514,18 +480,7 @@ impl IngestionPipeline {
                     Some(c) => c,
                     None => continue,
                 };
-                let section_path = data
-                    .get("metadata")
-                    .and_then(|m| m.get("section_path"))
-                    .and_then(|p| p.as_array())
-                    .map(|parts| {
-                        parts
-                            .iter()
-                            .filter_map(|p| p.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" > ")
-                    })
-                    .unwrap_or_default();
+                let section_path = section_path_of(data).unwrap_or_default();
                 let result = self
                     .extractor
                     .extract(chunk_content, chunk_id, &section_path)
@@ -590,7 +545,8 @@ impl IngestionPipeline {
         *self.last_run_at.lock().unwrap() = Some(now_iso());
 
         let pending_docs = self
-            .doc_status_storage
+            .doc_status_repo
+            .storage()
             .get_docs_by_status(DocStatus::Pending, biz_id)
             .await?;
         tracing::info!(
@@ -684,32 +640,16 @@ impl IngestionPipeline {
         error_msg: Option<&str>,
         biz_id: &str,
     ) {
-        let mut update = JsonMap::new();
-        update.insert(
-            "status".into(),
-            JsonValue::String(status.value().to_string()),
-        );
-        update.insert("updated_at".into(), JsonValue::String(now_iso()));
-        // Always written so a stale error from a previous FAILED run is cleared.
-        update.insert(
-            "error_msg".into(),
-            match error_msg {
-                Some(msg) => JsonValue::String(msg.to_string()),
-                None => JsonValue::Null,
-            },
-        );
-        if let Some(count) = chunks_count {
-            update.insert("chunks_count".into(), JsonValue::from(count as u64));
-        }
-        if let Some(list) = chunks_list {
-            update.insert(
-                "chunks_list".into(),
-                JsonValue::Array(list.into_iter().map(JsonValue::String).collect()),
-            );
-        }
-        let mut batch = HashMap::new();
-        batch.insert(doc_id.to_string(), update);
-        if let Err(e) = self.doc_status_storage.upsert(batch, biz_id).await {
+        // A failed status write must not abort an otherwise-successful document
+        // run, so the transition error is logged and swallowed here — the
+        // repository returns it rather than baking in the policy. `error_msg`
+        // is always written (None → null) so a stale error from a previous
+        // FAILED run is cleared.
+        if let Err(e) = self
+            .doc_status_repo
+            .mark_status(doc_id, status, chunks_count, chunks_list, error_msg, biz_id)
+            .await
+        {
             tracing::warn!("Failed to update status for document {doc_id}: {e}");
         }
     }

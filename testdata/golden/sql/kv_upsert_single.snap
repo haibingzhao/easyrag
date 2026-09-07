@@ -1,0 +1,5 @@
+---
+source: crates/easyrag-storage/tests/postgres_storage.rs
+assertion_line: 332
+---
+INSERT INTO kv_cache (id, workspace, biz_id, content, updated_at) VALUES ('k1', 'test_ws', 'default', '{"content":"v1"}'::jsonb, NOW()) ON CONFLICT (id, workspace, biz_id) DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()

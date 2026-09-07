@@ -1,0 +1,13 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+UNWIND $ids AS id OPTIONAL MATCH (n:`test` {entity_id: id, biz_id: $biz})-[r:DIRECTED]-(m:`test` {biz_id: $biz}) RETURN id, count(r) AS degree
+--- params[0] ---
+{
+  "biz": "default",
+  "ids": [
+    "a",
+    "b"
+  ]
+}

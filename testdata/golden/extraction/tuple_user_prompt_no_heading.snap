@@ -1,0 +1,19 @@
+---
+source: crates/easyrag-pipeline/tests/extraction_golden.rs
+---
+---Task---
+Extract entities and relationships from the `---Input Text---` section below.
+
+---Instructions---
+1. **Strict Adherence to Format:** Strictly adhere to all format requirements for entity and relationship lists, including output order, field delimiters, and proper noun handling, as specified in the system prompt.
+2. **Quantity Limits:** In this response, output at most 41 total rows and at most 23 entity rows. Output fewer rows if fewer high-value items are present. Only output relationship rows whose source and target entities are both included in this response.
+3. **Output Content Only:** Output *only* the extracted list of entities and relationships. Do not include any introductory or concluding remarks, explanations, or additional text before or after the list.
+4. **Completion Signal:** Output `<|COMPLETE|>` as the final line after all relevant entities and relationships have been extracted and presented. If the row limit is reached, output `<|COMPLETE|>` immediately after the last allowed row.
+5. **Output Language:** Ensure the output language is Klingon. Proper nouns (e.g., personal names, place names, organization names) must be kept in their original language and not translated.
+
+---Input Text---
+```
+Ada Lovelace collaborated with Charles Babbage on the Analytical Engine.
+```
+
+---Output---

@@ -8,6 +8,7 @@
 use easyrag_core::llm::service::{LlmRequest, LlmService, ResponseFormat};
 use easyrag_core::model::verification::{ClaimVerification, VerificationResult};
 use easyrag_core::prompt::{format_prompt, CLAIM_DECOMPOSITION_PROMPT, CLAIM_VERIFICATION_PROMPT};
+use easyrag_core::util::json::parse_json;
 use easyrag_core::JsonMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -151,11 +152,12 @@ impl ClaimVerifier {
 
 /// Parse the LLM response for claim decomposition.
 fn parse_claims_response(response: &str) -> easyrag_core::Result<Vec<String>> {
-    let json_str = extract_json_object(response);
-    let json: serde_json::Value = match serde_json::from_str(&json_str) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("Failed to parse claim decomposition response: {e}");
+    // Shared multi-strategy parser (lenient JSON, thinking-tag/markdown fence
+    // stripping, quote repair, brace-matched extraction).
+    let json: serde_json::Value = match parse_json(response) {
+        Some(v) => v,
+        None => {
+            tracing::warn!("Failed to parse claim decomposition response: {response}");
             return Ok(Vec::new());
         }
     };
@@ -176,11 +178,10 @@ fn parse_claims_response(response: &str) -> easyrag_core::Result<Vec<String>> {
 
 /// Parse the LLM response for claim verification.
 fn parse_verification_response(response: &str) -> easyrag_core::Result<Vec<ClaimVerification>> {
-    let json_str = extract_json_object(response);
-    let json: serde_json::Value = match serde_json::from_str(&json_str) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("Failed to parse verification response: {e}");
+    let json: serde_json::Value = match parse_json(response) {
+        Some(v) => v,
+        None => {
+            tracing::warn!("Failed to parse verification response: {response}");
             return Ok(Vec::new());
         }
     };
@@ -209,17 +210,6 @@ fn parse_verification_response(response: &str) -> easyrag_core::Result<Vec<Claim
         .unwrap_or_default();
 
     Ok(verdicts)
-}
-
-/// Extract JSON object from a response that may contain markdown wrapping.
-fn extract_json_object(response: &str) -> String {
-    let trimmed = response.trim();
-    if let Some(start) = trimmed.find('{') {
-        if let Some(end) = trimmed.rfind('}') {
-            return trimmed[start..=end].to_string();
-        }
-    }
-    trimmed.to_string()
 }
 
 #[cfg(test)]
@@ -263,9 +253,50 @@ mod tests {
     }
 
     #[test]
-    fn extract_json_object_from_markdown() {
-        let response = "Here is the result:\n```json\n{\"claims\": [\"a\"]}\n```";
-        let result = extract_json_object(response);
-        assert_eq!(result, "{\"claims\": [\"a\"]}");
+    fn parse_claims_from_markdown_fence() {
+        let response = "Here is the result:\n```json\n{\"claims\": [\"Paris is in France\"]}\n```";
+        let claims = parse_claims_response(response).unwrap();
+        assert_eq!(claims, vec!["Paris is in France".to_string()]);
+    }
+
+    #[test]
+    fn parse_claims_tolerates_trailing_brace_prose() {
+        // BC-13 (A-11): the removed local extractor sliced from the first `{`
+        // to the *last* `}` of the whole response, so prose containing braces
+        // after the payload yielded invalid JSON and every claim was silently
+        // dropped. The shared parser strips the fence before parsing.
+        let response =
+            "```json\n{\"claims\": [\"Paris is in France\"]}\n```\nDone {see the fence above}.";
+        let claims = parse_claims_response(response).unwrap();
+        assert_eq!(claims, vec!["Paris is in France".to_string()]);
+    }
+
+    #[test]
+    fn parse_verdicts_from_markdown_fence() {
+        let response = "```json\n{\"verdicts\": [{\"claim\": \"Paris is in France\", \"supported\": true, \"confidence\": 0.9}]}\n```";
+        let verdicts = parse_verification_response(response).unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert!(verdicts[0].supported);
+    }
+
+    #[test]
+    fn legacy_brace_slicing_is_invalid_where_shared_parser_succeeds() {
+        // Red-first proof for BC-13: replays the removed extractor's algorithm
+        // (first `{` ..= last `}`) on the fixture above. That slice is not
+        // valid JSON, so the old code silently returned no claims — exactly the
+        // A-11 defect. The shared parser recovers the payload.
+        let response =
+            "```json\n{\"claims\": [\"Paris is in France\"]}\n```\nDone {see the fence above}.";
+        let trimmed = response.trim();
+        let legacy = &trimmed[trimmed.find('{').unwrap()..=trimmed.rfind('}').unwrap()];
+        assert!(
+            serde_json::from_str::<serde_json::Value>(legacy).is_err(),
+            "legacy slice should not parse: {legacy}"
+        );
+        assert!(parse_json(response).is_some());
+        assert_eq!(
+            parse_claims_response(response).unwrap(),
+            vec!["Paris is in France".to_string()]
+        );
     }
 }

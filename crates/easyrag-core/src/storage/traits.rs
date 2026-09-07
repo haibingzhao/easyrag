@@ -27,7 +27,12 @@ pub trait StorageNameSpace: Send + Sync {
     }
 
     /// Commit the storage operations after indexing.
-    async fn index_done_callback(&self) -> crate::Result<()>;
+    /// Backends that commit eagerly (postgres, neo4j, in-memory) keep this
+    /// default no-op; only backends that buffer writes — the JSON file backend
+    /// flushes to disk here — override it.
+    async fn index_done_callback(&self) -> crate::Result<()> {
+        Ok(())
+    }
 
     /// Discard any not-yet-flushed buffered index ops.
     /// Backends that defer writes to index_done_callback override this.

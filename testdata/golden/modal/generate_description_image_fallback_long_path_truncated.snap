@@ -1,0 +1,5 @@
+---
+source: crates/easyrag-pipeline/tests/modal_processor_fallback.rs
+---
+description: /figures/pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp.png
+entity: {entity_name="image_a347baff770a96f946141054b7d2af41", entity_type="image", summary="Image content: /figures/ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"}

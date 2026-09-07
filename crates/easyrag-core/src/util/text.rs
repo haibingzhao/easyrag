@@ -105,6 +105,30 @@ pub fn split_string_by_multi_markers(content: &str, markers: &[&str]) -> Vec<Str
         .collect()
 }
 
+/// Byte-budget truncation for diagnostics, safe on UTF-8 char boundaries.
+///
+/// Walks `end` back to the nearest char boundary so a multi-byte code point is
+/// never split, then appends a single-char ellipsis. Strings that already fit
+/// are returned unchanged (no ellipsis), which matters because the result is
+/// embedded in error messages that callers match on.
+///
+/// Lifted verbatim out of `easyrag-llm/src/openai.rs` (Phase 4.4) so the LLM
+/// clients and any future caller share one definition. Note this is a *byte*
+/// budget, unlike `easyrag-server`'s `truncate_string`, which counts code
+/// points and appends `"..."`; the two answer different questions (how much of
+/// a raw HTTP body fits in a log line vs. how much of a user-facing title fits
+/// in a UI column) and are deliberately kept apart.
+pub fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 /// Truncate a list of data by token size.
 /// Returns the items that fit within `max_token_size`.
 pub fn truncate_list_by_token_size<T, F>(
@@ -443,6 +467,34 @@ mod tests {
         let data = vec!["hello".to_string()];
         let result = truncate_list_by_token_size(&data, |s| s.clone(), 0, &tokenizer);
         assert!(result.is_empty());
+    }
+
+    /// Phase 4.4: `truncate_with_ellipsis` is a *relocation* of the private
+    /// `openai.rs::truncate`, so these pin the exact behaviour the LLM error
+    /// messages already depend on (byte budget, `…` suffix, no ellipsis when
+    /// the input already fits).
+    #[test]
+    fn truncate_with_ellipsis_leaves_short_input_untouched() {
+        assert_eq!("hello", truncate_with_ellipsis("hello", 10));
+        // Exactly at the budget still fits: no ellipsis, no truncation.
+        assert_eq!("hello", truncate_with_ellipsis("hello", 5));
+        assert_eq!("", truncate_with_ellipsis("", 5));
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_cuts_and_appends_a_single_char_ellipsis() {
+        assert_eq!("hel…", truncate_with_ellipsis("hello world", 3));
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_never_splits_a_multi_byte_char() {
+        // '€' is 3 bytes; a budget landing mid-code-point must walk back.
+        let s = "a€b";
+        assert_eq!("a…", truncate_with_ellipsis(s, 2));
+        assert_eq!("a€…", truncate_with_ellipsis(s, 4));
+        assert_eq!("a€b", truncate_with_ellipsis(s, 5));
+        // A budget of zero yields just the ellipsis rather than panicking.
+        assert_eq!("…", truncate_with_ellipsis("abc", 0));
     }
 
     #[test]

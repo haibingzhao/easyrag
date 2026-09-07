@@ -20,6 +20,7 @@ use easyrag_core::JsonMap;
 
 use crate::error::AppResult;
 use crate::state::{AppServices, AppState};
+use crate::util::success_response;
 
 pub fn router() -> Router<Arc<AppServices>> {
     Router::new()
@@ -341,10 +342,10 @@ async fn create_entity(
     if let Err(e) = bundle.vector_storage.upsert(vector_data, &biz_id).await {
         tracing::warn!("Failed to write entity to VDB: {e}");
     }
-    Ok(Json(json!({
-        "status": "success",
-        "message": format!("Entity created: {}", request.name),
-    })))
+    Ok(Json(success_response(
+        &format!("Entity created: {}", request.name),
+        None,
+    )))
 }
 
 async fn edit_entity(
@@ -408,10 +409,10 @@ async fn edit_entity(
     }
 
     graph.upsert_node(&target_name, updated_data, &biz_id).await?;
-    Ok(Json(json!({
-        "status": "success",
-        "message": format!("Entity updated: {target_name}"),
-    })))
+    Ok(Json(success_response(
+        &format!("Entity updated: {target_name}"),
+        None,
+    )))
 }
 
 async fn delete_entity(
@@ -519,10 +520,10 @@ async fn merge_entities(
         graph.delete_node(entity_name, &biz_id).await?;
     }
 
-    Ok(Json(json!({
-        "status": "success",
-        "message": format!("Merged {} entities into: {target_name}", request.entities.len()),
-    })))
+    Ok(Json(success_response(
+        &format!("Merged {} entities into: {target_name}", request.entities.len()),
+        None,
+    )))
 }
 
 async fn create_relation(
@@ -582,10 +583,10 @@ async fn create_relation(
     if let Err(e) = bundle.vector_storage.upsert(vector_data, &biz_id).await {
         tracing::warn!("Failed to write relation to VDB: {e}");
     }
-    Ok(Json(json!({
-        "status": "success",
-        "message": format!("Relation created: {} <-> {}", request.source, request.target),
-    })))
+    Ok(Json(success_response(
+        &format!("Relation created: {} <-> {}", request.source, request.target),
+        None,
+    )))
 }
 
 async fn edit_relation(
@@ -615,10 +616,10 @@ async fn edit_relation(
     graph
         .upsert_edge(&request.source, &request.target, updated_data, &biz_id)
         .await?;
-    Ok(Json(json!({
-        "status": "success",
-        "message": format!("Relation updated: {} <-> {}", request.source, request.target),
-    })))
+    Ok(Json(success_response(
+        &format!("Relation updated: {} <-> {}", request.source, request.target),
+        None,
+    )))
 }
 
 async fn delete_relation(
@@ -633,8 +634,8 @@ async fn delete_relation(
     graph
         .remove_edges(&[(q.source.clone(), q.target.clone())], &biz_id)
         .await?;
-    Ok(Json(json!({
-        "status": "success",
-        "message": format!("Relation deleted: {} <-> {}", q.source, q.target),
-    })))
+    Ok(Json(success_response(
+        &format!("Relation deleted: {} <-> {}", q.source, q.target),
+        None,
+    )))
 }

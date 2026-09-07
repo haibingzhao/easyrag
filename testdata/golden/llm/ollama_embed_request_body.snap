@@ -1,0 +1,4 @@
+---
+source: crates/easyrag-llm/tests/ollama_client.rs
+---
+{"model":"test-llama","input":["a","b"]}

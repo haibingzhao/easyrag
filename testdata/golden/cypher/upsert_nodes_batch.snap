@@ -1,0 +1,23 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+UNWIND $items AS item MERGE (n:`test` {entity_id: item.id, biz_id: $biz}) SET n += item.props
+--- params[0] ---
+{
+  "biz": "default",
+  "items": [
+    {
+      "id": "a",
+      "props": {
+        "type": "X"
+      }
+    },
+    {
+      "id": "b",
+      "props": {
+        "type": "Y"
+      }
+    }
+  ]
+}

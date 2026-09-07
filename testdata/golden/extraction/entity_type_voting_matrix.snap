@@ -1,0 +1,12 @@
+---
+source: crates/easyrag-pipeline/tests/extraction_golden.rs
+---
+existing="Person" new="Person" -> voted="Person"  (equal, case-sensitively)
+existing="person" new="Person" -> voted="person"  (equal ignoring case -> keeps existing spelling)
+existing="Other" new="Person" -> voted="Person"  (generic existing -> new wins)
+existing="" new="Person" -> voted="Person"  (empty existing is generic -> new wins)
+existing="Unknown" new="Person" -> voted="Person"  (generic existing -> new wins)
+existing="entity" new="Person" -> voted="Person"  (generic existing -> new wins)
+existing="Person" new="Other" -> voted="Person"  (generic new -> existing kept)
+existing="Person" new="" -> voted="Person"  (empty new is generic -> existing kept)
+existing="Person" new="Organisation" -> voted="Person"  (both specific -> existing kept for stability)

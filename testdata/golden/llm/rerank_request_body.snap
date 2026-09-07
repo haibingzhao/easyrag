@@ -1,0 +1,4 @@
+---
+source: crates/easyrag-llm/tests/rerank_client.rs
+---
+{"model":"test-reranker","query":"q","documents":["doc-a","doc-b","doc-c"],"top_n":3}

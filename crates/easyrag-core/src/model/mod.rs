@@ -6,6 +6,7 @@ pub mod evaluation;
 pub mod query_param;
 pub mod query_result;
 pub mod scan_task;
+pub mod scope;
 pub mod types;
 pub mod verification;
 
@@ -19,6 +20,7 @@ pub use evaluation::{
 pub use query_param::{QueryParam, QueryMode};
 pub use query_result::{QueryContextResult, QueryResult, TextChunk};
 pub use scan_task::{ScanCycleStats, ScanPosition, ScanTaskKind, ScanTaskSpec};
+pub use scope::{AsTenantScope, TenantScope, TenantScopeRef};
 pub use types::{
     EntityExtractionResult, ExtractedEntity, ExtractedRelationship, KnowledgeGraph,
     KnowledgeGraphEdge, KnowledgeGraphNode,

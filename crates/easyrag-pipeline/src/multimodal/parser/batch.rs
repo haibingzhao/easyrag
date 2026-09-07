@@ -8,11 +8,12 @@ use std::time::Instant;
 use easyrag_core::JsonMap;
 use md5::{Digest, Md5};
 use serde_json::Value as JsonValue;
-use tokio::sync::{Mutex, Semaphore};
 
 use super::super::model::BatchProcessingResult;
-use super::mineru::path_to_absolute;
-use super::{file_mtime_millis, walk_top_down, MultimodalParser, ParserRegistry};
+use super::super::util::{run_batch, BatchStats};
+use super::{
+    file_mtime_millis, path_to_absolute, walk_top_down, ExternalParserRegistry, MultimodalParser,
+};
 
 const MANIFEST_FILE_NAME: &str = ".raganything_batch_manifest.json";
 
@@ -48,7 +49,7 @@ impl BatchParser {
         timeout_per_file: u64,
         skip_installation_check: bool,
     ) -> easyrag_core::Result<Self> {
-        let parser = ParserRegistry::get_parser(parser_type)?;
+        let parser = ExternalParserRegistry::get_parser(parser_type)?;
 
         if !skip_installation_check && !parser.check_installation() {
             let mut chars = parser_type.chars();
@@ -176,81 +177,57 @@ impl BatchParser {
             };
         }
 
-        // Process files with semaphore-controlled concurrency.
-        let semaphore = Arc::new(Semaphore::new(self.max_workers));
-        let successful_files: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let failed_files: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let errors: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-
-        let mut handles: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
-        for file in files_to_process.clone() {
-            let permit = semaphore.clone().acquire_owned();
-            let parser = self.parser.clone();
-            let successful = successful_files.clone();
-            let failed = failed_files.clone();
-            let errors = errors.clone();
-            let output_dir = output_dir.to_string();
-            let parse_method = parse_method.to_string();
-            let kwargs = kwargs.clone();
-
-            handles.push((path_to_absolute(&file), tokio::spawn(async move {
-                let Ok(permit) = permit.await else {
-                    return;
-                };
-                let _permit = permit;
-                let abs_path = path_to_absolute(&file);
-
-                let stem = file
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let file_output_dir = Path::new(&output_dir).join(stem);
-                if let Err(e) = std::fs::create_dir_all(&file_output_dir) {
-                    let error_msg = format!("Failed to process {abs_path}: mkdir failed: {e}");
-                    tracing::error!("{error_msg}");
-                    failed.lock().await.push(abs_path.clone());
-                    errors.lock().await.insert(abs_path, error_msg);
-                    return;
-                }
-
-                let mut parse_kwargs = kwargs;
-                parse_kwargs.insert(
-                    "output_dir".to_string(),
-                    JsonValue::from(path_to_absolute(&file_output_dir)),
-                );
-
-                match parser.parse(&file, Some(&parse_method), &parse_kwargs).await {
-                    Ok(_) => {
-                        successful.lock().await.push(abs_path.clone());
-                        tracing::info!(
-                            "Successfully processed {}",
-                            file.file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_default()
-                        );
+        // Process files with semaphore-controlled concurrency (shared run_batch).
+        let parser = Arc::clone(&self.parser);
+        let output_dir_str = output_dir.to_string();
+        let parse_method_str = parse_method.to_string();
+        let kwargs_base = kwargs.clone();
+        let stats = run_batch(
+            files_to_process.clone(),
+            self.max_workers,
+            |file: &PathBuf| path_to_absolute(file),
+            move |file: PathBuf, abs_path: String| {
+                let parser = Arc::clone(&parser);
+                let output_dir = output_dir_str.clone();
+                let parse_method = parse_method_str.clone();
+                let mut parse_kwargs = kwargs_base.clone();
+                async move {
+                    let stem = file
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let file_output_dir = Path::new(&output_dir).join(stem);
+                    if let Err(e) = std::fs::create_dir_all(&file_output_dir) {
+                        return Err(format!("Failed to process {abs_path}: mkdir failed: {e}"));
                     }
-                    Err(e) => {
-                        let error_msg = format!("Failed to process {abs_path}: {e}");
-                        tracing::error!("{error_msg}");
-                        failed.lock().await.push(abs_path.clone());
-                        errors.lock().await.insert(abs_path, error_msg);
+
+                    parse_kwargs.insert(
+                        "output_dir".to_string(),
+                        JsonValue::from(path_to_absolute(&file_output_dir)),
+                    );
+
+                    match parser.parse(&file, Some(&parse_method), &parse_kwargs).await {
+                        Ok(_) => {
+                            tracing::info!(
+                                "Successfully processed {}",
+                                file.file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default()
+                            );
+                            Ok(())
+                        }
+                        Err(e) => Err(format!("Failed to process {abs_path}: {e}")),
                     }
                 }
-            })));
-        }
+            },
+        )
+        .await;
 
-        for (abs_path, handle) in handles {
-            // A panicked/cancelled task must not vanish from the stats:
-            // count it as failed so totals stay consistent.
-            if let Err(e) = handle.await {
-                let error_msg = format!("Failed to process {abs_path}: task aborted: {e}");
-                tracing::error!("{error_msg}");
-                failed_files.lock().await.push(abs_path.clone());
-                errors.lock().await.insert(abs_path, error_msg);
-            }
-        }
-
-        let successful = successful_files.lock().await.clone();
+        let BatchStats {
+            successful,
+            failed,
+            errors,
+        } = stats;
 
         // Save incremental manifest for successful files.
         if incremental && !successful.is_empty() {
@@ -261,10 +238,10 @@ impl BatchParser {
 
         let result = BatchProcessingResult {
             successful_files: successful,
-            failed_files: failed_files.lock().await.clone(),
+            failed_files: failed,
             total_files: supported_files.len(),
             processing_time_ms: processing_time,
-            errors: errors.lock().await.clone(),
+            errors,
             output_dir: String::new(),
             dry_run: false,
             skipped_files: skipped_files.iter().map(|f| path_to_absolute(f)).collect(),

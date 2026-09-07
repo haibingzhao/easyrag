@@ -1,0 +1,4 @@
+---
+source: crates/easyrag-storage/tests/postgres_storage.rs
+---
+SELECT source, target, properties FROM graph_edges_graph WHERE workspace = 'test_ws' AND biz_id = 'default'

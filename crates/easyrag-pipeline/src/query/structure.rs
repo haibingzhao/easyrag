@@ -3,14 +3,15 @@
 
 use super::agent::StructureAgentStrategy;
 use super::tree_search::{ReasoningStep, TreeSearchEngine};
-use easyrag_core::constants::STRUCTURE_INDEX_KEY_PREFIX;
+use crate::repository::StructureIndexRepository;
 use easyrag_core::llm::service::{LlmRequest, LlmService};
 use easyrag_core::model::doc_status::DocStatus;
-use easyrag_core::model::document_structure::{DocumentStructureIndex, SectionNode};
+use easyrag_core::model::document_structure::{
+    section_path_of, DocumentStructureIndex, SectionNode,
+};
 use easyrag_core::model::query_param::QueryParam;
 use easyrag_core::prompt::{format_prompt, STRUCTURE_QUERY_RESPONSE};
 use easyrag_core::storage::traits::{DocStatusStorage, KVStorage, VectorStorage};
-use easyrag_core::util::json::parse_json_value;
 use easyrag_core::JsonMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -282,21 +283,9 @@ impl StructureQueryStrategy {
         doc_id: &str,
         biz_id: &str,
     ) -> easyrag_core::Result<Option<DocumentStructureIndex>> {
-        let data = self
-            .kv_storage
-            .get_by_id(&format!("{STRUCTURE_INDEX_KEY_PREFIX}{doc_id}"), biz_id)
-            .await?;
-        let Some(data) = data else { return Ok(None) };
-        let Some(structure_json) = data.get("structure").and_then(|v| v.as_str()) else {
-            return Ok(None);
-        };
-        match parse_json_value::<DocumentStructureIndex>(structure_json) {
-            Some(index) => Ok(Some(index)),
-            None => {
-                tracing::warn!("Failed to deserialize structure index for {}", doc_id);
-                Ok(None)
-            }
-        }
+        StructureIndexRepository::new(&self.kv_storage)
+            .load_typed(doc_id, biz_id)
+            .await
     }
 
     /// Retrieve chunk content for selected sections by matching
@@ -368,18 +357,7 @@ impl StructureQueryStrategy {
             .iter()
             .enumerate()
             .map(|(i, chunk)| {
-                let path = chunk
-                    .get("metadata")
-                    .and_then(|m| m.get("section_path"))
-                    .and_then(|p| p.as_array())
-                    .map(|parts| {
-                        parts
-                            .iter()
-                            .filter_map(|p| p.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" > ")
-                    })
-                    .unwrap_or_else(|| format!("Section {}", i + 1));
+                let path = section_path_of(chunk).unwrap_or_else(|| format!("Section {}", i + 1));
                 let content = chunk.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 format!("--- [{}] ---\n{}", path, content)
             })

@@ -1,7 +1,7 @@
 //! Document parser tests: per-parser behavior, registry routing,
 //! hint syntax, and hand-crafted docx/pptx/xlsx zip fixtures.
 
-use easyrag_pipeline::{DocumentParser, ParserRegistry};
+use easyrag_pipeline::{DocumentParser, TextParserRegistry};
 use std::io::{Cursor, Write};
 
 fn build_zip(files: &[(&str, &str)]) -> Vec<u8> {
@@ -23,7 +23,7 @@ fn build_zip(files: &[(&str, &str)]) -> Vec<u8> {
 
 #[tokio::test]
 async fn plain_text_parser_reads_utf8() {
-    let registry = ParserRegistry::default();
+    let registry = TextParserRegistry::default();
     let parser = registry.get_parser("txt").unwrap();
     let text = parser.parse_bytes("héllo".as_bytes(), "a.txt").await.unwrap();
     assert_eq!("héllo", text);
@@ -68,7 +68,7 @@ async fn code_parser_supports_expected_extensions() {
 
 #[tokio::test]
 async fn registry_routes_by_extension_case_insensitively() {
-    let registry = ParserRegistry::default();
+    let registry = TextParserRegistry::default();
     assert!(registry.get_parser("MD").is_some());
     assert!(registry.get_parser(".json").is_some());
     assert!(registry.get_parser("docx").is_some());
@@ -81,7 +81,7 @@ async fn registry_routes_by_extension_case_insensitively() {
 
 #[tokio::test]
 async fn registry_hint_syntax_routes_to_named_engine() {
-    let registry = ParserRegistry::default();
+    let registry = TextParserRegistry::default();
     // Hinted engine wins over the extension.
     let parser = registry.get_parser_for_file_name("report.[markdown].pdf").unwrap();
     assert!(parser.supported_extensions().contains(&"md"));
@@ -189,7 +189,7 @@ async fn parse_file_reads_from_disk() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("note.md");
     std::fs::write(&path, "# Hello").unwrap();
-    let registry = ParserRegistry::default();
+    let registry = TextParserRegistry::default();
     let parser = registry.get_parser_for_file(&path).unwrap();
     let text = parser.parse_file(&path).await.unwrap();
     assert_eq!("# Hello", text);

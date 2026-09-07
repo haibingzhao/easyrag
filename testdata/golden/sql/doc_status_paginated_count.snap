@@ -1,0 +1,4 @@
+---
+source: crates/easyrag-storage/tests/postgres_storage.rs
+---
+SELECT COUNT(*) as cnt FROM doc_status_doc_status WHERE workspace = 'test_ws' AND biz_id = 'default' AND file_path LIKE '/data/%'

@@ -21,6 +21,7 @@ pub mod ingest;
 pub mod multimodal;
 pub mod parser;
 pub mod query;
+pub mod repository;
 pub mod structure;
 pub mod summarizer;
 
@@ -52,7 +53,7 @@ pub use multimodal::{
 };
 pub use parser::{
     CodeFileParser, DocxParser, DocumentParser, DocumentProcessingOptions, HtmlParser,
-    MarkdownParser, ParserRegistry, PdfParser, PlainTextParser, PptxParser, XlsxParser,
+    MarkdownParser, TextParserRegistry, PdfParser, PlainTextParser, PptxParser, XlsxParser,
 };
 pub use query::{
     AgentQueryResult, KeywordsResult, QueryDataResult, QueryEngine, QueryReference,

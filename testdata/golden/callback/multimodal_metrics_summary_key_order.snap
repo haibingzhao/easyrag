@@ -1,0 +1,5 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+keys=["documents_parsed", "documents_failed", "total_content_blocks", "total_chunks_created", "modal_items_processed", "modal_items_failed", "queries_executed", "total_parse_time_ms", "total_insert_time_ms", "total_modal_time_ms", "total_query_time_ms"]
+json={"documents_parsed":2,"documents_failed":1,"total_content_blocks":10,"total_chunks_created":12,"modal_items_processed":4,"modal_items_failed":1,"queries_executed":1,"total_parse_time_ms":300,"total_insert_time_ms":50,"total_modal_time_ms":300,"total_query_time_ms":40}

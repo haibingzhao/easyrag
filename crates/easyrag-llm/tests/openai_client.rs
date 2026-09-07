@@ -26,6 +26,37 @@ async fn last_request_body(server: &MockServer) -> Value {
     serde_json::from_slice(&last.body).unwrap()
 }
 
+/// Phase 0.6 — raw request-body bytes exactly as sent on the wire.
+///
+/// A `serde_json::Value` comparison normalises field order and formatting, so it
+/// cannot catch a transport refactor (Phase 4.1 `LlmTransport`/`ChatWireFormat`)
+/// that reorders or reshapes the serialized body. Snapshotting the raw bytes pins
+/// the full-byte contract.
+async fn last_request_body_raw(server: &MockServer) -> String {
+    let requests = server.received_requests().await.unwrap();
+    let last = requests.last().expect("at least one request");
+    String::from_utf8(last.body.clone()).expect("utf-8 request body")
+}
+
+fn llm_golden_dir() -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root above crates/easyrag-llm");
+    root.join("testdata").join("golden").join("llm")
+}
+
+fn snap_llm(name: &str, body: &str) {
+    insta::with_settings!({
+        snapshot_path => llm_golden_dir(),
+        prepend_module_to_snapshot => false,
+        omit_expression => true,
+    }, {
+        insta::assert_snapshot!(name, body);
+    });
+}
+
 fn completion_response(content: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(json!({
         "choices": [{ "message": { "content": content } }]
@@ -82,6 +113,12 @@ async fn complete_sends_golden_request_body() {
     let requests = server.received_requests().await.unwrap();
     let auth = requests[0].headers.get("authorization").unwrap();
     assert_eq!("Bearer test-key", auth.to_str().unwrap());
+
+    // Full-byte golden: the exact serialized chat body Phase 4.1 must preserve.
+    snap_llm(
+        "openai_complete_request_body",
+        &last_request_body_raw(&server).await,
+    );
 }
 
 #[tokio::test]
@@ -289,6 +326,13 @@ async fn embed_sends_golden_body_and_parses_vectors() {
         json!({ "model": "test-model", "input": ["a", "b"] }),
         last_request_body(&server).await
     );
+
+    // Full-byte golden: the exact serialized embeddings body (Phase 4.2 merges
+    // embedding into the shared transport, so its wire shape is pinned too).
+    snap_llm(
+        "openai_embed_request_body",
+        &last_request_body_raw(&server).await,
+    );
 }
 
 #[tokio::test]
@@ -432,6 +476,13 @@ async fn complete_with_tools_sends_tools_and_tool_results() {
     assert_eq!(
         json!({ "role": "tool", "tool_call_id": "call_1", "content": "{\"tree\":[]}" }),
         msgs[4]
+    );
+
+    // Full-byte golden: tools + tool-result message encoding (Phase 4.1
+    // ChatWireFormat::build_tool_messages must reproduce these exact bytes).
+    snap_llm(
+        "openai_complete_with_tools_request_body",
+        &last_request_body_raw(&server).await,
     );
 }
 

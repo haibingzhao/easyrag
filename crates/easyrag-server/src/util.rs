@@ -42,22 +42,6 @@ pub fn truncate_string(text: Option<&str>, max_length: usize) -> String {
     }
 }
 
-/// Build a paginated response wrapper.
-pub fn paginated_response(items: Value, total: u64, page: u64, page_size: u64) -> Value {
-    let total_pages = if page_size == 0 {
-        0
-    } else {
-        (total + page_size - 1) / page_size
-    };
-    json!({
-        "items": items,
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "total_pages": total_pages,
-    })
-}
-
 /// Extract bearer token from an Authorization header. Requires exactly two
 /// whitespace-separated parts with a case-insensitive `Bearer` scheme.
 pub fn extract_bearer_token(auth_header: Option<&str>) -> Option<&str> {
@@ -111,17 +95,6 @@ mod tests {
         assert_eq!(extract_bearer_token(Some("Basic abc")), None);
         assert_eq!(extract_bearer_token(Some("Bearer a b")), None);
         assert_eq!(extract_bearer_token(Some("Bearer")), None);
-    }
-
-    #[test]
-    fn paginated_response_computes_total_pages() {
-        let v = paginated_response(json!([]), 10, 1, 3);
-        assert_eq!(v["total"], 10);
-        assert_eq!(v["page"], 1);
-        assert_eq!(v["page_size"], 3);
-        assert_eq!(v["total_pages"], 4);
-        // (0 + 3 - 1) / 3 == 0
-        assert_eq!(paginated_response(json!([]), 0, 1, 3)["total_pages"], 0);
     }
 
     #[test]

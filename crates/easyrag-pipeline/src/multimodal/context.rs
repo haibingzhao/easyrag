@@ -3,6 +3,7 @@
 use easyrag_core::JsonMap;
 
 use super::model::ContentItem;
+use super::util::take_chars;
 
 /// Configuration for context extraction.
 #[derive(Debug, Clone)]
@@ -237,10 +238,6 @@ fn info_i64(info: &JsonMap, key: &str) -> Option<i64> {
 /// Char-count helpers to mirror code-point semantics.
 fn char_len(s: &str) -> usize {
     s.chars().count()
-}
-
-fn take_chars(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
 }
 
 fn truncate_at_boundary(truncated: &str) -> String {

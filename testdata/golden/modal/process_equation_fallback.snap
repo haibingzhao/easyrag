@@ -1,0 +1,10 @@
+---
+source: crates/easyrag-pipeline/tests/modal_processor_fallback.rs
+---
+entity_name: equation_281a70c20b16a38d7781189936e1ac9f
+entity_type: equation
+description: Equation content: E = mc^2
+chunk_content: E = mc^2
+success: true
+error_message: None
+metadata: [fallback=true]

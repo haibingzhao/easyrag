@@ -1,0 +1,10 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+MATCH (n:`test` {biz_id: $biz})-[r:DIRECTED]-() RETURN n.entity_id AS label, count(r) AS degree ORDER BY degree DESC LIMIT $limit
+--- params[0] ---
+{
+  "biz": "default",
+  "limit": 10
+}

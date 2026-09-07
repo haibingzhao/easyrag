@@ -1,0 +1,5 @@
+---
+source: crates/easyrag-pipeline/tests/extraction_golden.rs
+---
+entities=0
+relationships=0

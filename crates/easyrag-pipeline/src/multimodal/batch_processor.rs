@@ -2,19 +2,19 @@
 //!
 //! Uses tokio tasks + Semaphore for structured concurrency.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use easyrag_core::{CoreError, JsonMap};
 use serde_json::Value as JsonValue;
-use tokio::sync::{Mutex, Semaphore};
 
 use super::config::RagAnythingConfig;
 use super::document_processor::{absolute_path_string, DocumentProcessor};
 use super::model::BatchProcessingResult;
 use super::parser::walk_top_down;
+use super::util::run_batch;
 
 /// Batch processor for folder-level document processing.
 pub struct BatchProcessor {
@@ -69,32 +69,19 @@ impl BatchProcessor {
             .unwrap_or_else(|| self.config.parser_output_dir.clone());
         let _ = std::fs::create_dir_all(&effective_output_dir);
 
-        // Process files with semaphore-controlled concurrency
-        let semaphore = Arc::new(Semaphore::new(max_workers.max(1)));
-        let successful_files: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let failed_files: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let errors: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-
-        let mut handles: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
-        for file in &files {
-            let permit = semaphore.clone().acquire_owned();
-            let document_processor = Arc::clone(&self.document_processor);
-            let successful = successful_files.clone();
-            let failed = failed_files.clone();
-            let errors = errors.clone();
-            let effective_output_dir = effective_output_dir.clone();
-            let parse_method = parse_method.map(|s| s.to_string());
-            let file = file.clone();
-
-            handles.push((
-                absolute_path_string(&file.to_string_lossy()),
-                tokio::spawn(async move {
-                    let Ok(permit) = permit.await else {
-                        return;
-                    };
-                    let _permit = permit;
-                    let abs_path = absolute_path_string(&file.to_string_lossy());
-
+        // Process files with semaphore-controlled concurrency (shared run_batch).
+        let document_processor = Arc::clone(&self.document_processor);
+        let effective_output_dir_base = effective_output_dir.clone();
+        let parse_method_base = parse_method.map(|s| s.to_string());
+        let stats = run_batch(
+            files.clone(),
+            max_workers,
+            |file: &PathBuf| absolute_path_string(&file.to_string_lossy()),
+            move |file: PathBuf, abs_path: String| {
+                let document_processor = Arc::clone(&document_processor);
+                let effective_output_dir = effective_output_dir_base.clone();
+                let parse_method = parse_method_base.clone();
+                async move {
                     let stem = file
                         .file_stem()
                         .map(|s| s.to_string_lossy().to_string())
@@ -117,43 +104,29 @@ impl BatchProcessor {
                         .await
                     {
                         Ok(_) => {
-                            successful.lock().await.push(abs_path.clone());
                             tracing::info!(
                                 "Successfully processed: {}",
                                 file.file_name()
                                     .map(|n| n.to_string_lossy().to_string())
                                     .unwrap_or_default()
                             );
+                            Ok(())
                         }
-                        Err(e) => {
-                            let error_msg = format!("Failed to process {abs_path}: {e}");
-                            tracing::error!("{error_msg}");
-                            failed.lock().await.push(abs_path.clone());
-                            errors.lock().await.insert(abs_path, error_msg);
-                        }
+                        Err(e) => Err(format!("Failed to process {abs_path}: {e}")),
                     }
-                }),
-            ));
-        }
-
-        for (abs_path, handle) in handles {
-            // A panicked/cancelled task must not vanish from the stats.
-            if let Err(e) = handle.await {
-                let error_msg = format!("Failed to process {abs_path}: task aborted: {e}");
-                tracing::error!("{error_msg}");
-                failed_files.lock().await.push(abs_path.clone());
-                errors.lock().await.insert(abs_path, error_msg);
-            }
-        }
+                }
+            },
+        )
+        .await;
 
         let processing_time_ms = start_time.elapsed().as_millis() as u64;
 
         let result = BatchProcessingResult {
-            successful_files: successful_files.lock().await.clone(),
-            failed_files: failed_files.lock().await.clone(),
+            successful_files: stats.successful,
+            failed_files: stats.failed,
             total_files: files.len(),
             processing_time_ms,
-            errors: errors.lock().await.clone(),
+            errors: stats.errors,
             output_dir: String::new(),
             dry_run: false,
             skipped_files: Vec::new(),

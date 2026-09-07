@@ -1,0 +1,4 @@
+---
+source: crates/easyrag-pipeline/tests/chunker_golden.rs
+---
+chunks=0

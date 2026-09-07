@@ -1,0 +1,14 @@
+---
+source: crates/easyrag-core/tests/prompt_golden.rs
+---
+---Task---
+Break the following answer into atomic, independently verifiable factual claims.
+Each claim should be a single, self-contained statement that can be verified independently.
+Remove any citation markers (like [1], [2]) before decomposing.
+
+---Output Format---
+Return a JSON object with a "claims" array:
+{"claims": ["claim 1", "claim 2", "claim 3"]}
+
+---Answer---
+{answer}

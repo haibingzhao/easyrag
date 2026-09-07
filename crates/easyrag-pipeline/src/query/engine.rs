@@ -5,6 +5,7 @@ use super::{ClaimVerifier, EvidenceScorer, QueryRouter};
 use easyrag_core::llm::service::{
     ChatMessage, LlmRequest, LlmService, MessageRole, RerankService, ResponseFormat,
 };
+use easyrag_core::model::document_structure::section_path_of;
 use easyrag_core::model::query_param::{QueryParam, QueryMode};
 use easyrag_core::model::verification::QualityDecision;
 use easyrag_core::prompt::{
@@ -127,6 +128,73 @@ pub struct QueryEngine {
     enable_citation_validation: bool,
 }
 
+/// Recall strategy for a chunk retrieval.
+///
+/// The two variants are not interchangeable: `Hybrid` fuses keyword hits in via
+/// RRF, so it can return chunks `Vector` never would. Which paths use which is
+/// pre-existing and stays that way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Recall {
+    /// `vector_storage.query` alone — the reference-list, pure-data and both
+    /// streaming-prompt paths.
+    Vector,
+    /// `hybrid_chunk_query`: vector + keyword fused by RRF — the two synchronous
+    /// answer paths.
+    Hybrid,
+}
+
+/// Which `QueryParam` budget sizes a retrieval. The same field feeds both the
+/// recall `top_k` and the post-filter limit, so a path cannot over-fetch and
+/// then truncate to a different number by accident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TopKField {
+    /// `param.top_k` — only the naive paths.
+    TopK,
+    /// `param.chunk_top_k` — every other path.
+    ChunkTopK,
+}
+
+impl TopKField {
+    fn of(self, param: &QueryParam) -> usize {
+        match self {
+            TopKField::TopK => param.top_k,
+            TopKField::ChunkTopK => param.chunk_top_k,
+        }
+    }
+}
+
+/// The router's own reply to a query no corpus could answer (Feature 6). Both
+/// entry points returned this string verbatim; it lives here once.
+const NO_RETRIEVAL_RESPONSE: &str = "I'm here to help with questions about your documents. Could you please rephrase your question in the context of your knowledge base?";
+
+/// Outcome of the pre-retrieval routing gate.
+enum Routing {
+    /// Routing did not divert the query — carry on with retrieval.
+    Proceed,
+    /// The router answered outright; return this text without retrieving.
+    Answer(String),
+}
+
+/// Per-caller log wording of the routing gate. `scope` slots into
+/// `Query{scope} routed to …` and `Query routing{scope} failed: …`; the
+/// false-premise line differs wholesale between the two callers, so it is
+/// carried verbatim. Log text only, never control flow — which is what lets one
+/// implementation serve both entry points.
+struct RoutingLogs {
+    scope: &'static str,
+    false_premise: &'static str,
+}
+
+const ROUTING_LOGS_SYNC: RoutingLogs = RoutingLogs {
+    scope: "",
+    false_premise: "False premise detected in query, response may be affected",
+};
+
+const ROUTING_LOGS_STREAM: RoutingLogs = RoutingLogs {
+    scope: " (stream)",
+    false_premise: "False premise detected in stream query",
+};
+
 impl QueryEngine {
     /// Note: the global tokenizer is captured at construction time
     /// (`TokenizerProvider::get_tokenizer` snapshot); a later
@@ -239,43 +307,11 @@ impl QueryEngine {
         // (debug contract: those modes must return deterministic output).
         let use_routing = cacheable
             && param.enable_query_routing.unwrap_or(self.query_router.is_some());
-        if use_routing {
-            match &self.query_router {
-                Some(router) => {
-                    match router.route(query).await {
-                        Ok(route) => {
-                            use easyrag_core::model::verification::QueryRouteType;
-                            match route.route_type {
-                                QueryRouteType::NoRetrieval => {
-                                    tracing::debug!("Query routed to no_retrieval");
-                                    return Ok("I'm here to help with questions about your documents. Could you please rephrase your question in the context of your knowledge base?".to_string());
-                                }
-                                QueryRouteType::MultiHop => {
-                                    tracing::debug!(
-                                        "Query routed to multi_hop with {} sub-queries",
-                                        route.sub_queries.len()
-                                    );
-                                    // Execute sub-queries and merge context
-                                    // For now, fall through to normal query with expanded context
-                                }
-                                QueryRouteType::SingleHop => {
-                                    tracing::debug!("Query routed to single_hop");
-                                    // Normal flow
-                                }
-                            }
-                            if route.has_false_premise {
-                                tracing::info!("False premise detected in query, response may be affected");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Query routing failed: {e}");
-                        }
-                    }
-                }
-                None => {
-                    tracing::warn!("Query routing requested but no QueryRouter is configured");
-                }
-            }
+        if let Routing::Answer(text) = self
+            .route_query(query, use_routing, &ROUTING_LOGS_SYNC)
+            .await
+        {
+            return Ok(text);
         }
 
         let result = match param.mode {
@@ -310,36 +346,15 @@ impl QueryEngine {
         query: &str,
         param: &QueryParam,
     ) -> easyrag_core::Result<QueryWithRefsResult> {
-        let chunks = apply_metadata_filters(
-            self.vector_storage
-                .query(
-                    query,
-                    effective_top_k(param, param.chunk_top_k),
-                    None,
-                    param.time_range_start,
-                    param.time_range_end,
-                    &param.biz_id,
-                )
-                .await?,
-            param,
-            param.chunk_top_k,
-        );
+        let chunks = self
+            .retrieve_chunks(query, param, Recall::Vector, TopKField::ChunkTopK)
+            .await?;
 
         let references: Vec<QueryReference> = chunks
             .iter()
             .enumerate()
             .map(|(index, chunk)| {
-                let section_path = chunk
-                    .get("metadata")
-                    .and_then(|m| m.get("section_path"))
-                    .and_then(|p| p.as_array())
-                    .map(|parts| {
-                        parts
-                            .iter()
-                            .filter_map(|p| p.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" > ")
-                    });
+                let section_path = section_path_of(chunk);
                 QueryReference {
                     reference_id: index + 1,
                     file_path: chunk
@@ -389,20 +404,9 @@ impl QueryEngine {
         query: &str,
         param: &QueryParam,
     ) -> easyrag_core::Result<QueryDataResult> {
-        let chunks = apply_metadata_filters(
-            self.vector_storage
-                .query(
-                    query,
-                    effective_top_k(param, param.chunk_top_k),
-                    None,
-                    param.time_range_start,
-                    param.time_range_end,
-                    &param.biz_id,
-                )
-                .await?,
-            param,
-            param.chunk_top_k,
-        );
+        let chunks = self
+            .retrieve_chunks(query, param, Recall::Vector, TopKField::ChunkTopK)
+            .await?;
 
         let mut entities: Vec<JsonMap> = Vec::new();
         let mut relations: Vec<JsonMap> = Vec::new();
@@ -545,37 +549,12 @@ impl QueryEngine {
             // Bypass mode keeps its echo contract untouched.
             let use_routing = !matches!(param.mode, QueryMode::Bypass)
                 && param.enable_query_routing.unwrap_or(this.query_router.is_some());
-            if use_routing {
-                if let Some(router) = &this.query_router {
-                    match router.route(&query).await {
-                        Ok(route) => {
-                            use easyrag_core::model::verification::QueryRouteType;
-                            match route.route_type {
-                                QueryRouteType::NoRetrieval => {
-                                    yield "I'm here to help with questions about your documents. Could you please rephrase your question in the context of your knowledge base?".to_string();
-                                    return;
-                                }
-                                QueryRouteType::MultiHop => {
-                                    tracing::debug!(
-                                        "Query (stream) routed to multi_hop with {} sub-queries",
-                                        route.sub_queries.len()
-                                    );
-                                }
-                                QueryRouteType::SingleHop => {
-                                    tracing::debug!("Query (stream) routed to single_hop");
-                                }
-                            }
-                            if route.has_false_premise {
-                                tracing::info!("False premise detected in stream query");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Query routing (stream) failed: {e}");
-                        }
-                    }
-                } else {
-                    tracing::warn!("Query routing requested but no QueryRouter is configured");
-                }
+            if let Routing::Answer(text) = this
+                .route_query(&query, use_routing, &ROUTING_LOGS_STREAM)
+                .await
+            {
+                yield text;
+                return;
             }
 
             match param.mode {
@@ -632,37 +611,18 @@ impl QueryEngine {
         query: &str,
         param: &QueryParam,
     ) -> easyrag_core::Result<Option<String>> {
-        let mut chunks = apply_metadata_filters(
-            self.vector_storage
-                .query(
-                    query,
-                    effective_top_k(param, param.top_k),
-                    None,
-                    param.time_range_start,
-                    param.time_range_end,
-                    &param.biz_id,
-                )
-                .await?,
-            param,
-            param.top_k,
-        );
+        let chunks = self.naive_recall(query, param, Recall::Vector).await?;
         if chunks.is_empty() {
             return Ok(None);
         }
 
-        if param.enable_rerank && self.rerank_service.is_some() && chunks.len() > 1 {
-            chunks = self.rerank_chunks(query, chunks, param.chunk_top_k).await;
-        }
-
         let context_data = self.build_naive_context(&chunks, param);
-        let mut vars = HashMap::new();
-        vars.insert("response_type".to_string(), param.response_type.clone());
-        vars.insert(
-            "user_prompt".to_string(),
-            param.user_prompt.clone().unwrap_or_default(),
-        );
-        vars.insert("content_data".to_string(), context_data);
-        Ok(Some(format_prompt(NAIVE_RAG_RESPONSE, &vars)))
+        Ok(Some(self.render_answer_prompt(
+            &NAIVE_RAG_RESPONSE,
+            "content_data",
+            context_data,
+            param,
+        )))
     }
 
     /// Build the KG query prompt for streaming (keyword extraction +
@@ -675,9 +635,11 @@ impl QueryEngine {
     ) -> easyrag_core::Result<Option<String>> {
         let mode = param.mode.value();
 
-        // The streaming KG path always runs LLM extraction
-        // WITHOUT param — the streaming KG path always runs LLM extraction and
-        // ignores manual hl/ll keywords (unlike the synchronous kg_query).
+        // Three deliberate deviations from the synchronous `kg_query`, all
+        // long-standing: extraction runs WITHOUT `param`, so manual hl/ll
+        // keywords are ignored; `separate_relations` is false, so relationships
+        // land in `entities`; and there is no entity-related-chunk pass (4b),
+        // no evidence gate and no conversation history.
         let language = self.language.clone();
         let keywords = self.extract_keywords(query, &language, None).await?;
 
@@ -686,37 +648,22 @@ impl QueryEngine {
             .search_entities_and_relations(&search_terms, param, false)
             .await?;
 
-        let mut chunks = apply_metadata_filters(
-            self.vector_storage
-                .query(
-                    query,
-                    effective_top_k(param, param.chunk_top_k),
-                    None,
-                    param.time_range_start,
-                    param.time_range_end,
-                    &param.biz_id,
-                )
-                .await?,
-            param,
-            param.chunk_top_k,
-        );
-        if param.enable_rerank && self.rerank_service.is_some() && chunks.len() > 1 {
-            chunks = self.rerank_chunks(query, chunks, param.chunk_top_k).await;
-        }
+        let chunks = self
+            .retrieve_chunks(query, param, Recall::Vector, TopKField::ChunkTopK)
+            .await?;
+        let chunks = self.rerank_if_enabled(query, chunks, param).await;
 
         if entities.is_empty() && chunks.is_empty() {
             return Ok(None);
         }
 
         let context_data = self.build_kg_context(&entities, &relations, &chunks, param);
-        let mut vars = HashMap::new();
-        vars.insert("response_type".to_string(), param.response_type.clone());
-        vars.insert(
-            "user_prompt".to_string(),
-            param.user_prompt.clone().unwrap_or_default(),
-        );
-        vars.insert("context_data".to_string(), context_data);
-        Ok(Some(format_prompt(RAG_RESPONSE, &vars)))
+        Ok(Some(self.render_answer_prompt(
+            &RAG_RESPONSE,
+            "context_data",
+            context_data,
+            param,
+        )))
     }
 
     /// Search entities by terms and collect their connected graph edges.
@@ -886,103 +833,277 @@ impl QueryEngine {
         Ok(rrf_fusion(vec_results, kw_results, self.rrf_k, 0.7, 0.3))
     }
 
-    /// Naive query - pure vector retrieval without knowledge graph.
-    async fn naive_query(&self, query: &str, param: &QueryParam) -> easyrag_core::Result<String> {
-        // 1. Retrieve relevant chunks via hybrid search (vector + keyword).
-        let mut chunks = apply_metadata_filters(
-            self.hybrid_chunk_query(
-                query,
-                effective_top_k(param, param.top_k),
-                param.time_range_start,
-                param.time_range_end,
-                &param.biz_id,
-            )
-            .await?,
-            param,
-            param.top_k,
-        );
-
-        if chunks.is_empty() {
-            return Ok(FAIL_RESPONSE.to_string());
-        }
-
-        // 2. Apply reranking if enabled and available.
-        if param.enable_rerank && self.rerank_service.is_some() && chunks.len() > 1 {
-            chunks = self.rerank_chunks(query, chunks, param.chunk_top_k).await;
-        }
-
-        // [Guardrail] Evidence quality scoring (Feature 2) — post-retrieval
-        let use_scoring = param.enable_evidence_scoring.unwrap_or(self.evidence_scorer.is_some());
-        if use_scoring {
-            match &self.evidence_scorer {
-                Some(scorer) => {
-                    match scorer.score(query, &chunks).await {
-                        Ok(score) => {
-                            tracing::debug!("Evidence quality: {:.2} ({:?})", score.score, score.decision);
-                            match score.decision {
-                                QualityDecision::Abstain => {
-                                    return Ok(FAIL_RESPONSE.to_string());
-                                }
-                                QualityDecision::Refine => {
-                                    tracing::debug!("Evidence quality borderline, proceeding with caution");
-                                }
-                                QualityDecision::Generate => {
-                                    // Good evidence, proceed normally
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Evidence scoring failed: {e}");
-                        }
-                    }
-                }
-                None => {
-                    tracing::warn!("Evidence quality scoring requested but no EvidenceScorer is configured");
-                }
+    /// Recall + metadata filter — the first two steps of every chunk retrieval
+    /// in the engine.
+    ///
+    /// Reranking is deliberately *not* folded in: three of the four paths that
+    /// rerank do something between the filter and the rerank (an emptiness check
+    /// that must return `FAIL_RESPONSE`/`None`, or `kg_query` appending
+    /// entity-related chunks so the combined set is ranked together), and
+    /// reordering those would change results. Callers follow up with
+    /// [`Self::rerank_if_enabled`] at the point where they always did.
+    ///
+    /// The per-term entity recall inside `search_entities_and_relations` is not
+    /// a caller: it splits `top_k` across search terms and applies neither the
+    /// metadata filter nor reranking, so it is a different shape that happens to
+    /// touch the same store.
+    async fn retrieve_chunks(
+        &self,
+        query: &str,
+        param: &QueryParam,
+        recall: Recall,
+        top_k_field: TopKField,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        let top_k = top_k_field.of(param);
+        let recalled = match recall {
+            Recall::Hybrid => {
+                self.hybrid_chunk_query(
+                    query,
+                    effective_top_k(param, top_k),
+                    param.time_range_start,
+                    param.time_range_end,
+                    &param.biz_id,
+                )
+                .await?
             }
+            Recall::Vector => {
+                self.vector_storage
+                    .query(
+                        query,
+                        effective_top_k(param, top_k),
+                        None,
+                        param.time_range_start,
+                        param.time_range_end,
+                        &param.biz_id,
+                    )
+                    .await?
+            }
+        };
+        Ok(apply_metadata_filters(recalled, param, top_k))
+    }
+
+    /// Rerank when the caller asked for it, a service is configured, and there
+    /// is more than one candidate worth ordering; otherwise return `chunks`
+    /// untouched, so a caller can always assign the result back.
+    ///
+    /// `top_n` is `chunk_top_k` on every path, including the naive ones that
+    /// size their recall from `top_k` — a pre-existing asymmetry, kept as is.
+    async fn rerank_if_enabled(
+        &self,
+        query: &str,
+        chunks: Vec<JsonMap>,
+        param: &QueryParam,
+    ) -> Vec<JsonMap> {
+        if param.enable_rerank && self.rerank_service.is_some() && chunks.len() > 1 {
+            return self.rerank_chunks(query, chunks, param.chunk_top_k).await;
         }
+        chunks
+    }
 
-        // 3. Build context from chunks.
-        let context_data = self.build_naive_context(&chunks, param);
+    /// Recall + rerank for the naive path — everything `naive_query` and
+    /// `build_naive_query_prompt` share before they diverge. An empty result
+    /// means "no context", which each caller signals its own way. Emptiness is
+    /// checked after this call rather than before the rerank as it used to be,
+    /// which is the same check: `rerank_if_enabled` needs more than one
+    /// candidate, so it hands an empty list straight back.
+    async fn naive_recall(
+        &self,
+        query: &str,
+        param: &QueryParam,
+        recall: Recall,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        let chunks = self
+            .retrieve_chunks(query, param, recall, TopKField::TopK)
+            .await?;
+        Ok(self.rerank_if_enabled(query, chunks, param).await)
+    }
 
-        // 4. Generate response.
+    /// Fill the vars all four answer prompts share and render `template`. The
+    /// retrieved-context var is `content_data` in the naive template and
+    /// `context_data` in the graph one, so the key stays a parameter.
+    fn render_answer_prompt(
+        &self,
+        template: &str,
+        context_key: &str,
+        context_data: String,
+        param: &QueryParam,
+    ) -> String {
         let mut vars = HashMap::new();
         vars.insert("response_type".to_string(), param.response_type.clone());
         vars.insert(
             "user_prompt".to_string(),
             param.user_prompt.clone().unwrap_or_default(),
         );
-        vars.insert("content_data".to_string(), context_data);
-        let prompt = format_prompt(NAIVE_RAG_RESPONSE, &vars);
+        vars.insert(context_key.to_string(), context_data);
+        format_prompt(template, &vars)
+    }
+
+    /// Pre-retrieval query routing (Feature 6), shared by [`Self::query`] and
+    /// [`Self::query_stream`].
+    ///
+    /// Each caller decides *whether* to route — they gate on different things,
+    /// the synchronous one also skipping the debug hooks — and passes that in as
+    /// `enabled`. A routing failure is logged and proceeds, so a broken router
+    /// cannot cost the user their answer.
+    async fn route_query(&self, query: &str, enabled: bool, logs: &RoutingLogs) -> Routing {
+        if !enabled {
+            return Routing::Proceed;
+        }
+        let Some(router) = &self.query_router else {
+            tracing::warn!("Query routing requested but no QueryRouter is configured");
+            return Routing::Proceed;
+        };
+        let RoutingLogs {
+            scope,
+            false_premise,
+        } = logs;
+        match router.route(query).await {
+            Ok(route) => {
+                use easyrag_core::model::verification::QueryRouteType;
+                match route.route_type {
+                    QueryRouteType::NoRetrieval => {
+                        tracing::debug!("Query{scope} routed to no_retrieval");
+                        return Routing::Answer(NO_RETRIEVAL_RESPONSE.to_string());
+                    }
+                    QueryRouteType::MultiHop => {
+                        tracing::debug!(
+                            "Query{scope} routed to multi_hop with {} sub-queries",
+                            route.sub_queries.len()
+                        );
+                        // Execute sub-queries and merge context
+                        // For now, fall through to normal query with expanded context
+                    }
+                    QueryRouteType::SingleHop => {
+                        tracing::debug!("Query{scope} routed to single_hop");
+                        // Normal flow
+                    }
+                }
+                if route.has_false_premise {
+                    tracing::info!("{false_premise}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Query routing{scope} failed: {e}");
+            }
+        }
+        Routing::Proceed
+    }
+
+    /// Post-retrieval hallucination gate (Feature 2). Returns `true` when the
+    /// evidence is too weak to answer and the caller should return
+    /// [`FAIL_RESPONSE`]; a scoring *failure* is logged and ignored, so a broken
+    /// scorer cannot turn a good answer into a refusal.
+    ///
+    /// `log_scope` is the suffix each caller puts in its tracing messages — `""`
+    /// on the naive path, `" (kg)"` on the graph one. Log text only, never control
+    /// flow, which is what lets one implementation serve both.
+    async fn gate_evidence(
+        &self,
+        query: &str,
+        chunks: &[JsonMap],
+        param: &QueryParam,
+        log_scope: &str,
+    ) -> bool {
+        let use_scoring = param
+            .enable_evidence_scoring
+            .unwrap_or(self.evidence_scorer.is_some());
+        if !use_scoring {
+            return false;
+        }
+        let Some(scorer) = &self.evidence_scorer else {
+            tracing::warn!("Evidence quality scoring requested but no EvidenceScorer is configured");
+            return false;
+        };
+        match scorer.score(query, chunks).await {
+            Ok(score) => {
+                tracing::debug!("Evidence quality{log_scope}: {:.2} ({:?})", score.score, score.decision);
+                match score.decision {
+                    QualityDecision::Abstain => true,
+                    QualityDecision::Refine => {
+                        tracing::debug!("Evidence quality borderline, proceeding with caution");
+                        false
+                    }
+                    // Good evidence, proceed normally.
+                    QualityDecision::Generate => false,
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Evidence scoring failed{log_scope}: {e}");
+                false
+            }
+        }
+    }
+
+    /// Post-generation hallucination gate (Feature 1).
+    ///
+    /// Returns `true` when the answer rests on insufficiently supported claims and
+    /// the caller should return [`FAIL_RESPONSE`]. `log_scope` means exactly what
+    /// it does in [`Self::gate_evidence`]: log text only.
+    async fn gate_claims(
+        &self,
+        response: &str,
+        chunks: &[JsonMap],
+        param: &QueryParam,
+        log_scope: &str,
+    ) -> bool {
+        let use_verification = param
+            .enable_verification
+            .unwrap_or(self.claim_verifier.is_some());
+        if !use_verification {
+            return false;
+        }
+        let Some(verifier) = &self.claim_verifier else {
+            tracing::warn!("Claim verification requested but no ClaimVerifier is configured");
+            return false;
+        };
+        match verifier.verify_answer(response, chunks).await {
+            Ok(result) => {
+                tracing::debug!(
+                    "Verification{log_scope}: {} claims, min_support={:.2}, abstain={}",
+                    result.claims.len(),
+                    result.min_support,
+                    result.abstain
+                );
+                result.abstain
+            }
+            Err(e) => {
+                tracing::warn!("Claim verification failed{log_scope}: {e}");
+                false
+            }
+        }
+    }
+
+    /// Naive query - pure vector retrieval without knowledge graph.
+    async fn naive_query(&self, query: &str, param: &QueryParam) -> easyrag_core::Result<String> {
+        // 1./2. Retrieve relevant chunks via hybrid search (vector + keyword)
+        // and rerank them.
+        let chunks = self.naive_recall(query, param, Recall::Hybrid).await?;
+
+        if chunks.is_empty() {
+            return Ok(FAIL_RESPONSE.to_string());
+        }
+
+        // [Guardrail] Evidence quality scoring (Feature 2) — post-retrieval
+        if self.gate_evidence(query, &chunks, param, "").await {
+            return Ok(FAIL_RESPONSE.to_string());
+        }
+
+        // 3. Build context from chunks.
+        let context_data = self.build_naive_context(&chunks, param);
+
+        // 4. Generate response.
+        let prompt = self.render_answer_prompt(
+            &NAIVE_RAG_RESPONSE,
+            "content_data",
+            context_data,
+            param,
+        );
 
         let response = self.llm_service.complete(&LlmRequest::new(prompt)).await?;
 
         // [Guardrail] Claim verification gate (Feature 1) — post-generation
-        let use_verification = param.enable_verification.unwrap_or(self.claim_verifier.is_some());
-        if use_verification {
-            match &self.claim_verifier {
-                Some(verifier) => {
-                    match verifier.verify_answer(&response, &chunks).await {
-                        Ok(result) => {
-                            tracing::debug!(
-                                "Verification: {} claims, min_support={:.2}, abstain={}",
-                                result.claims.len(),
-                                result.min_support,
-                                result.abstain
-                            );
-                            if result.abstain {
-                                return Ok(FAIL_RESPONSE.to_string());
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Claim verification failed: {e}");
-                        }
-                    }
-                }
-                None => {
-                    tracing::warn!("Claim verification requested but no ClaimVerifier is configured");
-                }
-            }
+        if self.gate_claims(&response, &chunks, param, "").await {
+            return Ok(FAIL_RESPONSE.to_string());
         }
 
         Ok(response)
@@ -1012,18 +1133,9 @@ impl QueryEngine {
             .await?;
 
         // 4. Retrieve text chunks (hybrid search + entity-related chunks).
-        let mut chunks = apply_metadata_filters(
-            self.hybrid_chunk_query(
-                query,
-                effective_top_k(param, param.chunk_top_k),
-                param.time_range_start,
-                param.time_range_end,
-                &param.biz_id,
-            )
-            .await?,
-            param,
-            param.chunk_top_k,
-        );
+        let mut chunks = self
+            .retrieve_chunks(query, param, Recall::Hybrid, TopKField::ChunkTopK)
+            .await?;
 
         // 4b. Collect entity-related chunks via source_ids.
         let mut entity_chunk_ids: Vec<String> = Vec::new();
@@ -1060,38 +1172,15 @@ impl QueryEngine {
             }
         }
 
-        // 5. Apply reranking if enabled and available.
-        if param.enable_rerank && self.rerank_service.is_some() && chunks.len() > 1 {
-            chunks = self.rerank_chunks(query, chunks, param.chunk_top_k).await;
-        }
+        // 5. Apply reranking if enabled and available — ranks the recall and
+        // the entity-related chunks appended in 4b as one set.
+        let chunks = self.rerank_if_enabled(query, chunks, param).await;
 
-        // [Guardrail] Evidence quality scoring (Feature 2) — post-retrieval
-        let use_scoring = param.enable_evidence_scoring.unwrap_or(self.evidence_scorer.is_some());
-        if use_scoring {
-            match &self.evidence_scorer {
-                Some(scorer) => {
-                    match scorer.score(query, &chunks).await {
-                        Ok(score) => {
-                            tracing::debug!("Evidence quality (kg): {:.2} ({:?})", score.score, score.decision);
-                            match score.decision {
-                                QualityDecision::Abstain => {
-                                    return Ok(FAIL_RESPONSE.to_string());
-                                }
-                                QualityDecision::Refine => {
-                                    tracing::debug!("Evidence quality borderline, proceeding with caution");
-                                }
-                                QualityDecision::Generate => {}
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Evidence scoring failed (kg): {e}");
-                        }
-                    }
-                }
-                None => {
-                    tracing::warn!("Evidence quality scoring requested but no EvidenceScorer is configured");
-                }
-            }
+        // [Guardrail] Evidence quality scoring (Feature 2) — post-retrieval.
+        // Deliberately ahead of the "nothing retrieved" check below, as it has
+        // always been: the scorer runs (and logs) even when `chunks` came back empty.
+        if self.gate_evidence(query, &chunks, param, " (kg)").await {
+            return Ok(FAIL_RESPONSE.to_string());
         }
 
         if entities.is_empty() && chunks.is_empty() {
@@ -1107,14 +1196,8 @@ impl QueryEngine {
         }
 
         // 7. Build prompt.
-        let mut vars = HashMap::new();
-        vars.insert("response_type".to_string(), param.response_type.clone());
-        vars.insert(
-            "user_prompt".to_string(),
-            param.user_prompt.clone().unwrap_or_default(),
-        );
-        vars.insert("context_data".to_string(), context_data);
-        let prompt = format_prompt(RAG_RESPONSE, &vars);
+        let prompt =
+            self.render_answer_prompt(&RAG_RESPONSE, "context_data", context_data, param);
 
         // Support only_need_prompt for debugging.
         if param.only_need_prompt {
@@ -1140,31 +1223,8 @@ impl QueryEngine {
         let response = self.llm_service.complete(&request).await?;
 
         // [Guardrail] Claim verification gate (Feature 1) — post-generation
-        let use_verification = param.enable_verification.unwrap_or(self.claim_verifier.is_some());
-        if use_verification {
-            match &self.claim_verifier {
-                Some(verifier) => {
-                    match verifier.verify_answer(&response, &chunks).await {
-                        Ok(result) => {
-                            tracing::debug!(
-                                "Verification (kg): {} claims, min_support={:.2}, abstain={}",
-                                result.claims.len(),
-                                result.min_support,
-                                result.abstain
-                            );
-                            if result.abstain {
-                                return Ok(FAIL_RESPONSE.to_string());
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Claim verification failed (kg): {e}");
-                        }
-                    }
-                }
-                None => {
-                    tracing::warn!("Claim verification requested but no ClaimVerifier is configured");
-                }
-            }
+        if self.gate_claims(&response, &chunks, param, " (kg)").await {
+            return Ok(FAIL_RESPONSE.to_string());
         }
 
         Ok(response)
@@ -1178,18 +1238,7 @@ impl QueryEngine {
             .iter()
             .enumerate()
             .map(|(index, chunk)| {
-                let section_path = chunk
-                    .get("metadata")
-                    .and_then(|m| m.get("section_path"))
-                    .and_then(|p| p.as_array())
-                    .map(|parts| {
-                        parts
-                            .iter()
-                            .filter_map(|p| p.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" > ")
-                    })
-                    .unwrap_or_default();
+                let section_path = section_path_of(chunk).unwrap_or_default();
                 let mut m = JsonMap::new();
                 m.insert(
                     "reference_id".into(),
@@ -1239,7 +1288,7 @@ impl QueryEngine {
         let mut vars = HashMap::new();
         vars.insert("text_chunks_str".to_string(), to_pretty_json(&chunks_json));
         vars.insert("reference_list_str".to_string(), reference_list);
-        format_prompt(NAIVE_QUERY_CONTEXT, &vars)
+        format_prompt(&NAIVE_QUERY_CONTEXT, &vars)
     }
 
     /// 4-stage query context architecture:
@@ -1259,7 +1308,7 @@ impl QueryEngine {
         param: &QueryParam,
     ) -> String {
         // P1.9: Calculate dynamic token budget accounting for prompt overhead.
-        let system_prompt_tokens = self.tokenizer.count_tokens(RAG_RESPONSE)
+        let system_prompt_tokens = self.tokenizer.count_tokens(&RAG_RESPONSE)
             + self.tokenizer.count_tokens(&param.response_type)
             + self
                 .tokenizer
@@ -1444,7 +1493,7 @@ impl QueryEngine {
         vars.insert("relations_str".to_string(), to_pretty_json(&relations_json));
         vars.insert("text_chunks_str".to_string(), to_pretty_json(&chunks_json));
         vars.insert("reference_list_str".to_string(), reference_list);
-        format_prompt(KG_QUERY_CONTEXT, &vars)
+        format_prompt(&KG_QUERY_CONTEXT, &vars)
     }
 
     /// Rerank chunks using the rerank service.
@@ -1624,6 +1673,33 @@ fn round_robin_merge<'a>(sources: &[&'a Vec<&'a JsonMap>]) -> Vec<&'a JsonMap> {
     result
 }
 
+/// Truncate a list of items to fit within a token budget, where each item's token
+/// cost is computed from a projection `key`. Items are kept in order until adding
+/// the next one would exceed `max_tokens`; at least one item is always kept when
+/// the input is non-empty. Generic over `T` with an `impl Fn` key so every call
+/// site monomorphizes to zero-cost code (no dyn/Box indirection).
+fn truncate_by<T: Clone>(
+    items: &[T],
+    max_tokens: usize,
+    tokenizer: &Tokenizer,
+    key: impl Fn(&T) -> String,
+) -> Vec<T> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let mut result: Vec<T> = Vec::new();
+    let mut tokens_used = 0usize;
+    for item in items {
+        let item_tokens = tokenizer.count_tokens(&key(item));
+        if tokens_used + item_tokens > max_tokens && !result.is_empty() {
+            break;
+        }
+        result.push(item.clone());
+        tokens_used += item_tokens;
+    }
+    result
+}
+
 /// Truncate chunks list to fit within a token budget.
 /// Keeps at least the first chunk even if it alone exceeds budget.
 fn truncate_to_token_budget(
@@ -1631,21 +1707,13 @@ fn truncate_to_token_budget(
     max_tokens: usize,
     tokenizer: &Tokenizer,
 ) -> Vec<JsonMap> {
-    if chunks.is_empty() {
-        return Vec::new();
-    }
-    let mut result: Vec<JsonMap> = Vec::new();
-    let mut tokens_used = 0usize;
-    for chunk in chunks {
-        let content = chunk.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        let chunk_tokens = tokenizer.count_tokens(content);
-        if tokens_used + chunk_tokens > max_tokens && !result.is_empty() {
-            break;
-        }
-        result.push(chunk.clone());
-        tokens_used += chunk_tokens;
-    }
-    result
+    truncate_by(chunks, max_tokens, tokenizer, |chunk| {
+        chunk
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    })
 }
 
 /// Truncate entities to fit within a token budget.
@@ -1654,12 +1722,7 @@ fn truncate_entities_to_budget(
     max_tokens: usize,
     tokenizer: &Tokenizer,
 ) -> Vec<JsonMap> {
-    if entities.is_empty() {
-        return Vec::new();
-    }
-    let mut result: Vec<JsonMap> = Vec::new();
-    let mut tokens_used = 0usize;
-    for entity in entities {
+    truncate_by(entities, max_tokens, tokenizer, |entity| {
         let desc = entity
             .get("description")
             .and_then(|v| v.as_str())
@@ -1669,14 +1732,8 @@ fn truncate_entities_to_budget(
             .or_else(|| entity.get("id"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let item_tokens = tokenizer.count_tokens(&format!("{name}: {desc}"));
-        if tokens_used + item_tokens > max_tokens && !result.is_empty() {
-            break;
-        }
-        result.push(entity.clone());
-        tokens_used += item_tokens;
-    }
-    result
+        format!("{name}: {desc}")
+    })
 }
 
 /// Truncate relations to fit within a token budget.
@@ -1685,12 +1742,7 @@ fn truncate_relations_to_budget(
     max_tokens: usize,
     tokenizer: &Tokenizer,
 ) -> Vec<JsonMap> {
-    if relations.is_empty() {
-        return Vec::new();
-    }
-    let mut result: Vec<JsonMap> = Vec::new();
-    let mut tokens_used = 0usize;
-    for relation in relations {
+    truncate_by(relations, max_tokens, tokenizer, |relation| {
         let desc = relation
             .get("description")
             .and_then(|v| v.as_str())
@@ -1699,14 +1751,8 @@ fn truncate_relations_to_budget(
             .get("keywords")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let item_tokens = tokenizer.count_tokens(&format!("{desc} {keywords}"));
-        if tokens_used + item_tokens > max_tokens && !result.is_empty() {
-            break;
-        }
-        result.push(relation.clone());
-        tokens_used += item_tokens;
-    }
-    result
+        format!("{desc} {keywords}")
+    })
 }
 
 /// Estimate total tokens for a list of map items (string values only,

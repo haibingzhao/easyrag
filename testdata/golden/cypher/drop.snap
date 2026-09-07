@@ -1,0 +1,9 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+MATCH (n:`myws` {biz_id: $biz}) DETACH DELETE n
+--- params[0] ---
+{
+  "biz": "default"
+}

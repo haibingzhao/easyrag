@@ -10,6 +10,8 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::drop_result::drop_success;
+
 /// JSON file-based KV storage implementation.
 ///
 /// One file per workspace; `biz_id` is a per-record field used as a
@@ -153,13 +155,9 @@ impl StorageNameSpace for JsonKVStorage {
             before - store.len()
         };
         self.persist_locked();
-        let mut result = HashMap::new();
-        result.insert("status".to_string(), "success".to_string());
-        result.insert(
-            "message".to_string(),
-            format!("data dropped ({removed} records for biz {biz_id})"),
-        );
-        Ok(result)
+        Ok(drop_success(format!(
+            "data dropped ({removed} records for biz {biz_id})"
+        )))
     }
 }
 

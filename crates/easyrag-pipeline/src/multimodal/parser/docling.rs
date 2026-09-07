@@ -2,17 +2,14 @@
 //! Invokes the `docling` CLI tool.
 
 use std::path::Path;
-use std::time::Duration;
 
 use async_trait::async_trait;
-use easyrag_core::{CoreError, JsonMap};
-use serde_json::Value as JsonValue;
+use easyrag_core::JsonMap;
 
 use super::super::model::{ContentItem, ParseResult};
-use super::mineru::path_to_absolute;
 use super::{
-    run_installation_check, take_last_chars, walk_top_down, MultimodalParser,
-    ParserExecutionError, IMAGE_FORMATS, OFFICE_FORMATS, PDF_FORMATS, TEXT_FORMATS,
+    first_json_file, path_to_absolute, walk_top_down, ExternalCliParser, MultimodalParser,
+    IMAGE_FORMATS, OFFICE_FORMATS, PDF_FORMATS, TEXT_FORMATS,
 };
 
 /// Docling document parser implementation.
@@ -32,7 +29,7 @@ impl DoclingParser {
         Self { timeout_seconds }
     }
 
-    fn build_command(&self, file: &Path, output_dir: &str, kwargs: &JsonMap) -> Vec<String> {
+    pub(super) fn build_command(&self, file: &Path, output_dir: &str, kwargs: &JsonMap) -> Vec<String> {
         let mut cmd: Vec<String> = vec![
             "docling".to_string(),
             path_to_absolute(file),
@@ -50,87 +47,16 @@ impl DoclingParser {
         cmd
     }
 
-    async fn execute_command(&self, command: &[String], file: &Path) -> easyrag_core::Result<()> {
-        let mut cmd = tokio::process::Command::new(&command[0]);
-        cmd.args(&command[1..])
-            .current_dir(file.parent().unwrap_or_else(|| Path::new(".")))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        let mut child = cmd.spawn().map_err(|e| {
-            CoreError::Internal(format!("Failed to start Docling process: {e}"))
-        })?;
-
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let stdout_task = tokio::spawn(super::read_stream(stdout));
-        let stderr_task = tokio::spawn(super::read_stream(stderr));
-
-        let wait_result =
-            tokio::time::timeout(Duration::from_secs(self.timeout_seconds), child.wait()).await;
-
-        let status = match wait_result {
-            Ok(Ok(status)) => status,
-            Ok(Err(e)) => {
-                return Err(CoreError::Internal(format!(
-                    "Docling process error: {e}"
-                )))
-            }
-            Err(_) => {
-                let _ = child.start_kill();
-                // Reap the killed child to avoid a zombie process.
-                let _ = child.wait().await;
-                return Err(ParserExecutionError::new(
-                    -1,
-                    format!("Docling timed out after {}s", self.timeout_seconds),
-                    self.name(),
-                ));
-            }
-        };
-
-        let stdout = tokio::time::timeout(Duration::from_secs(5), stdout_task)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
-        let stderr = tokio::time::timeout(Duration::from_secs(5), stderr_task)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
-
-        if !status.success() {
-            let code = status.code().unwrap_or(-1);
-            // redirects error stream into stdout; join both for the
-            // error message.
-            let merged = format!("{stdout}\n{stderr}");
-            let error_msg = take_last_chars(&merged, 2000);
-            tracing::error!("Docling failed (code={}): {}", code, error_msg);
-            return Err(ParserExecutionError::new(code, error_msg, self.name()));
-        }
-        Ok(())
-    }
-
-    fn parse_output(&self, output_dir: &str, _original_file: &Path) -> Vec<ContentItem> {
-        let dir = Path::new(output_dir);
-        if !dir.exists() {
-            tracing::warn!("Docling output directory not found: {}", output_dir);
+    pub(super) fn parse_output(&self, output_dir: &str, _original_file: &Path) -> Vec<ContentItem> {
+        if !self.output_dir_exists(output_dir) {
             return Vec::new();
         }
 
-        let Some(json_file) = walk_top_down(dir)
-            .into_iter()
-            .filter(|p| p.is_file())
-            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-        else {
+        let Some(json_file) = first_json_file(&walk_top_down(Path::new(output_dir))) else {
             return Vec::new();
         };
 
-        let Some(root) = std::fs::read_to_string(&json_file)
-            .ok()
-            .and_then(|text| serde_json::from_str::<JsonMap>(&text).ok())
-        else {
-            tracing::error!("Failed to parse Docling output: {}", json_file.display());
+        let Some(root) = self.read_output_json(&json_file) else {
             return Vec::new();
         };
 
@@ -234,6 +160,18 @@ impl DoclingParser {
     }
 }
 
+impl ExternalCliParser for DoclingParser {
+    const DISPLAY_NAME: &'static str = "Docling";
+    const INSTALL_CHECK: &'static [&'static str] = &["docling", "--version"];
+    const INSTALL_CHECK_TIMEOUT: u64 = 10;
+    const FORMAT_LISTS: &'static [&'static [&'static str]] =
+        &[PDF_FORMATS, OFFICE_FORMATS, IMAGE_FORMATS, TEXT_FORMATS];
+
+    fn timeout_seconds(&self) -> u64 {
+        self.timeout_seconds
+    }
+}
+
 impl Default for DoclingParser {
     fn default() -> Self {
         Self::new()
@@ -247,11 +185,7 @@ impl MultimodalParser for DoclingParser {
     }
 
     fn supported_formats(&self) -> Vec<String> {
-        let mut formats = Vec::new();
-        for list in [PDF_FORMATS, OFFICE_FORMATS, IMAGE_FORMATS, TEXT_FORMATS] {
-            formats.extend(list.iter().map(|f| (*f).to_string()));
-        }
-        formats
+        self.supported_format_list()
     }
 
     async fn parse(
@@ -260,57 +194,26 @@ impl MultimodalParser for DoclingParser {
         _parse_method: Option<&str>,
         kwargs: &JsonMap,
     ) -> easyrag_core::Result<ParseResult> {
-        if !file.exists() {
-            return Err(CoreError::InvalidArgument(format!(
-                "File not found: {}",
-                path_to_absolute(file)
-            )));
-        }
-
-        let stem = file
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let default_output = file
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(format!("{stem}_docling_output"));
-        let output_dir = kwargs
-            .get("output_dir")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| path_to_absolute(&default_output));
+        let output_dir = self.resolve_output_dir(file, kwargs)?;
 
         tracing::info!(
-            "Parsing {} with Docling (output={})",
+            "Parsing {} with {} (output={})",
             file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            Self::DISPLAY_NAME,
             output_dir
         );
 
         let command = self.build_command(file, &output_dir, kwargs);
-        tracing::debug!("Docling command: {}", command.join(" "));
+        tracing::debug!("{} command: {}", Self::DISPLAY_NAME, command.join(" "));
 
         self.execute_command(&command, file).await?;
 
         let content_list = self.parse_output(&output_dir, file);
 
-        let mut metadata = JsonMap::new();
-        metadata.insert("parser".to_string(), JsonValue::from("docling"));
-        metadata.insert("output_dir".to_string(), JsonValue::from(output_dir));
-
-        Ok(ParseResult {
-            content_list,
-            doc_id: String::new(),
-            file_path: path_to_absolute(file),
-            metadata,
-        })
+        Ok(self.cli_parse_result(content_list, file, &output_dir, None))
     }
 
     fn check_installation(&self) -> bool {
-        let ok = run_installation_check(&["docling", "--version"], 10);
-        if !ok {
-            tracing::debug!("Docling installation check failed");
-        }
-        ok
+        self.installation_ok()
     }
 }

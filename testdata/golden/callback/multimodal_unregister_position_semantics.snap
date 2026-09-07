@@ -1,0 +1,11 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+len_after_first_unregister=1
+len_after_second_unregister=0
+len_before_stranger=1
+len_after_stranger=1
+calls:
+on_query_start(query=q1, mode=naive)
+on_query_start(query=q1, mode=naive)
+on_query_start(query=q2, mode=naive)

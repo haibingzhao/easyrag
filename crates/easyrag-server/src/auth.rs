@@ -228,11 +228,11 @@ pub async fn auth_middleware(
         .and_then(|v| v.to_str().ok());
     let Some(header) = header else {
         tracing::warn!("[auth] 401 {path} from {client_ip}: missing Authorization header");
-        return Err(AppError::status(401, "Unauthorized"));
+        return Err(AppError::unauthorized("Unauthorized"));
     };
     let Some(token) = extract_bearer_token(Some(header)) else {
         tracing::warn!("[auth] 401 {path} from {client_ip}: malformed Authorization header");
-        return Err(AppError::status(401, "Unauthorized"));
+        return Err(AppError::unauthorized("Unauthorized"));
     };
     match jwt.validate_token_detailed(token) {
         Ok(_) => Ok(next.run(req).await),
@@ -241,7 +241,7 @@ pub async fn auth_middleware(
             tracing::warn!(
                 "[auth] 401 {path} from {client_ip}: token {prefix}... rejected: {reason}"
             );
-            Err(AppError::status(401, "Unauthorized"))
+            Err(AppError::unauthorized("Unauthorized"))
         }
     }
 }

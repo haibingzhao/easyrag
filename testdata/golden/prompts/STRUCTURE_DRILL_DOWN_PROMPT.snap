@@ -1,0 +1,23 @@
+---
+source: crates/easyrag-core/tests/prompt_golden.rs
+---
+---Task---
+You previously selected section "{parent_title}" as relevant.
+Now examine its sub-sections and decide which contain the specific answer.
+
+---Parent Section Summary---
+{parent_summary}
+
+---Sub-Sections---
+{sub_sections}
+
+---Original Query---
+{query}
+
+---Instructions---
+1. Given the parent context, reason about which sub-section(s) have the specific answer
+2. If the parent section itself (not children) likely contains the answer, select "__self__"
+3. Select 1-3 most relevant sub-sections, or "__self__" if parent is sufficient
+
+Return JSON:
+{"thinking": "<reasoning about which sub-section has the specific answer>", "selected_sections": ["<section_id>"], "need_deeper": true}

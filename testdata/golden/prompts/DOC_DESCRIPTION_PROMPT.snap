@@ -1,0 +1,11 @@
+---
+source: crates/easyrag-core/tests/prompt_golden.rs
+---
+---Task---
+Provide a one-sentence description of the following document. Focus on its main topic and purpose.
+
+---Document Content (truncated)---
+{content}
+
+---Output---
+A single concise sentence describing this document:

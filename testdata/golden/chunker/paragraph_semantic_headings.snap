@@ -1,0 +1,10 @@
+---
+source: crates/easyrag-pipeline/tests/chunker_golden.rs
+---
+chunks=3
+order=0 tokens=65 doc_id="doc-1" content="Introductory preamble text with no heading above it.\n\n# Chapter One\nSentence number 0 discusses topic 0.\n\n# Chapter One\nSentence number 1 discusses topic 1. Sentence number 2 discusses topic 2. Sentence number 3 discusses topic 3. Sentence number 4 discusses topic 0."
+  metadata: heading="" level=0 parent_headings=[]
+order=1 tokens=27 doc_id="doc-1" content="# Chapter One\nSentence number 5 discusses topic 1.\n\n## Sub A\nTiny body.\n\n## Sub B\nAlso tiny."
+  metadata: heading="Chapter One" level=1 parent_headings=[]
+order=2 tokens=31 doc_id="doc-1" content="# Chapter Two\nSentence number 0 discusses topic 0. Sentence number 1 discusses topic 1. Sentence number 2 discusses topic 2."
+  metadata: heading="Chapter Two" level=1 parent_headings=[]

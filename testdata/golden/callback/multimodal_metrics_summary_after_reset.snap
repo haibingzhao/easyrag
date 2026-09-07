@@ -1,0 +1,4 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+{"documents_parsed":0,"documents_failed":0,"total_content_blocks":0,"total_chunks_created":0,"modal_items_processed":0,"modal_items_failed":0,"queries_executed":0,"total_parse_time_ms":0,"total_insert_time_ms":0,"total_modal_time_ms":0,"total_query_time_ms":0}

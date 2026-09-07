@@ -23,6 +23,7 @@ use easyrag_core::storage::tenant_config::TenantConfig;
 
 use crate::error::{AppError, AppResult};
 use crate::state::{AppServices, AppState};
+use crate::util::success_response;
 
 pub fn router() -> Router<Arc<AppServices>> {
     Router::new()
@@ -151,10 +152,9 @@ async fn list_or_get_tenant_config(
             .await?;
         match config {
             Some(c) => Ok(Json(json!(config_to_response(&c)))),
-            None => Err(AppError::status(
-                404,
-                format!("No tenant config for workspace: {workspace}"),
-            )),
+            None => Err(AppError::not_found(format!(
+                "No tenant config for workspace: {workspace}"
+            ))),
         }
     } else {
         let all = state.tenant_config_storage.list_all().await?;
@@ -280,8 +280,8 @@ async fn delete_tenant_config(
     state.workspace_resolver.invalidate_workspace(workspace).await;
 
     tracing::info!("Tenant config deleted for workspace: {workspace}");
-    Ok(Json(json!({
-        "status": "success",
-        "message": format!("Tenant config for workspace '{workspace}' deleted")
-    })))
+    Ok(Json(success_response(
+        &format!("Tenant config for workspace '{workspace}' deleted"),
+        None,
+    )))
 }

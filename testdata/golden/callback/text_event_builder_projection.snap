@@ -1,0 +1,19 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+--- bare ---
+event_type=query_start
+file_path=None
+doc_id=None
+stage=None
+details={}
+duration_ms=None
+error=None
+--- full ---
+event_type=query_end
+file_path=Some(fp)
+doc_id=Some(doc)
+stage=Some(retrieve)
+details={"k":"v"}
+duration_ms=Some(9)
+error=Some(err)

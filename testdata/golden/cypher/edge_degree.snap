@@ -1,0 +1,17 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+MATCH (n:`test` {entity_id: $id, biz_id: $biz})-[r:DIRECTED]-(m:`test` {biz_id: $biz}) RETURN count(r) AS degree
+--- params[0] ---
+{
+  "biz": "default",
+  "id": "A"
+}
+--- query[1] ---
+MATCH (n:`test` {entity_id: $id, biz_id: $biz})-[r:DIRECTED]-(m:`test` {biz_id: $biz}) RETURN count(r) AS degree
+--- params[1] ---
+{
+  "biz": "default",
+  "id": "B"
+}

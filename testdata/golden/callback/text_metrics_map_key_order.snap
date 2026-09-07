@@ -1,0 +1,5 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+keys=["documents_processed", "documents_failed", "success_rate", "total_chunks", "total_entities", "total_relations", "avg_processing_time_ms", "queries_executed", "avg_query_time_ms"]
+json={"documents_processed":2,"documents_failed":1,"success_rate":0.6666666865348816,"total_chunks":5,"total_entities":3,"total_relations":2,"avg_processing_time_ms":200,"queries_executed":2,"avg_query_time_ms":100}

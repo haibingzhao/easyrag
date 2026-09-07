@@ -1,0 +1,17 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+MATCH (n:`test`) RETURN n LIMIT $limit
+--- params[0] ---
+{
+  "biz": "",
+  "limit": 10
+}
+--- query[1] ---
+MATCH (a:`test`)-[r:DIRECTED]->(b:`test`) RETURN a.entity_id AS src, b.entity_id AS tgt, r LIMIT $limit
+--- params[1] ---
+{
+  "biz": "",
+  "limit": 30
+}

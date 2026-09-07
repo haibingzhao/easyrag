@@ -1,0 +1,7 @@
+---
+source: crates/easyrag-pipeline/tests/chunker_golden.rs
+---
+chunks=3
+order=0 tokens=22 doc_id="doc-1" content="Line 0 of the document about topic 0. Line 1 of the document about topic 1."
+order=1 tokens=22 doc_id="doc-1" content="Line 2 of the document about topic 2. Line 3 of the document about topic 0."
+order=2 tokens=11 doc_id="doc-1" content="Line 4 of the document about topic 1."

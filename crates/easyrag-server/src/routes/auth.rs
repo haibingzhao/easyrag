@@ -50,8 +50,7 @@ async fn login(
         .unwrap_or_else(|| "unknown".to_string());
     let identifier = format!("{ip}:{username}");
     if !state.rate_limiter.is_allowed(&identifier) {
-        return Err(AppError::status(
-            429,
+        return Err(AppError::too_many_requests(
             "Too many login attempts; please try again later",
         ));
     }
@@ -64,6 +63,6 @@ async fn login(
             tracing::info!("login succeeded for user '{}' from {ip}", user.username);
             Ok(Json(json!({ "token": token, "username": user.username })))
         }
-        None => Err(AppError::status(401, "Invalid username or password")),
+        None => Err(AppError::unauthorized("Invalid username or password")),
     }
 }

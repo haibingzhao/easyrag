@@ -1,0 +1,9 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+text_events_logged=1
+mm_len=1
+calls:
+on_event(query_start)
+on_query_start(query=q, mode=naive)
+on_query_start(query=q, mode=naive)

@@ -1,0 +1,7 @@
+---
+source: crates/easyrag-pipeline/tests/modal_processor_fallback.rs
+---
+image_given_table: Expected ImageContent, got table
+table_given_equation: Expected TableContent, got equation
+equation_given_generic: Expected EquationContent, got generic
+generic_given_image: Expected GenericContent, got image

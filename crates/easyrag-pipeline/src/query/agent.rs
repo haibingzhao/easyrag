@@ -6,11 +6,12 @@
 //! Requires a `ToolCallingLlmService`; the strategy is only constructed
 //! when one is available (graceful fallback happens at the caller).
 
-use easyrag_core::constants::STRUCTURE_INDEX_KEY_PREFIX;
+use crate::repository::StructureIndexRepository;
 use easyrag_core::llm::service::{
     ChatMessage, LlmRequest, MessageRole, ToolCall, ToolCallingLlmService, ToolDefinition,
 };
 use easyrag_core::model::doc_status::DocStatus;
+use easyrag_core::model::document_structure::section_path_of;
 use easyrag_core::model::query_param::QueryParam;
 use easyrag_core::prompt::STRUCTURE_AGENT_SYSTEM_PROMPT;
 use easyrag_core::storage::traits::{DocStatusStorage, KVStorage, VectorStorage};
@@ -355,9 +356,8 @@ impl StructureAgentStrategy {
     }
 
     async fn execute_get_structure(&self, doc_id: &str, biz_id: &str) -> easyrag_core::Result<String> {
-        let data = self
-            .kv_storage
-            .get_by_id(&format!("{STRUCTURE_INDEX_KEY_PREFIX}{doc_id}"), biz_id)
+        let data = StructureIndexRepository::new(&self.kv_storage)
+            .load_raw(doc_id, biz_id)
             .await?;
         let Some(data) = data else {
             return Ok(format!("No structure index found for document {doc_id}"));
@@ -393,17 +393,7 @@ impl StructureAgentStrategy {
             .iter()
             .copied()
             .filter(|chunk| {
-                let path = chunk
-                    .get("metadata")
-                    .and_then(|m| m.get("section_path"))
-                    .and_then(|p| p.as_array())
-                    .map(|parts| {
-                        parts
-                            .iter()
-                            .filter_map(|p| p.as_str())
-                            .collect::<Vec<_>>()
-                            .join(" > ")
-                    });
+                let path = section_path_of(chunk);
                 match path {
                     Some(p) => p.to_lowercase().contains(&section_path.to_lowercase()),
                     None => false,
@@ -434,9 +424,8 @@ impl StructureAgentStrategy {
         keyword: &str,
         biz_id: &str,
     ) -> easyrag_core::Result<String> {
-        let data = self
-            .kv_storage
-            .get_by_id(&format!("{STRUCTURE_INDEX_KEY_PREFIX}{doc_id}"), biz_id)
+        let data = StructureIndexRepository::new(&self.kv_storage)
+            .load_raw(doc_id, biz_id)
             .await?;
         let Some(data) = data else {
             return Ok(format!("No structure index found for document {doc_id}"));

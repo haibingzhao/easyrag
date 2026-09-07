@@ -1,0 +1,8 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+calls:
+on_event(documnet_complete)
+on_event()
+on_event(DOCUMENT_COMPLETE)
+logged_event_types=["documnet_complete", "", "DOCUMENT_COMPLETE"]

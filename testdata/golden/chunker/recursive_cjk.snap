@@ -1,0 +1,10 @@
+---
+source: crates/easyrag-pipeline/tests/chunker_golden.rs
+---
+chunks=6
+order=0 tokens=9 doc_id="doc-1" content="第0句话讲述主题0的内容"
+order=1 tokens=9 doc_id="doc-1" content="第1句话讲述主题1的内容"
+order=2 tokens=9 doc_id="doc-1" content="第2句话讲述主题2的内容"
+order=3 tokens=9 doc_id="doc-1" content="第3句话讲述主题0的内容"
+order=4 tokens=9 doc_id="doc-1" content="第4句话讲述主题1的内容"
+order=5 tokens=10 doc_id="doc-1" content="第5句话讲述主题2的内容。"

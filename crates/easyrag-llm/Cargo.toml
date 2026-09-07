@@ -20,7 +20,9 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 eventsource-stream = { workspace = true }
 moka = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
 tokio-test = "0.4"
+insta = { workspace = true }

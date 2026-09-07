@@ -1,0 +1,8 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+calls:
+on_event(document_complete)
+on_event(document_complete)
+on_document_complete(doc_id=d1, file_path=fp-1, duration_ms=5)
+logged_event_count=1

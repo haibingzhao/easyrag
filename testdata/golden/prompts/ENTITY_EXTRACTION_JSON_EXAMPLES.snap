@@ -1,0 +1,25 @@
+---
+source: crates/easyrag-core/tests/prompt_golden.rs
+---
+{
+  "entities": [
+    {
+      "name": "<entity_name>",
+      "type": "<entity_type>",
+      "description": "<entity_description>"
+    },
+    {
+      "name": "<related_entity_name>",
+      "type": "<related_entity_type>",
+      "description": "<related_entity_description>"
+    }
+  ],
+  "relationships": [
+    {
+      "source": "<entity_name>",
+      "target": "<related_entity_name>",
+      "keywords": "<relationship_keywords>",
+      "description": "<relationship_description>"
+    }
+  ]
+}

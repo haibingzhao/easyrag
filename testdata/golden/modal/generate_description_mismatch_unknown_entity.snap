@@ -1,0 +1,11 @@
+---
+source: crates/easyrag-pipeline/tests/modal_processor_fallback.rs
+---
+image_given_table: description: 
+entity: {entity_name="unknown_image", entity_type="image", summary=""}
+table_given_equation: description: 
+entity: {entity_name="unknown_table", entity_type="table", summary=""}
+equation_given_generic: description: 
+entity: {entity_name="unknown_equation", entity_type="equation", summary=""}
+generic_given_image: description: 
+entity: {entity_name="unknown_content", entity_type="generic", summary=""}

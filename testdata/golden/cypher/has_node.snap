@@ -1,0 +1,10 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+MATCH (n:`test` {entity_id: $id, biz_id: $biz}) RETURN count(n) > 0 AS exists
+--- params[0] ---
+{
+  "biz": "default",
+  "id": "entity1"
+}

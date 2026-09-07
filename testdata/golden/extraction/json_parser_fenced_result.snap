@@ -1,0 +1,9 @@
+---
+source: crates/easyrag-pipeline/tests/extraction_golden.rs
+---
+entities=3
+  entity name="Ada Lovelace" type="Person" desc="Wrote notes on the Analytical Engine"
+  entity name="Charles Babbage" type="Other" desc="Designed the Analytical Engine"
+  entity name="NoType" type="" desc="explicit empty type is kept"
+relationships=1
+  rel src="Ada Lovelace" tgt="Charles Babbage" kw="collaborated with" desc="Worked on the Analytical Engine"

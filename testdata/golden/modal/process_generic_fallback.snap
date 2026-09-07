@@ -1,0 +1,10 @@
+---
+source: crates/easyrag-pipeline/tests/modal_processor_fallback.rs
+---
+entity_name: chart_dd2179d34e7f1289d85dd25d29821a19
+entity_type: chart
+description: chart content: some generic content body
+chunk_content: some generic content body
+success: true
+error_message: None
+metadata: [fallback=true]

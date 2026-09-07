@@ -1,5 +1,9 @@
 //! In-memory DocStatus storage.
 //! For development and testing without external dependencies.
+//!
+//! The KV-family behaviour lives in [`MemKvTable`]; this storage embeds one and
+//! delegates, overriding `upsert` alone so status transitions merge instead of
+//! replacing the record.
 
 use async_trait::async_trait;
 use easyrag_core::llm::EmbeddingFunc;
@@ -8,21 +12,12 @@ use easyrag_core::storage::traits::{
     resolve_status_filter_values, DocStatusStorage, KVStorage, StorageNameSpace,
 };
 use easyrag_core::JsonMap;
-use parking_lot::Mutex;
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-/// Business-line tag stored inside each record.
-fn record_biz(doc: &JsonMap) -> Option<&str> {
-    doc.get("biz_id").and_then(|v| v.as_str())
-}
+use super::kv_table::{record_biz, MemKvTable};
 
 pub struct InMemoryDocStatusStorage {
-    namespace: String,
-    workspace: String,
-    global_config: JsonMap,
-    embedding_func: Option<EmbeddingFunc>,
-    data: Mutex<HashMap<String, JsonMap>>,
+    table: MemKvTable,
 }
 
 impl InMemoryDocStatusStorage {
@@ -37,143 +32,52 @@ impl InMemoryDocStatusStorage {
         embedding_func: Option<EmbeddingFunc>,
     ) -> Self {
         Self {
-            namespace: namespace.into(),
-            workspace: workspace.into(),
-            global_config,
-            embedding_func,
-            data: Mutex::new(HashMap::new()),
+            table: MemKvTable::new(namespace, workspace, global_config, embedding_func),
         }
     }
 }
 
+/// Memory stores every status field flat at the record root, so the record IS
+/// the unwrapped field map the shared core mapper expects (postgres passes its
+/// nested `content` payload instead). Keeping one mapper for both backends is
+/// what prevents per-field drift — see `DocProcessingStatus::from_json`.
 fn map_to_doc_status(doc: &JsonMap) -> DocProcessingStatus {
-    let status_str = doc
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("pending");
-    DocProcessingStatus {
-        file_path: doc
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        status: DocStatus::from_value(status_str).unwrap_or(DocStatus::Pending),
-        content_summary: doc
-            .get("content_summary")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        content_length: doc
-            .get("content_length")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0),
-        created_at: doc
-            .get("created_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        updated_at: doc
-            .get("updated_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        chunks_count: doc.get("chunks_count").and_then(|v| v.as_i64()),
-        chunks_list: doc
-            .get("chunks_list")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        error_msg: doc
-            .get("error_msg")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        metadata: doc
-            .get("metadata")
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default(),
-        multimodal_processed: doc.get("multimodal_processed").and_then(|v| v.as_bool()),
-        content_hash: doc
-            .get("content_hash")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        track_id: doc
-            .get("track_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        has_structure: doc.get("has_structure").and_then(|v| v.as_bool()) == Some(true),
-        external_id: doc
-            .get("external_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        biz_id: record_biz(doc).unwrap_or_default().to_string(),
-    }
+    DocProcessingStatus::from_json(doc)
 }
 
 #[async_trait]
 impl StorageNameSpace for InMemoryDocStatusStorage {
     fn namespace(&self) -> &str {
-        &self.namespace
+        self.table.namespace()
     }
 
     fn workspace(&self) -> &str {
-        &self.workspace
+        self.table.workspace()
     }
 
     fn global_config(&self) -> &JsonMap {
-        &self.global_config
+        self.table.global_config()
     }
 
-    async fn index_done_callback(&self) -> easyrag_core::Result<()> {
-        Ok(())
-    }
+    // initialize / finalize / index_done_callback: trait defaults (no-op).
 
     async fn drop(&self, biz_id: &str) -> easyrag_core::Result<HashMap<String, String>> {
-        let removed = {
-            let mut data = self.data.lock();
-            let before = data.len();
-            data.retain(|_, v| record_biz(v) != Some(biz_id));
-            before - data.len()
-        };
-        let mut result = HashMap::new();
-        result.insert("status".to_string(), "success".to_string());
-        result.insert(
-            "message".to_string(),
-            format!("data dropped ({removed} records for biz {biz_id})"),
-        );
-        Ok(result)
+        StorageNameSpace::drop(&self.table, biz_id).await
     }
 }
 
 #[async_trait]
 impl KVStorage for InMemoryDocStatusStorage {
     fn embedding_func(&self) -> Option<&EmbeddingFunc> {
-        self.embedding_func.as_ref()
+        self.table.embedding_func()
     }
 
     async fn get_by_id(&self, id: &str, biz_id: &str) -> easyrag_core::Result<Option<JsonMap>> {
-        Ok(self
-            .data
-            .lock()
-            .get(id)
-            .filter(|v| record_biz(v) == Some(biz_id))
-            .cloned())
+        self.table.get_by_id(id, biz_id).await
     }
 
     async fn get_by_ids(&self, ids: &[String], biz_id: &str) -> easyrag_core::Result<Vec<JsonMap>> {
-        let data = self.data.lock();
-        Ok(ids
-            .iter()
-            .filter_map(|id| {
-                data.get(id)
-                    .filter(|v| record_biz(v) == Some(biz_id))
-                    .cloned()
-            })
-            .collect())
+        self.table.get_by_ids(ids, biz_id).await
     }
 
     async fn filter_keys(
@@ -181,48 +85,23 @@ impl KVStorage for InMemoryDocStatusStorage {
         keys: &HashSet<String>,
         biz_id: &str,
     ) -> easyrag_core::Result<HashSet<String>> {
-        let data = self.data.lock();
-        Ok(keys
-            .iter()
-            .filter(|k| !data.get(*k).is_some_and(|v| record_biz(v) == Some(biz_id)))
-            .cloned()
-            .collect())
+        self.table.filter_keys(keys, biz_id).await
     }
 
+    /// The one method that is NOT shared with `InMemoryKVStorage`.
+    /// Merge semantics: partial updates (e.g. status transitions) must not wipe
+    /// fields written at insert time (file_path, content_hash, external_id, ...).
     async fn upsert(&self, data: HashMap<String, JsonMap>, biz_id: &str) -> easyrag_core::Result<()> {
-        // Merge semantics: partial updates (e.g. status transitions) must not wipe
-        // fields written at insert time (file_path, content_hash, external_id, ...).
-        let mut store = self.data.lock();
-        for (id, mut record) in data {
-            record.insert("biz_id".to_string(), Value::String(biz_id.to_string()));
-            store
-                .entry(id)
-                .and_modify(|existing| {
-                    if record_biz(existing) == Some(biz_id) {
-                        existing.extend(record.clone());
-                    }
-                })
-                .or_insert(record);
-        }
+        self.table.upsert_merge(data, biz_id);
         Ok(())
     }
 
     async fn delete(&self, ids: &[String], biz_id: &str) -> easyrag_core::Result<()> {
-        let mut data = self.data.lock();
-        for id in ids {
-            if data.get(id).is_some_and(|v| record_biz(v) == Some(biz_id)) {
-                data.remove(id);
-            }
-        }
-        Ok(())
+        self.table.delete(ids, biz_id).await
     }
 
     async fn is_empty(&self, biz_id: &str) -> easyrag_core::Result<bool> {
-        Ok(!self
-            .data
-            .lock()
-            .values()
-            .any(|v| record_biz(v) == Some(biz_id)))
+        self.table.is_empty(biz_id).await
     }
 }
 
@@ -231,6 +110,7 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
     async fn get_status_counts(&self, biz_id: &str) -> easyrag_core::Result<HashMap<String, usize>> {
         let mut counts: HashMap<String, usize> = HashMap::new();
         for doc in self
+            .table
             .data
             .lock()
             .values()
@@ -252,7 +132,7 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
         status: DocStatus,
         biz_id: &str,
     ) -> easyrag_core::Result<HashMap<String, DocProcessingStatus>> {
-        let data = self.data.lock();
+        let data = self.table.data.lock();
         Ok(data
             .iter()
             .filter(|(_, doc)| {
@@ -269,7 +149,7 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
         biz_id: &str,
     ) -> easyrag_core::Result<HashMap<String, DocProcessingStatus>> {
         let status_values: HashSet<&str> = statuses.iter().map(|s| s.value()).collect();
-        let data = self.data.lock();
+        let data = self.table.data.lock();
         Ok(data
             .iter()
             .filter(|(_, doc)| {
@@ -289,7 +169,7 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
         track_id: &str,
         biz_id: &str,
     ) -> easyrag_core::Result<HashMap<String, DocProcessingStatus>> {
-        let data = self.data.lock();
+        let data = self.table.data.lock();
         Ok(data
             .iter()
             .filter(|(_, doc)| {
@@ -313,7 +193,7 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
     ) -> easyrag_core::Result<(Vec<(String, DocProcessingStatus)>, usize)> {
         let filter_values = resolve_status_filter_values(status_filter, status_filters);
         let prefix = file_path_prefix.map(str::trim).filter(|p| !p.is_empty());
-        let data = self.data.lock();
+        let data = self.table.data.lock();
         let mut filtered: Vec<(String, &JsonMap)> = data
             .iter()
             .filter(|(_, doc)| {
@@ -360,7 +240,7 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
         file_path: &str,
         biz_id: &str,
     ) -> easyrag_core::Result<Option<JsonMap>> {
-        let data = self.data.lock();
+        let data = self.table.data.lock();
         Ok(data
             .values()
             .find(|doc| {
@@ -375,7 +255,7 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
         basename: &str,
         biz_id: &str,
     ) -> easyrag_core::Result<Option<(String, JsonMap)>> {
-        let data = self.data.lock();
+        let data = self.table.data.lock();
         Ok(data
             .iter()
             .find(|(_, doc)| {
@@ -394,7 +274,7 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
         content_hash: &str,
         biz_id: &str,
     ) -> easyrag_core::Result<Option<(String, JsonMap)>> {
-        let data = self.data.lock();
+        let data = self.table.data.lock();
         Ok(data
             .iter()
             .find(|(_, doc)| {

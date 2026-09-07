@@ -164,6 +164,8 @@ mod kv {
             .unwrap();
         let result = storage.drop(BIZ).await.unwrap();
         assert_eq!("success", result["status"]);
+        // Drop envelope guardrail: the shared helper must keep this text.
+        assert_eq!("data dropped (2 records for biz default)", result["message"]);
         assert!(storage.is_empty(BIZ).await.unwrap());
         assert_eq!(0, storage.size());
     }
@@ -374,6 +376,7 @@ mod vector {
             .unwrap();
         let result = storage.drop(BIZ).await.unwrap();
         assert_eq!("success", result["status"]);
+        assert_eq!("data dropped (2 vectors for biz default)", result["message"]);
         assert_eq!(0, storage.size());
     }
 
@@ -683,6 +686,7 @@ mod graph {
             .unwrap();
         let result = storage.drop(BIZ).await.unwrap();
         assert_eq!("success", result["status"]);
+        assert_eq!("data dropped (2 nodes for biz default)", result["message"]);
         assert_eq!(0, storage.node_count());
         assert_eq!(0, storage.edge_count());
     }

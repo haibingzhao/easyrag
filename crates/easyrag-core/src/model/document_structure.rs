@@ -18,14 +18,37 @@ pub struct SectionNode {
     pub children: Vec<SectionNode>,
 }
 
+/// Separator joining section titles into a human-readable path
+/// (e.g. "Chapter 1 > 1.1 Introduction > Background").
+pub const SECTION_PATH_SEP: &str = " > ";
+
 impl SectionNode {
     /// Returns the full path from root to this node
     /// (e.g. "Chapter 1 > 1.1 Introduction > Background").
     pub fn path_with(&self, ancestors: &[String]) -> String {
         let mut parts: Vec<&str> = ancestors.iter().map(|s| s.as_str()).collect();
         parts.push(&self.title);
-        parts.join(" > ")
+        parts.join(SECTION_PATH_SEP)
     }
+}
+
+/// Extract the `metadata.section_path` array from a chunk map and join it into a
+/// `" > "` path string. Returns `None` when the chunk carries no section path.
+///
+/// Shared by the query/ingest paths that previously inlined the identical
+/// five-line extraction; uses the same separator as [`SectionNode::path_with`].
+pub fn section_path_of(chunk: &crate::JsonMap) -> Option<String> {
+    chunk
+        .get("metadata")
+        .and_then(|m| m.get("section_path"))
+        .and_then(|p| p.as_array())
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(SECTION_PATH_SEP)
+        })
 }
 
 /// Document-level structure index stored in KV storage.

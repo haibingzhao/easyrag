@@ -1,0 +1,9 @@
+---
+source: crates/easyrag-pipeline/tests/extraction_golden.rs
+---
+entities=3
+  entity name="Upper Case Row" type="Person" desc="Keyword match is case-insensitive"
+  entity name="Four" type="Person" desc="Exactly four parts is an entity"
+  entity name="After Blank And Delimiter" type="Person" desc="Blank lines are dropped"
+relationships=1
+  rel src="A" tgt="B" kw="kw" desc="Mixed case relation prefix"

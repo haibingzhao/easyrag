@@ -3,6 +3,7 @@
 pub mod doc_status;
 pub mod graph;
 pub mod kv;
+mod kv_table;
 pub mod tenant_config;
 pub mod user;
 pub mod vector;

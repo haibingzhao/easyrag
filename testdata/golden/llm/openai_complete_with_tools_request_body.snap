@@ -1,0 +1,4 @@
+---
+source: crates/easyrag-llm/tests/openai_client.rs
+---
+{"model":"test-model","messages":[{"role":"system","content":"sys"},{"role":"user","content":"find docs"},{"role":"assistant","content":"thinking","tool_calls":[{"id":"call_0","type":"function","function":{"name":"list_documents","arguments":"{}"}},{"id":"call_1","type":"function","function":{"name":"get_document_structure","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_0","content":"1. doc_id=d1"},{"role":"tool","tool_call_id":"call_1","content":"{\"tree\":[]}"}],"tools":[{"type":"function","function":{"name":"list_documents","description":"list_documents description","parameters":{"type":"object"}}}],"stream":false}

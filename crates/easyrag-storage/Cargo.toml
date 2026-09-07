@@ -31,6 +31,7 @@ serial_test = { workspace = true }
 tokio-test = "0.4"
 sqlx = { workspace = true }
 uuid = { workspace = true }
+insta = { workspace = true }
 
 [features]
 default = ["memory", "json"]

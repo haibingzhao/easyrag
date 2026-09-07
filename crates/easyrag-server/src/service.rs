@@ -111,7 +111,7 @@ impl AuthService {
     pub fn generate_token(&self, username: &str) -> AppResult<String> {
         self.jwt
             .generate_token(username)
-            .map_err(|e| AppError::status(500, format!("JWT generation failed: {e}")))
+            .map_err(|e| AppError::internal(format!("JWT generation failed: {e}")))
     }
 
     /// Seed the default `admin/admin` user when the user store is empty
@@ -121,7 +121,7 @@ impl AuthService {
             return Ok(());
         }
         let hash = bcrypt::hash(DEFAULT_ADMIN_PASSWORD, BCRYPT_COST)
-            .map_err(|e| AppError::status(500, format!("BCrypt hashing failed: {e}")))?;
+            .map_err(|e| AppError::internal(format!("BCrypt hashing failed: {e}")))?;
         let now = Utc::now();
         let admin = UserRecord {
             username: DEFAULT_ADMIN_USERNAME.to_string(),
@@ -467,7 +467,7 @@ impl DocumentLifecycleService {
             });
         }
         if existing.is_some() {
-            Self::check_pipeline_busy(&ops.pipeline)?;
+            check_pipeline_busy(&ops.pipeline)?;
             self.cascade_delete_document(&doc_id, false, false, ops, biz_id).await?;
         }
         ops.pipeline
@@ -507,10 +507,9 @@ impl DocumentLifecycleService {
             .and_then(|m| m.get("external_id"))
             .and_then(JsonValue::as_str);
         if status.is_none() || stored_external_id != Some(external_id) {
-            return Err(AppError::status(
-                404,
-                format!("No document with external_id: {external_id}"),
-            ));
+            return Err(AppError::not_found(format!(
+                "No document with external_id: {external_id}"
+            )));
         }
         let status = status.unwrap();
         let doc = doc.unwrap();
@@ -543,7 +542,7 @@ impl DocumentLifecycleService {
             .kv_storage
             .get_by_id(doc_id, biz_id)
             .await?
-            .ok_or_else(|| AppError::status(404, format!("Document not found: {doc_id}")))?;
+            .ok_or_else(|| AppError::not_found(format!("Document not found: {doc_id}")))?;
         let status = ops.bundle.doc_status_storage.get_by_id(doc_id, biz_id).await?;
         let content_length = doc
             .get("content")
@@ -586,7 +585,7 @@ impl DocumentLifecycleService {
             .kv_storage
             .get_by_id(doc_id, biz_id)
             .await?
-            .ok_or_else(|| AppError::status(404, format!("Document not found: {doc_id}")))?;
+            .ok_or_else(|| AppError::not_found(format!("Document not found: {doc_id}")))?;
 
         // Validate before claiming: a claim flips status to processing, and a
         // post-claim failure would leave the document unclaimable forever.
@@ -696,20 +695,28 @@ impl DocumentLifecycleService {
             "final_status": "processing",
         }))
     }
+}
 
-    fn check_pipeline_busy(pipeline: &IngestionPipeline) -> AppResult<()> {
-        let busy = pipeline
-            .pipeline_status()
-            .get("busy")
-            .and_then(JsonValue::as_bool)
-            .unwrap_or(false);
-        if busy {
-            return Err(AppError::conflict(
-                "Pipeline is busy processing documents. Please wait or cancel first.",
-            ));
-        }
-        Ok(())
+/// P2.16 pipeline concurrency guard: 409 while the pipeline is busy.
+/// Checks the target workspace's pipeline so cross-workspace requests
+/// are not blocked by the default workspace's busy state.
+///
+/// Single source of truth shared by `service` and `routes::documents`.
+/// `AppError::conflict(msg)` and `AppError::status(409, msg)` are wire-identical
+/// (both build `Status(409, msg)`), so merging the two former copies is
+/// behavior-preserving.
+pub(crate) fn check_pipeline_busy(pipeline: &IngestionPipeline) -> AppResult<()> {
+    let busy = pipeline
+        .pipeline_status()
+        .get("busy")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    if busy {
+        return Err(AppError::conflict(
+            "Pipeline is busy processing documents. Please wait or cancel first.",
+        ));
     }
+    Ok(())
 }
 
 #[cfg(test)]

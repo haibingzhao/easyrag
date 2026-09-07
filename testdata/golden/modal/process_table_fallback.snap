@@ -1,0 +1,10 @@
+---
+source: crates/easyrag-pipeline/tests/modal_processor_fallback.rs
+---
+entity_name: table_598a1c5ce11433f9e2f2091ed5b05267
+entity_type: table
+description: Table content: <table><tr><td>a</td><td>b</td></tr></table>
+chunk_content: <table><tr><td>a</td><td>b</td></tr></table>
+success: true
+error_message: None
+metadata: [fallback=true]

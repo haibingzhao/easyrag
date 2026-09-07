@@ -1,0 +1,9 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+MATCH (a:`test`)-[r:DIRECTED]->(b:`test`) RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props
+--- params[0] ---
+{
+  "biz": ""
+}

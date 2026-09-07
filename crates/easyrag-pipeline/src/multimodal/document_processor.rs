@@ -17,9 +17,9 @@ use super::callback::CallbackManager;
 use super::config::RagAnythingConfig;
 use super::context::{ContextConfig, ContextExtractor};
 use super::model::{ContentItem, ModalProcessResult, ParseResult};
-use super::parser::{ParseCache, ParserRegistry};
+use super::parser::{ParseCache, ExternalParserRegistry};
 use super::processor::ModalProcessorRegistry;
-use super::util::get_file_reference;
+use super::util::{get_file_reference, take_chars};
 
 /// Core document processor orchestrating the full multimodal pipeline.
 /// Flow: parse → separate_content → insert_text → process_modals → update_status
@@ -72,7 +72,7 @@ impl DocumentProcessor {
     fn parser(&self) -> easyrag_core::Result<&Arc<dyn super::parser::MultimodalParser>> {
         //: resolution errors surface on first access.
         if self.parser.get().is_none() {
-            let parser = ParserRegistry::get_parser(&self.config.parser)?;
+            let parser = ExternalParserRegistry::get_parser(&self.config.parser)?;
             let _ = self.parser.set(parser);
         }
         Ok(self.parser.get().expect("parser initialized above"))
@@ -440,11 +440,6 @@ pub fn generate_content_based_doc_id(content_list: &[ContentItem]) -> String {
         .collect();
     let content_signature = parts.join("\n");
     compute_mdhash_id(&content_signature, "doc-")
-}
-
-/// Take the first `n` chars.
-fn take_chars(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
 }
 
 /// Resolve a path the way does (no

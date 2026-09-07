@@ -1,0 +1,7 @@
+---
+source: crates/easyrag-storage/tests/postgres_storage.rs
+assertion_line: 332
+---
+INSERT INTO graph_edges_graph (id, workspace, biz_id, source, target, properties, updated_at)
+                 VALUES ('Alice-Bob', 'test_ws', 'default', 'Alice', 'Bob', '{"weight":1.0}'::jsonb, NOW())
+                 ON CONFLICT (id, workspace, biz_id) DO UPDATE SET properties = '{"weight":1.0}'::jsonb, updated_at = NOW()

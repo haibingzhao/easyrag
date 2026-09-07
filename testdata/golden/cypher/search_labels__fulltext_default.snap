@@ -1,0 +1,12 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+CALL db.index.fulltext.queryNodes(`test_entity_fulltext`, $query) YIELD node WHERE $ws IN labels(node) AND node.biz_id = $biz RETURN node.entity_id AS label LIMIT $limit
+--- params[0] ---
+{
+  "biz": "default",
+  "query": "Learning",
+  "limit": 10,
+  "ws": "test"
+}

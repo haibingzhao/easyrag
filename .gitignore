@@ -42,3 +42,9 @@ dist/
 .docs
 
 .qoder
+
+# insta pending snapshots — regenerate locally (INSTA_UPDATE=always), never commit
+*.snap.new
+
+# local scratch/attachment images
+vibe_images/

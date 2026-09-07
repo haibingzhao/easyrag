@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod pagination;
 pub mod routes;
 pub mod scan_stats;
 pub mod service;

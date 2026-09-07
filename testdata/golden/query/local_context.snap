@@ -1,0 +1,39 @@
+---
+source: crates/easyrag-pipeline/tests/query_engine.rs
+---
+
+Knowledge Graph Data (Entity):
+
+```json
+[
+  {
+    "entity_name": "Alice",
+    "entity_type": "Person",
+    "description": "A researcher who studies retrieval-augmented generation."
+  }
+]
+```
+
+Knowledge Graph Data (Relationship):
+
+```json
+[]
+```
+
+Document Chunks (Each entry has a reference_id refer to the `Reference Document List`; the optional `content_headings` field gives the chunk's heading path within its source document, e.g. `Section 1 → Subsection 1.2`):
+
+```json
+[
+  {
+    "reference_id": "1",
+    "content": "",
+    "file_path": "unknown"
+  }
+]
+```
+
+Reference Document List (Each entry starts with a [reference_id] that corresponds to entries in the Document Chunks):
+
+```
+[1] unknown
+```

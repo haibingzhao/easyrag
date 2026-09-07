@@ -520,14 +520,21 @@ pub struct DocumentProcessingOptions {
     pub build_structure: bool,
 }
 
-/// Parser registry — routes files to parsers by extension with optional
-/// `file.[engine].ext` hint syntax.
-pub struct ParserRegistry {
+/// Parser registry for text parsers — routes files to parsers by extension
+/// with optional `file.[engine].ext` hint syntax.
+///
+/// A per-instance value (two `HashMap`s of `Arc<dyn DocumentParser>`) and
+/// unrelated to
+/// [`ExternalParserRegistry`](crate::multimodal::parser::ExternalParserRegistry),
+/// the process-global registry of external-tool multimodal parsers. The two
+/// only ever shared a name, so they are named apart rather than abstracted
+/// together.
+pub struct TextParserRegistry {
     parser_map: HashMap<String, Arc<dyn DocumentParser>>,
     named_engines: HashMap<String, Arc<dyn DocumentParser>>,
 }
 
-impl Default for ParserRegistry {
+impl Default for TextParserRegistry {
     fn default() -> Self {
         Self::with_parsers(vec![
             Arc::new(PlainTextParser),
@@ -542,7 +549,7 @@ impl Default for ParserRegistry {
     }
 }
 
-impl ParserRegistry {
+impl TextParserRegistry {
     pub fn with_parsers(parsers: Vec<Arc<dyn DocumentParser>>) -> Self {
         let mut parser_map = HashMap::new();
         for parser in &parsers {

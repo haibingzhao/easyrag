@@ -1,0 +1,4 @@
+---
+source: crates/easyrag-storage/tests/postgres_storage.rs
+---
+INSERT INTO vector_vectors (id, workspace, biz_id, content, embedding, updated_at) VALUES ('chunk1', 'test_ws', 'default', '{"content":"hello world"}'::jsonb, '[0,0,0,0]'::vector, NOW()) ON CONFLICT (id, workspace, biz_id) DO UPDATE SET content = EXCLUDED.content, embedding = COALESCE(EXCLUDED.embedding, vector_vectors.embedding), updated_at = NOW()

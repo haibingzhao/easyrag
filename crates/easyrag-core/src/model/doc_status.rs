@@ -121,6 +121,73 @@ pub struct DocProcessingStatus {
 }
 
 impl DocProcessingStatus {
+    /// Build a status record from an **already-unwrapped** field map.
+    ///
+    /// Both storage backends persist the same logical fields but wrap them
+    /// differently: the in-memory backend keeps them flat at the record root,
+    /// while PostgreSQL nests them inside the `content` JSONB column and stores
+    /// `status`/`created_at`/`updated_at`/`biz_id` as real table columns. Each
+    /// backend therefore passes its own unwrapped map (`doc` for memory,
+    /// `content` for postgres) and then overwrites the fields that live outside
+    /// it. Sharing this single mapper is what makes per-field drift between
+    /// backends structurally impossible — previously postgres hardcoded
+    /// `chunks_list`/`error_msg`/`metadata`/`multimodal_processed` empty (A-1)
+    /// even though the values were present in the payload it had just read.
+    pub fn from_json(fields: &crate::JsonMap) -> Self {
+        let get_str = |key: &str| -> String {
+            fields
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_opt_str = |key: &str| -> Option<String> {
+            fields
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+        Self {
+            content_summary: get_str("content_summary"),
+            content_length: fields
+                .get("content_length")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            file_path: get_str("file_path"),
+            status: DocStatus::from_value(
+                fields
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("pending"),
+            )
+            .unwrap_or(DocStatus::Pending),
+            created_at: get_str("created_at"),
+            updated_at: get_str("updated_at"),
+            track_id: get_opt_str("track_id"),
+            chunks_count: fields.get("chunks_count").and_then(|v| v.as_i64()),
+            chunks_list: fields
+                .get("chunks_list")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            error_msg: get_opt_str("error_msg"),
+            metadata: fields
+                .get("metadata")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default(),
+            multimodal_processed: fields.get("multimodal_processed").and_then(|v| v.as_bool()),
+            content_hash: get_opt_str("content_hash"),
+            has_structure: fields.get("has_structure").and_then(|v| v.as_bool()) == Some(true),
+            external_id: get_opt_str("external_id"),
+            biz_id: get_str("biz_id"),
+        }
+    }
+
     /// Resolve effective status considering multimodal_processed flag.
     pub fn effective_status(&self) -> DocStatus {
         if self.multimodal_processed == Some(false) && self.status == DocStatus::Processed {

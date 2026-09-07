@@ -418,3 +418,380 @@ async fn match_queries_filter_by_biz_id() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1.6 — Cypher text golden guardrail.
+//
+// Every Cypher string in neo4j.rs is hand-built by `format!` concatenation, so
+// a single misplaced brace/backtick/space silently changes the query shape (and
+// Neo4j returns an empty set instead of erroring). Phase 1.6 extracts a fragment
+// library (node_pat/edge_pat/degree_pat/unwind_ids/json_ids); these snapshots pin
+// the EXACT Cypher bytes AND the bound parameter map for every operation, across
+// both scope branches (exact `$biz` vs empty-biz read-path wildcard) and the
+// search_labels fulltext→CONTAINS fallback. The fragment refactor must leave
+// every snapshot byte-identical ([equivalent] proof).
+//
+// Snapshots land in `<workspace>/testdata/golden/cypher/`. Regenerate
+// deliberately:
+// `INSTA_UPDATE=always cargo test -p easyrag-storage --features neo4j --test neo4j_graph_storage`.
+// ---------------------------------------------------------------------------
+
+fn cypher_golden_dir() -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root above crates/easyrag-storage");
+    root.join("testdata").join("golden").join("cypher")
+}
+
+/// Snapshot the exact Cypher bytes + bound params for every executed query.
+/// Params are rendered as pretty JSON (deterministic key order) so a dropped or
+/// renamed `$bind` is caught, not just a changed query string.
+fn snap_cypher(name: &str, executed: &[(String, Neo4jParams)]) {
+    let mut rendered = String::new();
+    for (i, (q, p)) in executed.iter().enumerate() {
+        rendered.push_str(&format!("--- query[{}] ---\n{}\n", i, q));
+        let params_json = serde_json::to_string_pretty(&JsonValue::Object(p.clone()))
+            .expect("params serialize");
+        rendered.push_str(&format!("--- params[{}] ---\n{}\n", i, params_json));
+    }
+    insta::with_settings!({
+        snapshot_path => cypher_golden_dir(),
+        prepend_module_to_snapshot => false,
+        omit_expression => true,
+    }, {
+        insta::assert_snapshot!(name, rendered);
+    });
+}
+
+/// A node result row: `{"n": {"entity_id": id, ...}}` (matches `node_to_map`).
+fn node_row(id: &str) -> Neo4jRow {
+    let mut n = Neo4jRow::new();
+    n.insert("entity_id".to_string(), JsonValue::String(id.to_string()));
+    n.insert(
+        "description".to_string(),
+        JsonValue::String("desc".to_string()),
+    );
+    let mut m = Neo4jRow::new();
+    m.insert("n".to_string(), JsonValue::Object(n));
+    m
+}
+
+#[tokio::test]
+async fn cypher_golden_initialize() {
+    let (storage, fake) = create_storage("test");
+    storage.initialize().await.unwrap();
+    // Composite (entity_id, biz_id) index + per-workspace fulltext index.
+    assert_eq!(fake.executed_queries().len(), 2);
+    snap_cypher("initialize", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_drop() {
+    let (storage, fake) = create_storage("myws");
+    storage.drop(BIZ).await.unwrap();
+    assert_eq!(fake.executed_queries().len(), 1);
+    snap_cypher("drop", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_single_node_reads() {
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![bool_row("exists", true), int_row("degree", 3)]);
+    storage.has_node("entity1", BIZ).await.unwrap();
+    snap_cypher("has_node", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![node_row("entity1")]);
+    storage.get_node("entity1", BIZ).await.unwrap();
+    snap_cypher("get_node", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![int_row("degree", 5)]);
+    storage.node_degree("hub", BIZ).await.unwrap();
+    snap_cypher("node_degree", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_edge_degree() {
+    // edge_degree delegates to node_degree twice → 2 identical queries.
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![int_row("degree", 2)]);
+    storage.edge_degree("A", "B", BIZ).await.unwrap();
+    assert_eq!(fake.executed_queries().len(), 2);
+    snap_cypher("edge_degree", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_edge_reads() {
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![bool_row("exists", true)]);
+    storage.has_edge("A", "B", BIZ).await.unwrap();
+    snap_cypher("has_edge", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    let mut rel = Neo4jRow::new();
+    rel.insert("relation".to_string(), JsonValue::String("knows".to_string()));
+    let mut row = Neo4jRow::new();
+    row.insert("r".to_string(), JsonValue::Object(rel));
+    fake.set_results(vec![row]);
+    storage.get_edge("A", "B", BIZ).await.unwrap();
+    snap_cypher("get_edge", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_get_node_edges() {
+    // has_node gate (exists=true) then the edge-list query → 2 queries.
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![bool_row("exists", true)]);
+    storage.get_node_edges("A", BIZ).await.unwrap();
+    assert_eq!(fake.executed_queries().len(), 2);
+    snap_cypher("get_node_edges", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_single_writes() {
+    let (storage, fake) = create_storage("test");
+    storage
+        .upsert_node(
+            "node1",
+            json_map(json!({"entity_type": "Person", "description": "A test"})),
+            BIZ,
+        )
+        .await
+        .unwrap();
+    snap_cypher("upsert_node", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    storage
+        .upsert_edge("A", "B", json_map(json!({"relation": "knows"})), BIZ)
+        .await
+        .unwrap();
+    snap_cypher("upsert_edge", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    storage.delete_node("victim", BIZ).await.unwrap();
+    snap_cypher("delete_node", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_remove_bulk() {
+    let (storage, fake) = create_storage("test");
+    storage
+        .remove_nodes(
+            &["n1".to_string(), "n2".to_string(), "n3".to_string()],
+            BIZ,
+        )
+        .await
+        .unwrap();
+    snap_cypher("remove_nodes", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    storage
+        .remove_edges(
+            &[("A".to_string(), "B".to_string())],
+            BIZ,
+        )
+        .await
+        .unwrap();
+    snap_cypher("remove_edges", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_label_listing() {
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![str_row("label", "Apple")]);
+    storage.get_all_labels(BIZ).await.unwrap();
+    snap_cypher("get_all_labels", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_popular_labels_both_scopes() {
+    // Exact biz scope.
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![str_row("label", "Hub")]);
+    storage.get_popular_labels(10, BIZ).await.unwrap();
+    snap_cypher("get_popular_labels__default", &fake.executed_queries());
+
+    // Empty biz_id = read-path wildcard (node_scope drops the biz predicate).
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![str_row("label", "Hub")]);
+    storage.get_popular_labels(10, "").await.unwrap();
+    snap_cypher("get_popular_labels__wildcard", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_all_nodes_edges_both_scopes() {
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![node_row("A")]);
+    storage.get_all_nodes(BIZ).await.unwrap();
+    snap_cypher("get_all_nodes__default", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![node_row("A")]);
+    storage.get_all_nodes("").await.unwrap();
+    snap_cypher("get_all_nodes__wildcard", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    storage.get_all_edges(BIZ).await.unwrap();
+    snap_cypher("get_all_edges__default", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    storage.get_all_edges("").await.unwrap();
+    snap_cypher("get_all_edges__wildcard", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_search_labels_paths() {
+    // Fulltext success (exact biz): single query, biz post-filter present.
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![str_row("label", "Machine Learning")]);
+    storage.search_labels("Learning", 10, BIZ).await.unwrap();
+    assert_eq!(fake.executed_queries().len(), 1);
+    snap_cypher("search_labels__fulltext_default", &fake.executed_queries());
+
+    // Fulltext failure → CONTAINS fallback (exact biz): 2 queries.
+    let (storage, fake) = create_storage("test");
+    fake.set_handler(Box::new(|query, _params| {
+        if query.contains("fulltext") {
+            Err(CoreError::Internal("No fulltext index".to_string()))
+        } else {
+            Ok(vec![str_row("label", "Machine Learning")])
+        }
+    }));
+    storage.search_labels("Learning", 10, BIZ).await.unwrap();
+    assert_eq!(fake.executed_queries().len(), 2);
+    snap_cypher("search_labels__fallback_default", &fake.executed_queries());
+
+    // Fulltext failure → CONTAINS fallback (empty biz wildcard): 2 queries,
+    // biz post-filter dropped on both, node_scope wildcard on the fallback.
+    let (storage, fake) = create_storage("test");
+    fake.set_handler(Box::new(|query, _params| {
+        if query.contains("fulltext") {
+            Err(CoreError::Internal("No fulltext index".to_string()))
+        } else {
+            Ok(vec![str_row("label", "Machine Learning")])
+        }
+    }));
+    storage.search_labels("Learning", 10, "").await.unwrap();
+    assert_eq!(fake.executed_queries().len(), 2);
+    snap_cypher("search_labels__fallback_wildcard", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_full_graph_both_scopes() {
+    // get_knowledge_graph(None) → get_full_graph: node MATCH + edge MATCH.
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![node_row("A")]);
+    storage
+        .get_knowledge_graph(None, 2, 10, BIZ)
+        .await
+        .unwrap();
+    assert_eq!(fake.executed_queries().len(), 2);
+    snap_cypher("get_full_graph__default", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![node_row("A")]);
+    storage
+        .get_knowledge_graph(Some("*"), 2, 10, "")
+        .await
+        .unwrap();
+    assert_eq!(fake.executed_queries().len(), 2);
+    snap_cypher("get_full_graph__wildcard", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_sub_graph_both_scopes() {
+    // get_knowledge_graph(Some(label)) → get_sub_graph: variable-length path
+    // query + (nodes non-empty) inter-node edge query.
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![node_row("A")]);
+    storage
+        .get_knowledge_graph(Some("A"), 2, 10, BIZ)
+        .await
+        .unwrap();
+    assert_eq!(fake.executed_queries().len(), 2);
+    snap_cypher("get_sub_graph__default", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![node_row("A")]);
+    storage
+        .get_knowledge_graph(Some("A"), 2, 10, "")
+        .await
+        .unwrap();
+    assert_eq!(fake.executed_queries().len(), 2);
+    snap_cypher("get_sub_graph__wildcard", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_batch_node_reads() {
+    let ids = ["a".to_string(), "b".to_string()];
+
+    let (storage, fake) = create_storage("test");
+    fake.set_results(vec![node_row("a")]);
+    storage.get_nodes_batch(&ids, BIZ).await.unwrap();
+    snap_cypher("get_nodes_batch", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    storage.node_degrees_batch(&ids, BIZ).await.unwrap();
+    snap_cypher("node_degrees_batch", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    storage.has_nodes_batch(&ids, BIZ).await.unwrap();
+    snap_cypher("has_nodes_batch", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    storage.get_nodes_edges_batch(&ids, BIZ).await.unwrap();
+    snap_cypher("get_nodes_edges_batch", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_batch_writes() {
+    let (storage, fake) = create_storage("test");
+    storage
+        .upsert_nodes_batch(
+            &[
+                ("a".to_string(), json_map(json!({"type": "X"}))),
+                ("b".to_string(), json_map(json!({"type": "Y"}))),
+            ],
+            BIZ,
+        )
+        .await
+        .unwrap();
+    snap_cypher("upsert_nodes_batch", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    storage
+        .upsert_edges_batch(
+            &[
+                (
+                    "A".to_string(),
+                    "B".to_string(),
+                    json_map(json!({"rel": "r1"})),
+                ),
+                (
+                    "C".to_string(),
+                    "D".to_string(),
+                    json_map(json!({"rel": "r2"})),
+                ),
+            ],
+            BIZ,
+        )
+        .await
+        .unwrap();
+    snap_cypher("upsert_edges_batch", &fake.executed_queries());
+}
+
+#[tokio::test]
+async fn cypher_golden_batch_edge_reads() {
+    let pairs = [("A".to_string(), "B".to_string())];
+
+    let (storage, fake) = create_storage("test");
+    storage.edge_degrees_batch(&pairs, BIZ).await.unwrap();
+    snap_cypher("edge_degrees_batch", &fake.executed_queries());
+
+    let (storage, fake) = create_storage("test");
+    storage.get_edges_batch(&pairs, BIZ).await.unwrap();
+    snap_cypher("get_edges_batch", &fake.executed_queries());
+}

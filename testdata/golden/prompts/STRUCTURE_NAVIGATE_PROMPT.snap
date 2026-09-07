@@ -1,0 +1,25 @@
+---
+source: crates/easyrag-core/tests/prompt_golden.rs
+---
+---Task---
+You are a document expert. Given a query and the TOP-LEVEL sections of a document,
+reason about which sections are most likely to contain the answer.
+Think step by step like a human expert navigating a table of contents.
+
+---Document Info---
+Title: {doc_title}
+Description: {doc_description}
+
+---Top-Level Sections---
+{sections}
+
+---Query---
+{query}
+
+---Instructions---
+1. Analyze what the query is really asking for
+2. Reason about which section(s) would contain this information
+3. Select 1-3 most promising sections
+
+Return JSON:
+{"thinking": "<step-by-step reasoning about where the answer likely is>", "selected_sections": ["<section_id_1>"], "confidence": "high|medium|low"}

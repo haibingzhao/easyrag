@@ -13,7 +13,7 @@ use easyrag_core::JsonMap;
 use easyrag_pipeline::multimodal::context::{ContextConfig, ContextExtractor};
 use easyrag_pipeline::multimodal::document_processor::generate_content_based_doc_id;
 use easyrag_pipeline::multimodal::model::{ContentItem, ParseResult};
-use easyrag_pipeline::multimodal::parser::{MultimodalParser, ParserRegistry};
+use easyrag_pipeline::multimodal::parser::{MultimodalParser, ExternalParserRegistry};
 use easyrag_pipeline::multimodal::{
     BatchProcessor, DocumentProcessor, MultimodalQueryEngine, ParseCache,
     RAGAnything, RagAnythingConfig, TextQueryBackend,
@@ -297,7 +297,7 @@ impl MultimodalParser for EmptyParser {
 
 #[tokio::test]
 async fn parse_document_errors_on_empty_extraction() {
-    ParserRegistry::register_parser(
+    ExternalParserRegistry::register_parser(
         "empty-parser",
         Arc::new(|| Arc::new(EmptyParser) as Arc<dyn MultimodalParser>),
     );
@@ -339,7 +339,7 @@ async fn parse_document_errors_on_empty_extraction() {
 
 #[tokio::test]
 async fn process_document_complete_roundtrip_with_cache() {
-    ParserRegistry::register_parser(
+    ExternalParserRegistry::register_parser(
         "test-parser",
         Arc::new(|| Arc::new(TestParser) as Arc<dyn MultimodalParser>),
     );
@@ -502,7 +502,7 @@ async fn query_with_multimodal_cache_hit() {
 
 #[tokio::test]
 async fn batch_processor_discovers_and_processes_files() {
-    ParserRegistry::register_parser(
+    ExternalParserRegistry::register_parser(
         "test-parser",
         Arc::new(|| Arc::new(TestParser) as Arc<dyn MultimodalParser>),
     );
@@ -576,7 +576,7 @@ async fn batch_processor_discovers_and_processes_files() {
 
 #[tokio::test]
 async fn rag_anything_lifecycle_and_info() {
-    ParserRegistry::register_parser(
+    ExternalParserRegistry::register_parser(
         "test-parser",
         Arc::new(|| Arc::new(TestParser) as Arc<dyn MultimodalParser>),
     );

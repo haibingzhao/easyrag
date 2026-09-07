@@ -1,0 +1,10 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+event_type=multimodal_start
+file_path=None
+doc_id=None
+stage=None
+details={}
+duration_ms=None
+error=None

@@ -33,6 +33,22 @@ impl AppError {
     pub fn payload_too_large(message: impl Into<String>) -> Self {
         Self::Status(413, message.into())
     }
+
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::Status(404, message.into())
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::Status(401, message.into())
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Status(500, message.into())
+    }
+
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self::Status(429, message.into())
+    }
 }
 
 // Explicit conversions (a blanket `impl<E: Into<CoreError>>` would conflict

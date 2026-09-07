@@ -1,0 +1,15 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+UNWIND $edges AS edge MATCH (a:`test` {entity_id: edge.src, biz_id: $biz})-[r:DIRECTED]-(b:`test` {entity_id: edge.tgt, biz_id: $biz}) DELETE r
+--- params[0] ---
+{
+  "biz": "default",
+  "edges": [
+    {
+      "src": "A",
+      "tgt": "B"
+    }
+  ]
+}

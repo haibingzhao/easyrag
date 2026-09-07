@@ -1,0 +1,19 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+json={"documents_processed":1,"documents_failed":1,"success_rate":0.5,"total_chunks":4,"total_entities":5,"total_relations":6,"avg_processing_time_ms":70,"queries_executed":1,"avg_query_time_ms":80}
+calls:
+on_event(parse_start)
+on_parse_start(file_path=, doc_id=d)
+on_event(chunk_end)
+on_chunk_end(doc_id=d, chunks_count=4)
+on_event(extraction_end)
+on_extraction_end(doc_id=d, entities_count=5, relations_count=6)
+on_event(document_complete)
+on_document_complete(doc_id=d, file_path=, duration_ms=70)
+on_event(document_failed)
+on_document_failed(doc_id=d, file_path=, error=)
+on_event(query_end)
+on_query_end(query=q, mode=m, duration_ms=80)
+on_event(batch_end)
+on_batch_end(processed=1, failed=2, duration_ms=90)

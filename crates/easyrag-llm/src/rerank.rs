@@ -4,6 +4,11 @@ use easyrag_core::llm::service::{RerankResult, RerankService};
 use serde_json::{json, Value as JsonValue};
 use std::time::Duration;
 
+use crate::transport::{HttpEndpointConfig, LlmTransport};
+
+/// Rerank endpoint, appended to the provider-derived base URL.
+const RERANK_PATH: &str = "/rerank";
+
 /// Supported rerank providers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RerankProvider {
@@ -38,6 +43,33 @@ impl RerankConfig {
             connect_timeout: Duration::from_secs(30),
         }
     }
+
+    /// Resolve the base URL: an explicit override wins, otherwise the
+    /// provider's well-known endpoint. `Custom` with no override is a
+    /// configuration error rather than a guess, and stays one.
+    pub fn effective_base_url(&self) -> easyrag_core::Result<String> {
+        match &self.base_url {
+            Some(url) => Ok(url.clone()),
+            None => match self.provider {
+                RerankProvider::Jina => Ok("https://api.jina.ai/v1".to_string()),
+                RerankProvider::Cohere => Ok("https://api.cohere.ai/v1".to_string()),
+                RerankProvider::Custom => Err(easyrag_core::CoreError::InvalidArgument(
+                    "Custom provider requires baseUrl".to_string(),
+                )),
+            },
+        }
+    }
+
+    /// The transport-relevant slice of this config (Phase 4.4). The derived URL
+    /// becomes the transport's base, so `RERANK_PATH` resolves to exactly the
+    /// string the client used to format by hand.
+    pub fn endpoint(&self) -> easyrag_core::Result<HttpEndpointConfig> {
+        Ok(HttpEndpointConfig::new(
+            self.effective_base_url()?,
+            self.timeout,
+            self.connect_timeout,
+        ))
+    }
 }
 
 /// HTTP rerank client with graceful degradation: on any failure the
@@ -45,34 +77,15 @@ impl RerankConfig {
 ///
 pub struct RerankClient {
     config: RerankConfig,
-    http: reqwest::Client,
-    effective_base_url: String,
+    transport: LlmTransport,
 }
 
 impl RerankClient {
     pub fn new(config: RerankConfig) -> easyrag_core::Result<Self> {
-        let effective_base_url = match &config.base_url {
-            Some(url) => url.clone(),
-            None => match config.provider {
-                RerankProvider::Jina => "https://api.jina.ai/v1".to_string(),
-                RerankProvider::Cohere => "https://api.cohere.ai/v1".to_string(),
-                RerankProvider::Custom => {
-                    return Err(easyrag_core::CoreError::InvalidArgument(
-                        "Custom provider requires baseUrl".to_string(),
-                    ))
-                }
-            },
-        };
-        let http = reqwest::Client::builder()
-            .connect_timeout(config.connect_timeout)
-            .timeout(config.timeout)
-            .build()
-            .map_err(|e| easyrag_core::CoreError::Internal(format!("http client: {e}")))?;
-        Ok(Self {
-            config,
-            http,
-            effective_base_url,
-        })
+        // The `Custom`-without-baseUrl rejection still happens before any
+        // client is built, so a bad config fails as early as it used to.
+        let transport = config.endpoint()?.build_transport()?;
+        Ok(Self { config, transport })
     }
 
     fn build_request_body(&self, query: &str, documents: &[String], top_n: Option<usize>) -> JsonValue {
@@ -143,19 +156,14 @@ impl RerankService for RerankClient {
             return Ok(Vec::new());
         }
         let body = self.build_request_body(query, &documents, top_n);
-        let outcome = async {
-            let mut request = self
-                .http
-                .post(format!("{}/rerank", self.effective_base_url))
-                .header("Content-Type", "application/json")
-                .json(&body);
-            if !self.config.api_key.is_empty() {
-                request = request.header("Authorization", format!("Bearer {}", self.config.api_key));
-            }
-            let response = request.send().await?;
-            response.text().await
-        }
-        .await;
+        // `post_optional_bearer` keeps the `Authorization` header conditional on
+        // a non-empty key and returns the raw `reqwest::Error`, whose `Display`
+        // text is exactly what the degradation warn below has always logged.
+        let api_key = (!self.config.api_key.is_empty()).then_some(self.config.api_key.as_str());
+        let outcome = self
+            .transport
+            .post_optional_bearer(RERANK_PATH, api_key, &body)
+            .await;
         match outcome {
             Ok(text) => Ok(Self::parse_response(&text, &documents)),
             Err(e) => {

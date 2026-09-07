@@ -1,10 +1,13 @@
 //! easyrag-llm: LLM clients for EasyRAG.
 //!
 //! - [`openai`]: OpenAI-compatible client (chat / SSE streaming / vision /
-//!   tool calling, circuit breakers + quadratic-backoff retries)
+//!   tool calling, circuit breakers + exponential-backoff retries)
 //! - [`ollama`]: Ollama native client (chat / NDJSON streaming / embeddings /
-//!   tool calling)
+//!   tool calling, with the same circuit breakers and retries since `[BC-4]`)
 //! - [`rerank`]: Jina / Cohere / custom rerank client with graceful fallback
+//! - [`transport`]: the HTTP layer the three clients share (client builder,
+//!   POST flavours, streaming skeleton, `ChatWireFormat`, retry + breaker
+//!   plumbing)
 //! - [`cache`]: LLM response cache (moka, flattened `{mode}:{type}:{hash}` keys)
 //! - [`roles`]: role-based LLM manager with per-role concurrency control
 //!
@@ -17,6 +20,7 @@ pub mod ollama;
 pub mod openai;
 pub mod rerank;
 pub mod roles;
+pub mod transport;
 
 use easyrag_core::llm::service::ToolDefinition;
 use serde_json::{json, Value as JsonValue};
@@ -27,6 +31,11 @@ pub use ollama::{OllamaClient, OllamaConfig};
 pub use openai::{OpenAiClient, OpenAiConfig};
 pub use rerank::{RerankClient, RerankConfig, RerankProvider};
 pub use roles::{LlmRole, RoleConfig, RoleLlmManager};
+pub use transport::{
+    build_chat_messages, build_http_client, execute_with_retry, f32_array, is_retryable_message,
+    map_reqwest_error, role_str, stream_chat, ChatWireFormat, HttpEndpointConfig, LlmTransport,
+    PostFlavour, RetryPolicy, StreamAuth,
+};
 
 // ===== Tool-calling support shared by the openai/ollama clients =====
 

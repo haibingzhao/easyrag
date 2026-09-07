@@ -129,6 +129,34 @@ impl ContentItem {
         }
     }
 
+    /// The primary text of this item plus the two labels modal processors use
+    /// for entity naming and fallback descriptions:
+    /// `(primary_text, entity_type_token, description_label)`.
+    ///
+    /// - `primary_text` is the modality's main content field (`img_path`,
+    ///   `table_body`, `equation_text`, `content`).
+    /// - `entity_type_token` is the lowercase modality token (`"image"`,
+    ///   `"table"`, `"equation"`); it doubles as the entity-name prefix and the
+    ///   log label. For `Generic` it is the raw `content_type`.
+    /// - `description_label` is the label used in `"… content:"` fallback
+    ///   descriptions: capitalized for the fixed modalities, the raw
+    ///   `content_type` for `Generic`.
+    pub fn primary_text(&self) -> (&str, &str, &str) {
+        match self {
+            ContentItem::Text { text, .. } => (text, "text", "Text"),
+            ContentItem::Image { img_path, .. } => (img_path, "image", "Image"),
+            ContentItem::Table { table_body, .. } => (table_body, "table", "Table"),
+            ContentItem::Equation { equation_text, .. } => {
+                (equation_text, "equation", "Equation")
+            }
+            ContentItem::Generic {
+                content,
+                content_type,
+                ..
+            } => (content, content_type, content_type),
+        }
+    }
+
     /// Factory method to create a ContentItem from a raw map (parser output).
     /// Handles field aliases from MinerU, Docling, and PaddleOCR parsers.
     pub fn from_raw_map(map: JsonMap, index: i64) -> Self {

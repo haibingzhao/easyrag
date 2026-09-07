@@ -1,0 +1,14 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+UNWIND $ids AS id MATCH (n:`test` {entity_id: id, biz_id: $biz}) DETACH DELETE n
+--- params[0] ---
+{
+  "biz": "default",
+  "ids": [
+    "n1",
+    "n2",
+    "n3"
+  ]
+}

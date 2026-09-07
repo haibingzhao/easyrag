@@ -1,0 +1,11 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+CREATE INDEX IF NOT EXISTS FOR (n:`test`) ON (n.entity_id, n.biz_id)
+--- params[0] ---
+{}
+--- query[1] ---
+CREATE FULLTEXT INDEX `test_entity_fulltext` IF NOT EXISTS FOR (n:`test`) ON EACH [n.entity_id]
+--- params[1] ---
+{}

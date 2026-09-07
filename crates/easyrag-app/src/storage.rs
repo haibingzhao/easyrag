@@ -17,18 +17,18 @@ use easyrag_storage::memory::{
 
 use crate::embedding::make_embedding_func;
 
-pub(crate) struct AssembledStorage {
-    pub(crate) kv: Arc<dyn KVStorage>,
-    pub(crate) vector: Arc<dyn VectorStorage>,
-    pub(crate) graph: Arc<dyn GraphStorage>,
-    pub(crate) doc_status: Arc<dyn DocStatusStorage>,
-    pub(crate) keyword: Option<Arc<dyn KeywordSearchable>>,
+pub struct AssembledStorage {
+    pub kv: Arc<dyn KVStorage>,
+    pub vector: Arc<dyn VectorStorage>,
+    pub graph: Arc<dyn GraphStorage>,
+    pub doc_status: Arc<dyn DocStatusStorage>,
+    pub keyword: Option<Arc<dyn KeywordSearchable>>,
     /// Held for graceful shutdown.
-    pub(crate) pg_db: Option<easyrag_storage::postgres::PgDatabase>,
-    pub(crate) neo4j_db: Option<easyrag_storage::neo4j::Neo4jDatabase>,
+    pub pg_db: Option<easyrag_storage::postgres::PgDatabase>,
+    pub neo4j_db: Option<easyrag_storage::neo4j::Neo4jDatabase>,
 }
 
-pub(crate) async fn assemble_storage(config: &ServerConfig) -> anyhow::Result<AssembledStorage> {
+pub async fn assemble_storage(config: &ServerConfig) -> anyhow::Result<AssembledStorage> {
     let use_postgres = config.storage_type.eq_ignore_ascii_case("postgres");
     let use_neo4j_graph = config.graph_storage_type.eq_ignore_ascii_case("neo4j");
     // Workspace is the only structural isolation dimension; biz_id is a

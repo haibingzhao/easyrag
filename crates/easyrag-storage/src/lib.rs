@@ -6,6 +6,14 @@
 //! - `neo4j`: Neo4j graph storage (feature `neo4j`)
 //! - `tantivy_search`: embedded tantivy keyword index (feature `tantivy-backend`)
 
+mod drop_result;
+
+#[cfg(feature = "postgres")]
+mod pg_upsert;
+
+#[cfg(any(feature = "postgres", feature = "neo4j"))]
+mod scope_sql;
+
 #[cfg(feature = "json")]
 pub mod json;
 pub mod memory;

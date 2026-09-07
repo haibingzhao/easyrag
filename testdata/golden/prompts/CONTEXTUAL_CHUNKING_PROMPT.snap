@@ -1,0 +1,19 @@
+---
+source: crates/easyrag-core/tests/prompt_golden.rs
+---
+---Task---
+Here is a document excerpt:
+<document>
+{doc_preview}
+</document>
+
+Here is a chunk extracted from it:
+<chunk>
+{chunk_content}
+</chunk>
+
+Write a single concise sentence (15-25 words) that provides context for this chunk,
+explaining what part of the document it comes from and what it discusses.
+This sentence will be prepended to the chunk to improve retrieval.
+
+Return ONLY the context sentence, nothing else.

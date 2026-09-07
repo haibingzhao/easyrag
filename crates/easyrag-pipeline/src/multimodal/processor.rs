@@ -20,11 +20,56 @@ use serde_json::Value as JsonValue;
 use super::context::ContextExtractor;
 use super::model::{ContentItem, ModalProcessResult, ModalType};
 use super::{prompt_manager, util};
+use super::util::take_chars;
 
 /// Modal processor interface.
 /// Each processor handles a specific modal type (image, table, equation, generic).
+///
+/// The `process` / `generate_description` / `supported_types` methods are
+/// provided: they implement the shared skeleton (modal-type guard, dispatch to
+/// the `*_inner` hook, error absorption into a deterministic fallback, and the
+/// fallback entity/chunk construction). Each concrete processor only supplies
+/// its modality identity (`modal_type` / `variant_label` / `unknown_entity_name`
+/// / `truncate_process_description`) and its two `*_inner` hooks.
 #[async_trait]
 pub trait ModalProcessor: Send + Sync {
+    /// The single modal type this processor handles. Drives the mismatch guard,
+    /// `supported_types`, and the fallback `entity_type`.
+    fn modal_type(&self) -> ModalType;
+
+    /// Variant name used in the mismatch error ("Expected {label}Content, …").
+    fn variant_label(&self) -> &'static str;
+
+    /// `entity_name` used when `generate_description` receives a mismatched
+    /// variant (e.g. `"unknown_image"`; `"unknown_content"` for generic).
+    fn unknown_entity_name(&self) -> &'static str;
+
+    /// Whether the `process` fallback description truncates the primary text to
+    /// 100 chars. Defaults to `true`; the image processor overrides it to
+    /// `false` so the full image path is embedded.
+    fn truncate_process_description(&self) -> bool {
+        true
+    }
+
+    /// Core processing hook (unified signature). Implementations destructure
+    /// their own `ContentItem` variant; the provided `process` guarantees the
+    /// variant matches `modal_type` before this is called.
+    async fn process_inner(
+        &self,
+        item: &ContentItem,
+        file_info: &JsonMap,
+        context: &str,
+    ) -> easyrag_core::Result<ModalProcessResult>;
+
+    /// Core description-generation hook (unified signature). Mirrors
+    /// `process_inner`; the provided `generate_description` guarantees the
+    /// variant matches before this is called.
+    async fn generate_description_inner(
+        &self,
+        item: &ContentItem,
+        context: &str,
+    ) -> easyrag_core::Result<(String, JsonMap)>;
+
     /// Process a content item and produce a modal process result.
     /// Errors only on modal-type mismatch ( throws
     /// IllegalArgumentException); LLM/storage failures are absorbed into a
@@ -34,17 +79,111 @@ pub trait ModalProcessor: Send + Sync {
         item: &ContentItem,
         file_info: &JsonMap,
         context: &str,
-    ) -> easyrag_core::Result<ModalProcessResult>;
+    ) -> easyrag_core::Result<ModalProcessResult> {
+        if item.modal_type() != self.modal_type() {
+            return Err(CoreError::InvalidArgument(format!(
+                "Expected {}Content, got {}",
+                self.variant_label(),
+                item.modal_type().value()
+            )));
+        }
+
+        match self.process_inner(item, file_info, context).await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                let (_, type_label, _) = item.primary_text();
+                tracing::error!("Error processing {type_label} content: {e}");
+                Ok(self.fallback_result(item))
+            }
+        }
+    }
 
     /// Generate description only (without entity/chunk creation).
     /// Used for batch processing stage 1.
     /// Returns `(description, entity_info map)`; never fails
     /// (falls back on any error).
-    async fn generate_description(&self, item: &ContentItem, context: &str) -> (String, JsonMap);
+    async fn generate_description(&self, item: &ContentItem, context: &str) -> (String, JsonMap) {
+        if item.modal_type() != self.modal_type() {
+            return (String::new(), self.unknown_entity());
+        }
+
+        match self.generate_description_inner(item, context).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                let (_, type_label, _) = item.primary_text();
+                tracing::error!("Error generating {type_label} description: {e}");
+                self.fallback_description(item)
+            }
+        }
+    }
 
     /// The modal types this processor supports.
-    fn supported_types(&self) -> HashSet<ModalType>;
+    fn supported_types(&self) -> HashSet<ModalType> {
+        HashSet::from([self.modal_type()])
+    }
+
+    /// Fallback `ModalProcessResult` synthesized when `process_inner` fails.
+    /// Field values are derived from `ContentItem::primary_text` so every
+    /// modality produces byte-identical output to its previous hand-written
+    /// fallback.
+    fn fallback_result(&self, item: &ContentItem) -> ModalProcessResult {
+        let (primary, type_label, desc_label) = item.primary_text();
+        let desc_primary = if self.truncate_process_description() {
+            take_chars(primary, 100)
+        } else {
+            primary.to_string()
+        };
+        let mut metadata = JsonMap::new();
+        metadata.insert("fallback".to_string(), JsonValue::from(true));
+        ModalProcessResult {
+            entity_name: format!("{type_label}_{}", compute_mdhash_id(primary, "")),
+            entity_type: type_label.to_string(),
+            description: format!("{desc_label} content: {desc_primary}"),
+            chunk_content: primary.to_string(),
+            metadata,
+            success: true,
+            error_message: None,
+        }
+    }
+
+    /// Fallback `(description, entity_info)` synthesized when
+    /// `generate_description_inner` fails. The summary always truncates the
+    /// primary text to 100 chars (matching the previous per-modality code).
+    fn fallback_description(&self, item: &ContentItem) -> (String, JsonMap) {
+        let (primary, type_label, desc_label) = item.primary_text();
+        let mut entity = JsonMap::new();
+        entity.insert(
+            "entity_name".to_string(),
+            JsonValue::from(format!("{type_label}_{}", compute_mdhash_id(primary, ""))),
+        );
+        entity.insert(
+            "entity_type".to_string(),
+            JsonValue::from(type_label),
+        );
+        entity.insert(
+            "summary".to_string(),
+            JsonValue::from(format!("{desc_label} content: {}", take_chars(primary, 100))),
+        );
+        (primary.to_string(), entity)
+    }
+
+    /// Entity map returned when `generate_description` receives a mismatched
+    /// variant.
+    fn unknown_entity(&self) -> JsonMap {
+        let mut entity = JsonMap::new();
+        entity.insert(
+            "entity_name".to_string(),
+            JsonValue::from(self.unknown_entity_name()),
+        );
+        entity.insert(
+            "entity_type".to_string(),
+            JsonValue::from(self.modal_type().value()),
+        );
+        entity.insert("summary".to_string(), JsonValue::from(""));
+        entity
+    }
 }
+
 
 /// Shared dependencies for all modal processors.
 #[derive(Clone)]
@@ -301,11 +440,6 @@ pub fn strip_thinking_tags(text: &str) -> String {
     cleaned.trim().to_string()
 }
 
-/// First `n` chars of `s`.
-fn take_chars(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
-}
-
 /// Display a metadata value the way string interpolation does,
 /// defaulting to "None" for missing/null values.
 fn metadata_or_none(value: Option<&JsonValue>) -> String {
@@ -476,19 +610,80 @@ impl ImageModalProcessor {
         Self { base }
     }
 
-    async fn process_inner(
+    /// Generate fallback description when vision is unavailable.
+    /// Uses filename, captions, and context to produce a text-based description.
+    async fn generate_fallback_description(
         &self,
         img_path: &str,
         captions: &[String],
-        metadata: &JsonMap,
+        context: &str,
+    ) -> easyrag_core::Result<String> {
+        let file_name = Path::new(img_path)
+            .file_stem()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let caption_text = captions.join(", ");
+        let caption_value = if caption_text.is_empty() { "None".to_string() } else { caption_text };
+
+        let mut prompt = String::new();
+        prompt.push_str("Based on the following information, generate a JSON description for an image:\n");
+        prompt.push_str(&format!("- File name: {file_name}\n"));
+        prompt.push_str(&format!("- Captions: {caption_value}\n"));
+        if !context.is_empty() {
+            prompt.push_str(&format!("- Surrounding context: {}\n", take_chars(context, 500)));
+        }
+        prompt.push('\n');
+        prompt.push_str("Return JSON with fields: detailed_description, entity_info (entity_name, entity_type, summary)\n");
+
+        self.base
+            .call_llm(&prompt, &prompt_manager::get("IMAGE_ANALYSIS_SYSTEM")?)
+            .await
+    }
+}
+
+#[async_trait]
+impl ModalProcessor for ImageModalProcessor {
+    fn modal_type(&self) -> ModalType {
+        ModalType::Image
+    }
+
+    fn variant_label(&self) -> &'static str {
+        "Image"
+    }
+
+    fn unknown_entity_name(&self) -> &'static str {
+        "unknown_image"
+    }
+
+    /// Image fallbacks embed the full image path (no `take_chars` truncation),
+    /// unlike the other modalities.
+    fn truncate_process_description(&self) -> bool {
+        false
+    }
+
+    async fn process_inner(
+        &self,
+        item: &ContentItem,
         file_info: &JsonMap,
         context: &str,
     ) -> easyrag_core::Result<ModalProcessResult> {
+        let ContentItem::Image {
+            img_path,
+            captions,
+            metadata,
+            ..
+        } = item
+        else {
+            return Err(CoreError::InvalidArgument(format!(
+                "Expected {}Content, got {}",
+                self.variant_label(),
+                item.modal_type().value()
+            )));
+        };
+
         let (file_path, doc_id, chunk_order_index) = read_file_info(file_info);
 
-        let (description, entity_info) = self.generate_description_inner(
-            img_path, captions, metadata, context,
-        ).await?;
+        let (description, entity_info) = self.generate_description_inner(item, context).await?;
 
         // Build complete image content chunk: every line
         // carries a trailing newline).
@@ -510,11 +705,23 @@ impl ImageModalProcessor {
 
     async fn generate_description_inner(
         &self,
-        img_path: &str,
-        captions: &[String],
-        metadata: &JsonMap,
+        item: &ContentItem,
         context: &str,
     ) -> easyrag_core::Result<(String, JsonMap)> {
+        let ContentItem::Image {
+            img_path,
+            captions,
+            metadata,
+            ..
+        } = item
+        else {
+            return Err(CoreError::InvalidArgument(format!(
+                "Expected {}Content, got {}",
+                self.variant_label(),
+                item.modal_type().value()
+            )));
+        };
+
         let section_path = metadata
             .get("_section_path")
             .and_then(|v| v.as_str())
@@ -575,120 +782,8 @@ impl ImageModalProcessor {
 
         Ok(self.base.parse_response(&response, None, "image"))
     }
-
-    /// Generate fallback description when vision is unavailable.
-    /// Uses filename, captions, and context to produce a text-based description.
-    async fn generate_fallback_description(
-        &self,
-        img_path: &str,
-        captions: &[String],
-        context: &str,
-    ) -> easyrag_core::Result<String> {
-        let file_name = Path::new(img_path)
-            .file_stem()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let caption_text = captions.join(", ");
-        let caption_value = if caption_text.is_empty() { "None".to_string() } else { caption_text };
-
-        let mut prompt = String::new();
-        prompt.push_str("Based on the following information, generate a JSON description for an image:\n");
-        prompt.push_str(&format!("- File name: {file_name}\n"));
-        prompt.push_str(&format!("- Captions: {caption_value}\n"));
-        if !context.is_empty() {
-            prompt.push_str(&format!("- Surrounding context: {}\n", take_chars(context, 500)));
-        }
-        prompt.push('\n');
-        prompt.push_str("Return JSON with fields: detailed_description, entity_info (entity_name, entity_type, summary)\n");
-
-        self.base
-            .call_llm(&prompt, &prompt_manager::get("IMAGE_ANALYSIS_SYSTEM")?)
-            .await
-    }
 }
 
-#[async_trait]
-impl ModalProcessor for ImageModalProcessor {
-    async fn process(
-        &self,
-        item: &ContentItem,
-        file_info: &JsonMap,
-        context: &str,
-    ) -> easyrag_core::Result<ModalProcessResult> {
-        let ContentItem::Image {
-            img_path,
-            captions,
-            metadata,
-            ..
-        } = item
-        else {
-            return Err(CoreError::InvalidArgument(format!(
-                "Expected ImageContent, got {}",
-                item.modal_type().value()
-            )));
-        };
-
-        match self.process_inner(img_path, captions, metadata, file_info, context).await {
-            Ok(result) => Ok(result),
-            Err(e) => {
-                tracing::error!("Error processing image content: {e}");
-                // Fallback processing.
-                let mut fallback_meta = JsonMap::new();
-                fallback_meta.insert("fallback".to_string(), JsonValue::from(true));
-                Ok(ModalProcessResult {
-                    entity_name: format!("image_{}", compute_mdhash_id(img_path, "")),
-                    entity_type: "image".to_string(),
-                    description: format!("Image content: {img_path}"),
-                    chunk_content: img_path.clone(),
-                    metadata: fallback_meta,
-                    success: true,
-                    error_message: None,
-                })
-            }
-        }
-    }
-
-    async fn generate_description(&self, item: &ContentItem, context: &str) -> (String, JsonMap) {
-        let ContentItem::Image {
-            img_path,
-            captions,
-            metadata,
-            ..
-        } = item
-        else {
-            let mut entity = JsonMap::new();
-            entity.insert("entity_name".to_string(), JsonValue::from("unknown_image"));
-            entity.insert("entity_type".to_string(), JsonValue::from("image"));
-            entity.insert("summary".to_string(), JsonValue::from(""));
-            return (String::new(), entity);
-        };
-
-        match self
-            .generate_description_inner(img_path, captions, metadata, context)
-            .await
-        {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::error!("Error generating image description: {e}");
-                let mut entity = JsonMap::new();
-                entity.insert(
-                    "entity_name".to_string(),
-                    JsonValue::from(format!("image_{}", compute_mdhash_id(img_path, ""))),
-                );
-                entity.insert("entity_type".to_string(), JsonValue::from("image"));
-                entity.insert(
-                    "summary".to_string(),
-                    JsonValue::from(format!("Image content: {}", take_chars(img_path, 100))),
-                );
-                (img_path.clone(), entity)
-            }
-        }
-    }
-
-    fn supported_types(&self) -> HashSet<ModalType> {
-        HashSet::from([ModalType::Image])
-    }
-}
 
 /// Processor specialized for table content.
 /// Performs structured table analysis: row/column identification, data
@@ -701,20 +796,45 @@ impl TableModalProcessor {
     pub fn new(base: BaseModalProcessor) -> Self {
         Self { base }
     }
+}
+
+#[async_trait]
+impl ModalProcessor for TableModalProcessor {
+    fn modal_type(&self) -> ModalType {
+        ModalType::Table
+    }
+
+    fn variant_label(&self) -> &'static str {
+        "Table"
+    }
+
+    fn unknown_entity_name(&self) -> &'static str {
+        "unknown_table"
+    }
 
     async fn process_inner(
         &self,
-        table_body: &str,
-        captions: &[String],
-        metadata: &JsonMap,
+        item: &ContentItem,
         file_info: &JsonMap,
         context: &str,
     ) -> easyrag_core::Result<ModalProcessResult> {
+        let ContentItem::Table {
+            table_body,
+            captions,
+            metadata,
+            ..
+        } = item
+        else {
+            return Err(CoreError::InvalidArgument(format!(
+                "Expected {}Content, got {}",
+                self.variant_label(),
+                item.modal_type().value()
+            )));
+        };
+
         let (file_path, doc_id, chunk_order_index) = read_file_info(file_info);
 
-        let (description, entity_info) = self
-            .generate_description_inner(table_body, captions, metadata, context)
-            .await?;
+        let (description, entity_info) = self.generate_description_inner(item, context).await?;
 
         // Build complete table content chunk.
         let captions_str = captions.join(", ");
@@ -735,11 +855,23 @@ impl TableModalProcessor {
 
     async fn generate_description_inner(
         &self,
-        table_body: &str,
-        captions: &[String],
-        metadata: &JsonMap,
+        item: &ContentItem,
         context: &str,
     ) -> easyrag_core::Result<(String, JsonMap)> {
+        let ContentItem::Table {
+            table_body,
+            captions,
+            metadata,
+            ..
+        } = item
+        else {
+            return Err(CoreError::InvalidArgument(format!(
+                "Expected {}Content, got {}",
+                self.variant_label(),
+                item.modal_type().value()
+            )));
+        };
+
         let table_caption = captions.join(", ");
         let table_img_path = metadata
             .get("img_path")
@@ -776,90 +908,6 @@ impl TableModalProcessor {
     }
 }
 
-#[async_trait]
-impl ModalProcessor for TableModalProcessor {
-    async fn process(
-        &self,
-        item: &ContentItem,
-        file_info: &JsonMap,
-        context: &str,
-    ) -> easyrag_core::Result<ModalProcessResult> {
-        let ContentItem::Table {
-            table_body,
-            captions,
-            metadata,
-            ..
-        } = item
-        else {
-            return Err(CoreError::InvalidArgument(format!(
-                "Expected TableContent, got {}",
-                item.modal_type().value()
-            )));
-        };
-
-        match self
-            .process_inner(table_body, captions, metadata, file_info, context)
-            .await
-        {
-            Ok(result) => Ok(result),
-            Err(e) => {
-                tracing::error!("Error processing table content: {e}");
-                let mut fallback_meta = JsonMap::new();
-                fallback_meta.insert("fallback".to_string(), JsonValue::from(true));
-                Ok(ModalProcessResult {
-                    entity_name: format!("table_{}", compute_mdhash_id(table_body, "")),
-                    entity_type: "table".to_string(),
-                    description: format!("Table content: {}", take_chars(table_body, 100)),
-                    chunk_content: table_body.clone(),
-                    metadata: fallback_meta,
-                    success: true,
-                    error_message: None,
-                })
-            }
-        }
-    }
-
-    async fn generate_description(&self, item: &ContentItem, context: &str) -> (String, JsonMap) {
-        let ContentItem::Table {
-            table_body,
-            captions,
-            metadata,
-            ..
-        } = item
-        else {
-            let mut entity = JsonMap::new();
-            entity.insert("entity_name".to_string(), JsonValue::from("unknown_table"));
-            entity.insert("entity_type".to_string(), JsonValue::from("table"));
-            entity.insert("summary".to_string(), JsonValue::from(""));
-            return (String::new(), entity);
-        };
-
-        match self
-            .generate_description_inner(table_body, captions, metadata, context)
-            .await
-        {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::error!("Error generating table description: {e}");
-                let mut entity = JsonMap::new();
-                entity.insert(
-                    "entity_name".to_string(),
-                    JsonValue::from(format!("table_{}", compute_mdhash_id(table_body, ""))),
-                );
-                entity.insert("entity_type".to_string(), JsonValue::from("table"));
-                entity.insert(
-                    "summary".to_string(),
-                    JsonValue::from(format!("Table content: {}", take_chars(table_body, 100))),
-                );
-                (table_body.clone(), entity)
-            }
-        }
-    }
-
-    fn supported_types(&self) -> HashSet<ModalType> {
-        HashSet::from([ModalType::Table])
-    }
-}
 
 /// Processor specialized for equation content.
 /// Performs LaTeX equation parsing, variable identification, and physical
@@ -872,19 +920,44 @@ impl EquationModalProcessor {
     pub fn new(base: BaseModalProcessor) -> Self {
         Self { base }
     }
+}
+
+#[async_trait]
+impl ModalProcessor for EquationModalProcessor {
+    fn modal_type(&self) -> ModalType {
+        ModalType::Equation
+    }
+
+    fn variant_label(&self) -> &'static str {
+        "Equation"
+    }
+
+    fn unknown_entity_name(&self) -> &'static str {
+        "unknown_equation"
+    }
 
     async fn process_inner(
         &self,
-        equation_text: &str,
-        equation_format: &str,
+        item: &ContentItem,
         file_info: &JsonMap,
         context: &str,
     ) -> easyrag_core::Result<ModalProcessResult> {
+        let ContentItem::Equation {
+            equation_text,
+            equation_format,
+            ..
+        } = item
+        else {
+            return Err(CoreError::InvalidArgument(format!(
+                "Expected {}Content, got {}",
+                self.variant_label(),
+                item.modal_type().value()
+            )));
+        };
+
         let (file_path, doc_id, chunk_order_index) = read_file_info(file_info);
 
-        let (description, entity_info) = self
-            .generate_description_inner(equation_text, equation_format, context)
-            .await?;
+        let (description, entity_info) = self.generate_description_inner(item, context).await?;
 
         // Build complete equation content chunk.
         let modal_chunk = format!(
@@ -899,10 +972,22 @@ impl EquationModalProcessor {
 
     async fn generate_description_inner(
         &self,
-        equation_text: &str,
-        equation_format: &str,
+        item: &ContentItem,
         context: &str,
     ) -> easyrag_core::Result<(String, JsonMap)> {
+        let ContentItem::Equation {
+            equation_text,
+            equation_format,
+            ..
+        } = item
+        else {
+            return Err(CoreError::InvalidArgument(format!(
+                "Expected {}Content, got {}",
+                self.variant_label(),
+                item.modal_type().value()
+            )));
+        };
+
         // Build equation analysis prompt.
         let equation_prompt = if !context.is_empty() {
             prompt_manager::get("equation_prompt_with_context")?
@@ -928,94 +1013,6 @@ impl EquationModalProcessor {
     }
 }
 
-#[async_trait]
-impl ModalProcessor for EquationModalProcessor {
-    async fn process(
-        &self,
-        item: &ContentItem,
-        file_info: &JsonMap,
-        context: &str,
-    ) -> easyrag_core::Result<ModalProcessResult> {
-        let ContentItem::Equation {
-            equation_text,
-            equation_format,
-            ..
-        } = item
-        else {
-            return Err(CoreError::InvalidArgument(format!(
-                "Expected EquationContent, got {}",
-                item.modal_type().value()
-            )));
-        };
-
-        match self
-            .process_inner(equation_text, equation_format, file_info, context)
-            .await
-        {
-            Ok(result) => Ok(result),
-            Err(e) => {
-                tracing::error!("Error processing equation content: {e}");
-                let mut fallback_meta = JsonMap::new();
-                fallback_meta.insert("fallback".to_string(), JsonValue::from(true));
-                Ok(ModalProcessResult {
-                    entity_name: format!("equation_{}", compute_mdhash_id(equation_text, "")),
-                    entity_type: "equation".to_string(),
-                    description: format!(
-                        "Equation content: {}",
-                        take_chars(equation_text, 100)
-                    ),
-                    chunk_content: equation_text.clone(),
-                    metadata: fallback_meta,
-                    success: true,
-                    error_message: None,
-                })
-            }
-        }
-    }
-
-    async fn generate_description(&self, item: &ContentItem, context: &str) -> (String, JsonMap) {
-        let ContentItem::Equation {
-            equation_text,
-            equation_format,
-            ..
-        } = item
-        else {
-            let mut entity = JsonMap::new();
-            entity.insert("entity_name".to_string(), JsonValue::from("unknown_equation"));
-            entity.insert("entity_type".to_string(), JsonValue::from("equation"));
-            entity.insert("summary".to_string(), JsonValue::from(""));
-            return (String::new(), entity);
-        };
-
-        match self
-            .generate_description_inner(equation_text, equation_format, context)
-            .await
-        {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::error!("Error generating equation description: {e}");
-                let mut entity = JsonMap::new();
-                entity.insert(
-                    "entity_name".to_string(),
-                    JsonValue::from(format!("equation_{}", compute_mdhash_id(equation_text, ""))),
-                );
-                entity.insert("entity_type".to_string(), JsonValue::from("equation"));
-                entity.insert(
-                    "summary".to_string(),
-                    JsonValue::from(format!(
-                        "Equation content: {}",
-                        take_chars(equation_text, 100)
-                    )),
-                );
-                (equation_text.clone(), entity)
-            }
-        }
-    }
-
-    fn supported_types(&self) -> HashSet<ModalType> {
-        HashSet::from([ModalType::Equation])
-    }
-}
 
 /// Generic fallback processor for unknown modal types.
 pub struct GenericModalProcessor {
@@ -1026,19 +1023,55 @@ impl GenericModalProcessor {
     pub fn new(base: BaseModalProcessor) -> Self {
         Self { base }
     }
+}
+
+/// Uppercase the first character.
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+#[async_trait]
+impl ModalProcessor for GenericModalProcessor {
+    fn modal_type(&self) -> ModalType {
+        ModalType::Generic
+    }
+
+    fn variant_label(&self) -> &'static str {
+        "Generic"
+    }
+
+    /// Generic mismatches report `unknown_content` (not `unknown_generic`),
+    /// preserving the pre-refactor entity name.
+    fn unknown_entity_name(&self) -> &'static str {
+        "unknown_content"
+    }
 
     async fn process_inner(
         &self,
-        content: &str,
-        content_type: &str,
+        item: &ContentItem,
         file_info: &JsonMap,
         context: &str,
     ) -> easyrag_core::Result<ModalProcessResult> {
+        let ContentItem::Generic {
+            content,
+            content_type,
+            ..
+        } = item
+        else {
+            return Err(CoreError::InvalidArgument(format!(
+                "Expected {}Content, got {}",
+                self.variant_label(),
+                item.modal_type().value()
+            )));
+        };
+
         let (file_path, doc_id, chunk_order_index) = read_file_info(file_info);
 
-        let (description, entity_info) = self
-            .generate_description_inner(content, content_type, context)
-            .await?;
+        let (description, entity_info) = self.generate_description_inner(item, context).await?;
 
         let modal_chunk = format!(
             "## {} Content\n\n### Raw Content\n{}\n\n### Analysis\n{}\n",
@@ -1054,10 +1087,22 @@ impl GenericModalProcessor {
 
     async fn generate_description_inner(
         &self,
-        content: &str,
-        content_type: &str,
+        item: &ContentItem,
         context: &str,
     ) -> easyrag_core::Result<(String, JsonMap)> {
+        let ContentItem::Generic {
+            content,
+            content_type,
+            ..
+        } = item
+        else {
+            return Err(CoreError::InvalidArgument(format!(
+                "Expected {}Content, got {}",
+                self.variant_label(),
+                item.modal_type().value()
+            )));
+        };
+
         let entity_placeholder = format!("descriptive name for this {content_type}");
         let generic_prompt = if !context.is_empty() {
             prompt_manager::get("generic_prompt_with_context")?
@@ -1079,105 +1124,6 @@ impl GenericModalProcessor {
     }
 }
 
-/// Uppercase the first character.
-fn capitalize_first(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-    }
-}
-
-#[async_trait]
-impl ModalProcessor for GenericModalProcessor {
-    async fn process(
-        &self,
-        item: &ContentItem,
-        file_info: &JsonMap,
-        context: &str,
-    ) -> easyrag_core::Result<ModalProcessResult> {
-        let ContentItem::Generic {
-            content,
-            content_type,
-            ..
-        } = item
-        else {
-            return Err(CoreError::InvalidArgument(format!(
-                "Expected GenericContent, got {}",
-                item.modal_type().value()
-            )));
-        };
-
-        match self
-            .process_inner(content, content_type, file_info, context)
-            .await
-        {
-            Ok(result) => Ok(result),
-            Err(e) => {
-                tracing::error!("Error processing {} content: {}", content_type, e);
-                let mut fallback_meta = JsonMap::new();
-                fallback_meta.insert("fallback".to_string(), JsonValue::from(true));
-                Ok(ModalProcessResult {
-                    entity_name: format!("{content_type}_{}", compute_mdhash_id(content, "")),
-                    entity_type: content_type.clone(),
-                    description: format!(
-                        "{} content: {}",
-                        content_type,
-                        take_chars(content, 100)
-                    ),
-                    chunk_content: content.clone(),
-                    metadata: fallback_meta,
-                    success: true,
-                    error_message: None,
-                })
-            }
-        }
-    }
-
-    async fn generate_description(&self, item: &ContentItem, context: &str) -> (String, JsonMap) {
-        let ContentItem::Generic {
-            content,
-            content_type,
-            ..
-        } = item
-        else {
-            let mut entity = JsonMap::new();
-            entity.insert("entity_name".to_string(), JsonValue::from("unknown_content"));
-            entity.insert("entity_type".to_string(), JsonValue::from("generic"));
-            entity.insert("summary".to_string(), JsonValue::from(""));
-            return (String::new(), entity);
-        };
-
-        match self
-            .generate_description_inner(content, content_type, context)
-            .await
-        {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::error!("Error generating {} description: {}", content_type, e);
-                let mut entity = JsonMap::new();
-                entity.insert(
-                    "entity_name".to_string(),
-                    JsonValue::from(format!("{content_type}_{}", compute_mdhash_id(content, ""))),
-                );
-                entity.insert("entity_type".to_string(), JsonValue::from(content_type.as_str()));
-                entity.insert(
-                    "summary".to_string(),
-                    JsonValue::from(format!(
-                        "{} content: {}",
-                        content_type,
-                        take_chars(content, 100)
-                    )),
-                );
-                (content.clone(), entity)
-            }
-        }
-    }
-
-    fn supported_types(&self) -> HashSet<ModalType> {
-        HashSet::from([ModalType::Generic])
-    }
-}
 
 /// Registry that routes ModalType to the corresponding ModalProcessor.
 pub struct ModalProcessorRegistry;

@@ -7,14 +7,18 @@
 //! `DIRECTED` relationship type with undirected matching semantics.
 
 use async_trait::async_trait;
+use easyrag_core::concurrency::{with_retry as retry_core, IsRetryable, RetryConfig};
 use easyrag_core::llm::EmbeddingFunc;
-use easyrag_core::model::{KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode};
+use easyrag_core::model::{KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode, TenantScopeRef};
 use easyrag_core::storage::traits::{GraphStorage, StorageNameSpace};
 use easyrag_core::{CoreError, JsonMap};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::OnceLock;
+
+use crate::drop_result::{drop_error, drop_success};
+use crate::scope_sql::{cypher_ws_label, TenantScopeCypher};
 
 /// Query parameters expressed as JSON.
 pub type Neo4jParams = serde_json::Map<String, JsonValue>;
@@ -70,6 +74,84 @@ impl<T: Neo4jOps> Neo4jOps for std::sync::Arc<T> {
 }
 
 // ---------------------------------------------------------------------------
+// Cypher fragment library (Phase 1.6).
+//
+// Pure `fn -> String` builders (static dispatch, zero indirection) that
+// single-source the recurring Cypher shapes hand-concatenated across ~24 query
+// sites. Extracting them removes the duplication while the byte-level golden
+// snapshots in `tests/neo4j_graph_storage.rs` prove the rendered Cypher is
+// unchanged ([equivalent]). Shapes that occur once with a genuinely different
+// form (the variable-length `-[..*0..N]-` traversal and the biz-conditional
+// maps in `get_sub_graph`, the read-path `node_scope` wildcard, and the DDL
+// `CREATE INDEX` statements) are deliberately NOT abstracted here — but they
+// still interpolate `REL_TYPE`, since the relationship *name* is shared with
+// every other pattern and with the edges handed back to callers, even where
+// the pattern *shape* is unique.
+// ---------------------------------------------------------------------------
+mod cypher {
+    use serde_json::Value as JsonValue;
+
+    /// Relationship type every edge in the workspace graph carries.
+    ///
+    /// One type for all relations — the semantic type lives in the edge
+    /// properties — so the same name appears in the match patterns below and in
+    /// the `type` field of the `KnowledgeGraphEdge` values returned to callers.
+    /// Declared once: a rename has to touch patterns and payloads together or
+    /// reads silently stop matching writes.
+    pub const REL_TYPE: &str = "DIRECTED";
+
+    /// Workspace-scoped node pattern. `entity_key = Some(k)` renders the
+    /// double-key form `({var}:{ws} {entity_id: k, biz_id: $biz})`; `None`
+    /// renders the match-any side `({var}:{ws} {biz_id: $biz})`. `ws` is the
+    /// already-escaped workspace label (see `ws_label`).
+    pub fn node_pat(ws: &str, var: &str, entity_key: Option<&str>) -> String {
+        match entity_key {
+            Some(key) => format!("({var}:{ws} {{entity_id: {key}, biz_id: $biz}})"),
+            None => format!("({var}:{ws} {{biz_id: $biz}})"),
+        }
+    }
+
+    /// `DIRECTED` relationship connector: `-[{var}:DIRECTED]-` for undirected
+    /// matching (read/degree paths) or `-[{var}:DIRECTED]->` for the directed
+    /// MERGE/write paths.
+    pub fn edge_pat(var: &str, directed: bool) -> String {
+        if directed {
+            format!("-[{var}:{REL_TYPE}]->")
+        } else {
+            format!("-[{var}:{REL_TYPE}]-")
+        }
+    }
+
+    /// Degree-count pattern: an entity node joined to any biz-scoped node by an
+    /// undirected `DIRECTED` edge —
+    /// `({node_var} {entity_id: key})-[{edge_var}:DIRECTED]-({other_var} {biz_id})`.
+    pub fn degree_pat(
+        ws: &str,
+        node_var: &str,
+        entity_key: &str,
+        edge_var: &str,
+        other_var: &str,
+    ) -> String {
+        format!(
+            "{}{}{}",
+            node_pat(ws, node_var, Some(entity_key)),
+            edge_pat(edge_var, false),
+            node_pat(ws, other_var, None),
+        )
+    }
+
+    /// `UNWIND ${list} AS {var}` batch prefix.
+    pub fn unwind(list: &str, var: &str) -> String {
+        format!("UNWIND ${list} AS {var}")
+    }
+
+    /// JSON string array for an UNWIND `$ids`/`$items` parameter.
+    pub fn json_ids(ids: &[String]) -> Vec<JsonValue> {
+        ids.iter().map(|id| JsonValue::String(id.clone())).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Neo4jDatabase (live driver, neo4rs)
 // ---------------------------------------------------------------------------
 
@@ -98,6 +180,59 @@ impl Default for Neo4jConfig {
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY_MS: u64 = 500;
+
+/// Graph-driver retry policy: base 500ms, factor 2, 3 attempts, no jitter.
+///
+/// This reproduces the curve of the hand-rolled loop it replaces —
+/// `RETRY_DELAY_MS * (attempt + 1)` slept 500ms then 1000ms, and
+/// `500 * 2^(attempt-1)` sleeps exactly the same — so moving the loop onto
+/// `core::with_retry` is [equivalent]. `max_delay` never binds at 3 attempts;
+/// it is set so a future attempt-count bump cannot produce an unbounded wait.
+const RETRY_CONFIG: RetryConfig = RetryConfig {
+    max_attempts: MAX_RETRIES,
+    base_delay: std::time::Duration::from_millis(RETRY_DELAY_MS),
+    max_delay: std::time::Duration::from_secs(10),
+    exponential_base: 2.0,
+    jitter: false,
+};
+
+/// Adapter letting `neo4rs::Error` participate in `core::with_retry`.
+///
+/// `core::with_retry` decides retryability through the `IsRetryable` trait,
+/// which cannot be implemented for the foreign `neo4rs::Error` (orphan rule).
+/// The newtype carries the driver error plus the verdict `is_transient` already
+/// computes, and lives only for the duration of one call. The `bool` is captured
+/// up front rather than recomputed in `is_retryable` so the classification stays
+/// the single `is_transient` definition.
+#[derive(Debug)]
+struct Neo4jRetryError {
+    inner: neo4rs::Error,
+    retryable: bool,
+}
+
+impl IsRetryable for Neo4jRetryError {
+    fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+/// Map an exhausted retry back to the two messages callers have always seen.
+///
+/// The verdict is re-read rather than tracked separately: a non-transient error
+/// means `core::with_retry` bailed on the first attempt (so the message names the
+/// driver error), while a transient one means the budget ran out (so the message
+/// names the attempt count). Free function, not a method, because constructing a
+/// `Neo4jDatabase` needs a live connection — this way the mapping is unit-testable.
+fn neo4j_retry_error(e: Neo4jRetryError) -> CoreError {
+    if e.is_retryable() {
+        CoreError::Internal(format!(
+            "Neo4j operation failed after {MAX_RETRIES} retries: {}",
+            e.inner
+        ))
+    } else {
+        CoreError::Internal(format!("Neo4j error: {}", e.inner))
+    }
+}
 
 /// Neo4j connection manager wrapping neo4rs with retry for transient
 /// failures.
@@ -157,38 +292,43 @@ impl Neo4jDatabase {
         }
     }
 
+    /// Run `make` under the shared retry policy.
+    ///
+    /// Delegates the loop to `core::with_retry` (Phase 3.10) so the graph and
+    /// SQL backends cannot drift on attempts, backoff or what counts as
+    /// transient. `map_err` (not an `async` block) adapts the driver error:
+    /// it yields an *owned* future type, which is what `with_retry`'s single
+    /// `Fut` parameter requires — an async block would borrow `make` and could
+    /// not be named as one type across calls.
+    ///
+    /// Both original outcome messages are preserved by re-reading the verdict on
+    /// the way out: a non-transient failure surfaces immediately, an exhausted
+    /// budget reports the attempt count.
     async fn with_retry<T, F, Fut>(&self, make: F) -> easyrag_core::Result<T>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<T, neo4rs::Error>>,
     {
-        let mut last: Option<neo4rs::Error> = None;
-        for attempt in 0..MAX_RETRIES {
-            match make().await {
-                Ok(v) => return Ok(v),
-                Err(e) if Self::is_transient(&e) => {
-                    tracing::warn!(
-                        "Neo4j transient error (attempt {}/{}): {e}",
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    if attempt < MAX_RETRIES - 1 {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            RETRY_DELAY_MS * (attempt + 1) as u64,
-                        ))
-                        .await;
-                    }
-                    last = Some(e);
-                }
-                Err(e) => {
-                    return Err(CoreError::Internal(format!("Neo4j error: {e}")));
-                }
-            }
-        }
-        Err(CoreError::Internal(format!(
-            "Neo4j operation failed after {MAX_RETRIES} retries: {}",
-            last.map(|e| e.to_string()).unwrap_or_default()
-        )))
+        use futures::TryFutureExt;
+
+        let outcome = retry_core(
+            &RETRY_CONFIG,
+            Some(|e: &Neo4jRetryError, attempt: u32, _delay: std::time::Duration| {
+                tracing::warn!(
+                    "Neo4j transient error (attempt {attempt}/{MAX_RETRIES}): {}",
+                    e.inner
+                );
+            }),
+            move || {
+                make().map_err(|e| Neo4jRetryError {
+                    retryable: Self::is_transient(&e),
+                    inner: e,
+                })
+            },
+        )
+        .await;
+
+        outcome.map_err(neo4j_retry_error)
     }
 
     async fn drain_rows<S>(
@@ -441,25 +581,27 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
         })
     }
 
-    /// Escaped workspace label for Cypher queries.
+    /// Borrowed tenant scope for this backend (no allocation).
+    fn scope<'a>(&'a self, biz_id: &'a str) -> TenantScopeRef<'a> {
+        TenantScopeRef::new(&self.workspace, biz_id)
+    }
+
+    /// Escaped workspace label for Cypher queries (biz-independent).
     fn ws_label(&self) -> String {
-        format!("`{}`", self.workspace)
+        cypher_ws_label(&self.workspace)
     }
 
     /// Node label + biz-line scope fragment for Cypher MATCH: `` `ws` ``
     /// (read-path wildcard when `biz_id` is empty — lists every biz line of
     /// the workspace) or `` `ws` {biz_id: $biz} `` (exact biz line). Mirrors
-    /// `PgDocStatusStorage::list_scope_clause`: an empty biz_id is the
-    /// read-path wildcard, never a literal match against the empty string.
+    /// `PgScoped::list_scope_clause`: an empty biz_id is the read-path
+    /// wildcard, never a literal match against the empty string. The rule
+    /// itself lives in `TenantScopeCypher`, so the SQL and Cypher backends
+    /// cannot drift apart on it.
     /// Write paths and single-node reads must NOT route through this helper
     /// — they keep the exact scope.
     fn node_scope(&self, biz_id: &str) -> String {
-        let ws = self.ws_label();
-        if biz_id.is_empty() {
-            ws
-        } else {
-            format!("{ws} {{biz_id: $biz}}")
-        }
+        self.scope(biz_id).node_label()
     }
 
     /// Fulltext index name (sanitized for Neo4j symbolic name rules).
@@ -598,11 +740,11 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
         let mut nodes = Vec::new();
         for record in &node_records {
             if let Some(n) = record.get("n") {
-                nodes.push(KnowledgeGraphNode {
-                    id: Self::node_id(n),
-                    labels: Self::node_labels(n),
-                    properties: Self::node_to_map(n).unwrap_or_default(),
-                });
+                nodes.push(KnowledgeGraphNode::new(
+                    Self::node_id(n),
+                    Self::node_labels(n),
+                    Self::node_to_map(n).unwrap_or_default(),
+                ));
             }
         }
 
@@ -611,8 +753,9 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
             .db
             .run(
                 &format!(
-                    "MATCH (a:{node})-[r:DIRECTED]->(b:{node}) \
-                     RETURN a.entity_id AS src, b.entity_id AS tgt, r LIMIT $limit"
+                    "MATCH (a:{node}){}(b:{node}) \
+                     RETURN a.entity_id AS src, b.entity_id AS tgt, r LIMIT $limit",
+                    cypher::edge_pat("r", true)
                 ),
                 Self::biz_params_with(biz_id, &[(
                     "limit",
@@ -626,13 +769,13 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
             let tgt = Self::row_str(record, "tgt");
             if node_ids.contains(&src) && node_ids.contains(&tgt) {
                 let rel = record.get("r").cloned().unwrap_or(JsonValue::Null);
-                edges.push(KnowledgeGraphEdge {
-                    id: Self::rel_element_id(&rel),
-                    edge_type: Some("DIRECTED".to_string()),
-                    source: src,
-                    target: tgt,
-                    properties: Self::rel_props(&rel),
-                });
+                edges.push(KnowledgeGraphEdge::new(
+                    Self::rel_element_id(&rel),
+                    Some(cypher::REL_TYPE.to_string()),
+                    src,
+                    tgt,
+                    Self::rel_props(&rel),
+                ));
             }
         }
 
@@ -653,25 +796,26 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
         let safe_depth = max_depth.clamp(1, 10);
         let safe_max_nodes = max_nodes.clamp(1, 10_000);
         let ws = self.ws_label();
+        // The variable-length traversal keeps its own shape (it is not an
+        // `edge_pat` arm), but its relationship type is the same one every
+        // other pattern matches on, so it interpolates `REL_TYPE` rather than
+        // repeating the literal.
+        let rel = cypher::REL_TYPE;
         // Read-path wildcard: an empty biz_id expands across every biz line
         // of the workspace (drops the biz_id predicate instead of matching
         // the literal empty string). See `node_scope`.
-        let start_map = if biz_id.is_empty() {
-            "{entity_id: $label}".to_string()
-        } else {
-            "{entity_id: $label, biz_id: $biz}".to_string()
-        };
-        let biz_where = if biz_id.is_empty() {
-            String::new()
-        } else {
-            "WHERE n.biz_id = $biz ".to_string()
-        };
+        let scope = self.scope(biz_id);
+        let start_map = scope.entity_map("$label");
+        let biz_where = scope
+            .biz_predicate("n")
+            .map(|p| format!("WHERE {p} "))
+            .unwrap_or_default();
         // BFS-style expansion using variable-length path
         let records = self
             .db
             .run(
                 &format!(
-                    "MATCH path = (start:{ws} {start_map})-[:DIRECTED*0..{safe_depth}]-(connected:{ws}) \
+                    "MATCH path = (start:{ws} {start_map})-[:{rel}*0..{safe_depth}]-(connected:{ws}) \
                      UNWIND nodes(path) AS n \
                      {biz_where}WITH DISTINCT n LIMIT $maxNodes \
                      RETURN n"
@@ -686,11 +830,11 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
         let mut nodes = Vec::new();
         for record in &records {
             if let Some(n) = record.get("n") {
-                nodes.push(KnowledgeGraphNode {
-                    id: Self::node_id(n),
-                    labels: Self::node_labels(n),
-                    properties: Self::node_to_map(n).unwrap_or_default(),
-                });
+                nodes.push(KnowledgeGraphNode::new(
+                    Self::node_id(n),
+                    Self::node_labels(n),
+                    Self::node_to_map(n).unwrap_or_default(),
+                ));
             }
         }
 
@@ -707,20 +851,20 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
             .iter()
             .map(|n| JsonValue::String(n.id.clone()))
             .collect();
-        let a_map = if biz_id.is_empty() {
-            "{entity_id: srcId}".to_string()
-        } else {
-            "{entity_id: srcId, biz_id: $biz}".to_string()
-        };
+        // Same read-path wildcard rule as `node_scope`, applied to the
+        // `UNWIND`-bound source side of the match.
+        let a_map = self.scope(biz_id).entity_map("srcId");
         let b_scope = self.node_scope(biz_id);
         let edge_records = self
             .db
             .run(
                 &format!(
-                    "UNWIND $ids AS srcId \
-                     MATCH (a:{ws} {a_map})-[r:DIRECTED]-(b:{b_scope}) \
+                    "{} \
+                     MATCH (a:{ws} {a_map}){}(b:{b_scope}) \
                      WHERE b.entity_id IN $ids \
-                     RETURN DISTINCT a.entity_id AS src, b.entity_id AS tgt, r"
+                     RETURN DISTINCT a.entity_id AS src, b.entity_id AS tgt, r",
+                    cypher::unwind("ids", "srcId"),
+                    cypher::edge_pat("r", false)
                 ),
                 Self::biz_params_with(biz_id, &[("ids", JsonValue::Array(node_ids))]),
             )
@@ -729,13 +873,13 @@ impl<O: Neo4jOps> Neo4jGraphStorage<O> {
         let mut edges = Vec::new();
         for record in &edge_records {
             let rel = record.get("r").cloned().unwrap_or(JsonValue::Null);
-            edges.push(KnowledgeGraphEdge {
-                id: Self::rel_element_id(&rel),
-                edge_type: Some("DIRECTED".to_string()),
-                source: Self::row_str(record, "src"),
-                target: Self::row_str(record, "tgt"),
-                properties: Self::rel_props(&rel),
-            });
+            edges.push(KnowledgeGraphEdge::new(
+                Self::rel_element_id(&rel),
+                Some(cypher::REL_TYPE.to_string()),
+                Self::row_str(record, "src"),
+                Self::row_str(record, "tgt"),
+                Self::rel_props(&rel),
+            ));
         }
 
         Ok(KnowledgeGraph {
@@ -825,35 +969,21 @@ impl<O: Neo4jOps> StorageNameSpace for Neo4jGraphStorage<O> {
         Ok(())
     }
 
-    async fn index_done_callback(&self) -> easyrag_core::Result<()> {
-        // Neo4j auto-commits, nothing to flush
-        Ok(())
-    }
-
     async fn drop(&self, biz_id: &str) -> easyrag_core::Result<HashMap<String, String>> {
         let ws = self.ws_label();
         match self
             .db
             .run_write_void(
-                &format!("MATCH (n:{ws} {{biz_id: $biz}}) DETACH DELETE n"),
+                &format!("MATCH {} DETACH DELETE n", cypher::node_pat(&ws, "n", None)),
                 Self::biz_params(biz_id),
             )
             .await
         {
-            Ok(()) => Ok(HashMap::from([
-                ("status".to_string(), "success".to_string()),
-                (
-                    "message".to_string(),
-                    format!(
-                        "All nodes in workspace '{}', biz_id '{}' deleted",
-                        self.workspace, biz_id
-                    ),
-                ),
-            ])),
-            Err(e) => Ok(HashMap::from([
-                ("status".to_string(), "error".to_string()),
-                ("message".to_string(), e.to_string()),
-            ])),
+            Ok(()) => Ok(drop_success(format!(
+                "All nodes in workspace '{}', biz_id '{}' deleted",
+                self.workspace, biz_id
+            ))),
+            Err(e) => Ok(drop_error(e)),
         }
     }
 }
@@ -870,7 +1000,8 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             .db
             .run(
                 &format!(
-                    "MATCH (n:{ws} {{entity_id: $id, biz_id: $biz}}) RETURN count(n) > 0 AS exists"
+                    "MATCH {} RETURN count(n) > 0 AS exists",
+                    cypher::node_pat(&ws, "n", Some("$id"))
                 ),
                 Self::biz_params_with(biz_id, &[("id", JsonValue::String(node_id.to_string()))]),
             )
@@ -889,8 +1020,11 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             .db
             .run(
                 &format!(
-                    "MATCH (a:{ws} {{entity_id: $src, biz_id: $biz}})-[r:DIRECTED]-(b:{ws} {{entity_id: $tgt, biz_id: $biz}}) \
-                     RETURN count(r) > 0 AS exists"
+                    "MATCH {}{}{} \
+                     RETURN count(r) > 0 AS exists",
+                    cypher::node_pat(&ws, "a", Some("$src")),
+                    cypher::edge_pat("r", false),
+                    cypher::node_pat(&ws, "b", Some("$tgt"))
                 ),
                 Self::biz_params_with(biz_id, &[
                     ("src", JsonValue::String(source_node_id.to_string())),
@@ -907,7 +1041,8 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             .db
             .run(
                 &format!(
-                    "MATCH (n:{ws} {{entity_id: $id, biz_id: $biz}})-[r:DIRECTED]-(m:{ws} {{biz_id: $biz}}) RETURN count(r) AS degree"
+                    "MATCH {} RETURN count(r) AS degree",
+                    cypher::degree_pat(&ws, "n", "$id", "r", "m")
                 ),
                 Self::biz_params_with(biz_id, &[("id", JsonValue::String(node_id.to_string()))]),
             )
@@ -927,7 +1062,7 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
         let records = self
             .db
             .run(
-                &format!("MATCH (n:{ws} {{entity_id: $id, biz_id: $biz}}) RETURN n"),
+                &format!("MATCH {} RETURN n", cypher::node_pat(&ws, "n", Some("$id"))),
                 Self::biz_params_with(biz_id, &[("id", JsonValue::String(node_id.to_string()))]),
             )
             .await?;
@@ -951,8 +1086,11 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             .db
             .run(
                 &format!(
-                    "MATCH (a:{ws} {{entity_id: $src, biz_id: $biz}})-[r:DIRECTED]-(b:{ws} {{entity_id: $tgt, biz_id: $biz}}) \
-                     RETURN r LIMIT 1"
+                    "MATCH {}{}{} \
+                     RETURN r LIMIT 1",
+                    cypher::node_pat(&ws, "a", Some("$src")),
+                    cypher::edge_pat("r", false),
+                    cypher::node_pat(&ws, "b", Some("$tgt"))
                 ),
                 Self::biz_params_with(biz_id, &[
                     ("src", JsonValue::String(source_node_id.to_string())),
@@ -992,8 +1130,11 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             .db
             .run(
                 &format!(
-                    "MATCH (a:{ws} {{entity_id: $id, biz_id: $biz}})-[r:DIRECTED]-(b:{ws} {{biz_id: $biz}}) \
-                     RETURN a.entity_id AS src, b.entity_id AS tgt"
+                    "MATCH {}{}{} \
+                     RETURN a.entity_id AS src, b.entity_id AS tgt",
+                    cypher::node_pat(&ws, "a", Some("$id")),
+                    cypher::edge_pat("r", false),
+                    cypher::node_pat(&ws, "b", None)
                 ),
                 Self::biz_params_with(biz_id, &[("id", JsonValue::String(source_node_id.to_string()))]),
             )
@@ -1016,7 +1157,7 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
         let props = sanitize_props(node_data);
         self.db
             .run_write_void(
-                &format!("MERGE (n:{ws} {{entity_id: $id, biz_id: $biz}}) SET n += $props"),
+                &format!("MERGE {} SET n += $props", cypher::node_pat(&ws, "n", Some("$id"))),
                 Self::biz_params_with(biz_id, &[
                     ("id", JsonValue::String(node_id.to_string())),
                     ("props", JsonValue::Object(props)),
@@ -1037,8 +1178,11 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
         self.db
             .run_write_void(
                 &format!(
-                    "MATCH (a:{ws} {{entity_id: $src, biz_id: $biz}}), (b:{ws} {{entity_id: $tgt, biz_id: $biz}}) \
-                     MERGE (a)-[r:DIRECTED]->(b) SET r += $props, r.biz_id = $biz"
+                    "MATCH {}, {} \
+                     MERGE (a){}(b) SET r += $props, r.biz_id = $biz",
+                    cypher::node_pat(&ws, "a", Some("$src")),
+                    cypher::node_pat(&ws, "b", Some("$tgt")),
+                    cypher::edge_pat("r", true)
                 ),
                 Self::biz_params_with(biz_id, &[
                     ("src", JsonValue::String(source_node_id.to_string())),
@@ -1053,7 +1197,7 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
         let ws = self.ws_label();
         self.db
             .run_write_void(
-                &format!("MATCH (n:{ws} {{entity_id: $id, biz_id: $biz}}) DETACH DELETE n"),
+                &format!("MATCH {} DETACH DELETE n", cypher::node_pat(&ws, "n", Some("$id"))),
                 Self::biz_params_with(biz_id, &[("id", JsonValue::String(node_id.to_string()))]),
             )
             .await
@@ -1064,14 +1208,13 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             return Ok(());
         }
         let ws = self.ws_label();
-        let ids: Vec<JsonValue> = node_ids
-            .iter()
-            .map(|id| JsonValue::String(id.clone()))
-            .collect();
+        let ids = cypher::json_ids(node_ids);
         self.db
             .run_write_void(
                 &format!(
-                    "UNWIND $ids AS id MATCH (n:{ws} {{entity_id: id, biz_id: $biz}}) DETACH DELETE n"
+                    "{} MATCH {} DETACH DELETE n",
+                    cypher::unwind("ids", "id"),
+                    cypher::node_pat(&ws, "n", Some("id"))
                 ),
                 Self::biz_params_with(biz_id, &[("ids", JsonValue::Array(ids))]),
             )
@@ -1095,9 +1238,13 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
         self.db
             .run_write_void(
                 &format!(
-                    "UNWIND $edges AS edge \
-                     MATCH (a:{ws} {{entity_id: edge.src, biz_id: $biz}})-[r:DIRECTED]-(b:{ws} {{entity_id: edge.tgt, biz_id: $biz}}) \
-                     DELETE r"
+                    "{} \
+                     MATCH {}{}{} \
+                     DELETE r",
+                    cypher::unwind("edges", "edge"),
+                    cypher::node_pat(&ws, "a", Some("edge.src")),
+                    cypher::edge_pat("r", false),
+                    cypher::node_pat(&ws, "b", Some("edge.tgt"))
                 ),
                 Self::biz_params_with(biz_id, &[("edges", JsonValue::Array(edges))]),
             )
@@ -1110,7 +1257,8 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             .db
             .run(
                 &format!(
-                    "MATCH (n:{ws} {{biz_id: $biz}}) RETURN n.entity_id AS label ORDER BY n.entity_id"
+                    "MATCH {} RETURN n.entity_id AS label ORDER BY n.entity_id",
+                    cypher::node_pat(&ws, "n", None)
                 ),
                 Self::biz_params(biz_id),
             )
@@ -1151,8 +1299,9 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             .db
             .run(
                 &format!(
-                    "MATCH (a:{node})-[r:DIRECTED]->(b:{node}) \
-                     RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props"
+                    "MATCH (a:{node}){}(b:{node}) \
+                     RETURN a.entity_id AS src, b.entity_id AS tgt, properties(r) AS props",
+                    cypher::edge_pat("r", true)
                 ),
                 Self::biz_params(biz_id),
             )
@@ -1184,9 +1333,10 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             .db
             .run(
                 &format!(
-                    "MATCH (n:{node})-[r:DIRECTED]-() \
+                    "MATCH (n:{node}){}() \
                      RETURN n.entity_id AS label, count(r) AS degree \
-                     ORDER BY degree DESC LIMIT $limit"
+                     ORDER BY degree DESC LIMIT $limit",
+                    cypher::edge_pat("r", false)
                 ),
                 Self::biz_params_with(biz_id, &[("limit", JsonValue::from(limit as i64))]),
             )
@@ -1198,12 +1348,12 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
         let ftn = self.fulltext_index_name();
         // Read-path wildcard: an empty biz_id drops the biz post-filter so
         // search spans every biz line of the workspace.
-        let biz_pred = if biz_id.is_empty() {
-            String::new()
-        } else {
-            " AND node.biz_id = $biz".to_string()
-        };
-        let node = self.node_scope(biz_id);
+        let scope = self.scope(biz_id);
+        let biz_pred = scope
+            .biz_predicate("node")
+            .map(|p| format!(" AND {p}"))
+            .unwrap_or_default();
+        let node = scope.node_label();
         let params = Self::biz_params_with(biz_id, &[
             ("query", JsonValue::String(query.to_string())),
             ("limit", JsonValue::from(limit as i64)),
@@ -1255,14 +1405,15 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             return Ok(HashMap::new());
         }
         let ws = self.ws_label();
-        let ids: Vec<JsonValue> = node_ids
-            .iter()
-            .map(|id| JsonValue::String(id.clone()))
-            .collect();
+        let ids = cypher::json_ids(node_ids);
         let records = self
             .db
             .run(
-                &format!("UNWIND $ids AS id MATCH (n:{ws} {{entity_id: id, biz_id: $biz}}) RETURN n"),
+                &format!(
+                    "{} MATCH {} RETURN n",
+                    cypher::unwind("ids", "id"),
+                    cypher::node_pat(&ws, "n", Some("id"))
+                ),
                 Self::biz_params_with(biz_id, &[("ids", JsonValue::Array(ids))]),
             )
             .await?;
@@ -1287,17 +1438,16 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             return Ok(HashMap::new());
         }
         let ws = self.ws_label();
-        let ids: Vec<JsonValue> = node_ids
-            .iter()
-            .map(|id| JsonValue::String(id.clone()))
-            .collect();
+        let ids = cypher::json_ids(node_ids);
         let records = self
             .db
             .run(
                 &format!(
-                    "UNWIND $ids AS id \
-                     OPTIONAL MATCH (n:{ws} {{entity_id: id, biz_id: $biz}})-[r:DIRECTED]-(m:{ws} {{biz_id: $biz}}) \
-                     RETURN id, count(r) AS degree"
+                    "{} \
+                     OPTIONAL MATCH {} \
+                     RETURN id, count(r) AS degree",
+                    cypher::unwind("ids", "id"),
+                    cypher::degree_pat(&ws, "n", "id", "r", "m")
                 ),
                 Self::biz_params_with(biz_id, &[("ids", JsonValue::Array(ids))]),
             )
@@ -1325,7 +1475,9 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
         self.db
             .run_write_void(
                 &format!(
-                    "UNWIND $items AS item MERGE (n:{ws} {{entity_id: item.id, biz_id: $biz}}) SET n += item.props"
+                    "{} MERGE {} SET n += item.props",
+                    cypher::unwind("items", "item"),
+                    cypher::node_pat(&ws, "n", Some("item.id"))
                 ),
                 Self::biz_params_with(biz_id, &[("items", JsonValue::Array(items))]),
             )
@@ -1337,15 +1489,14 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             return Ok(HashSet::new());
         }
         let ws = self.ws_label();
-        let ids: Vec<JsonValue> = node_ids
-            .iter()
-            .map(|id| JsonValue::String(id.clone()))
-            .collect();
+        let ids = cypher::json_ids(node_ids);
         let records = self
             .db
             .run(
                 &format!(
-                    "UNWIND $ids AS id MATCH (n:{ws} {{entity_id: id, biz_id: $biz}}) RETURN n.entity_id AS id"
+                    "{} MATCH {} RETURN n.entity_id AS id",
+                    cypher::unwind("ids", "id"),
+                    cypher::node_pat(&ws, "n", Some("id"))
                 ),
                 Self::biz_params_with(biz_id, &[("ids", JsonValue::Array(ids))]),
             )
@@ -1375,9 +1526,13 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
         self.db
             .run_write_void(
                 &format!(
-                    "UNWIND $items AS item \
-                     MATCH (a:{ws} {{entity_id: item.src, biz_id: $biz}}), (b:{ws} {{entity_id: item.tgt, biz_id: $biz}}) \
-                     MERGE (a)-[r:DIRECTED]->(b) SET r += item.props, r.biz_id = $biz"
+                    "{} \
+                     MATCH {}, {} \
+                     MERGE (a){}(b) SET r += item.props, r.biz_id = $biz",
+                    cypher::unwind("items", "item"),
+                    cypher::node_pat(&ws, "a", Some("item.src")),
+                    cypher::node_pat(&ws, "b", Some("item.tgt")),
+                    cypher::edge_pat("r", true)
                 ),
                 Self::biz_params_with(biz_id, &[("items", JsonValue::Array(items))]),
             )
@@ -1406,11 +1561,14 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             .db
             .run(
                 &format!(
-                    "UNWIND $items AS item \
-                     OPTIONAL MATCH (a:{ws} {{entity_id: item.src, biz_id: $biz}})-[ra:DIRECTED]-(ma:{ws} {{biz_id: $biz}}) \
+                    "{} \
+                     OPTIONAL MATCH {} \
                      WITH item, count(ra) AS srcDeg \
-                     OPTIONAL MATCH (b:{ws} {{entity_id: item.tgt, biz_id: $biz}})-[rb:DIRECTED]-(mb:{ws} {{biz_id: $biz}}) \
-                     RETURN item.src AS src, item.tgt AS tgt, srcDeg + count(rb) AS degree"
+                     OPTIONAL MATCH {} \
+                     RETURN item.src AS src, item.tgt AS tgt, srcDeg + count(rb) AS degree",
+                    cypher::unwind("items", "item"),
+                    cypher::degree_pat(&ws, "a", "item.src", "ra", "ma"),
+                    cypher::degree_pat(&ws, "b", "item.tgt", "rb", "mb")
                 ),
                 Self::biz_params_with(biz_id, &[("items", JsonValue::Array(items))]),
             )
@@ -1448,9 +1606,13 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             .db
             .run(
                 &format!(
-                    "UNWIND $items AS item \
-                     MATCH (a:{ws} {{entity_id: item.src, biz_id: $biz}})-[r:DIRECTED]-(b:{ws} {{entity_id: item.tgt, biz_id: $biz}}) \
-                     RETURN item.src AS src, item.tgt AS tgt, properties(r) AS props"
+                    "{} \
+                     MATCH {}{}{} \
+                     RETURN item.src AS src, item.tgt AS tgt, properties(r) AS props",
+                    cypher::unwind("items", "item"),
+                    cypher::node_pat(&ws, "a", Some("item.src")),
+                    cypher::edge_pat("r", false),
+                    cypher::node_pat(&ws, "b", Some("item.tgt"))
                 ),
                 Self::biz_params_with(biz_id, &[("items", JsonValue::Array(items))]),
             )
@@ -1480,17 +1642,18 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             return Ok(HashMap::new());
         }
         let ws = self.ws_label();
-        let ids: Vec<JsonValue> = node_ids
-            .iter()
-            .map(|id| JsonValue::String(id.clone()))
-            .collect();
+        let ids = cypher::json_ids(node_ids);
         let records = self
             .db
             .run(
                 &format!(
-                    "UNWIND $ids AS id \
-                     MATCH (a:{ws} {{entity_id: id, biz_id: $biz}})-[r:DIRECTED]-(b:{ws} {{biz_id: $biz}}) \
-                     RETURN id, a.entity_id AS src, b.entity_id AS tgt"
+                    "{} \
+                     MATCH {}{}{} \
+                     RETURN id, a.entity_id AS src, b.entity_id AS tgt",
+                    cypher::unwind("ids", "id"),
+                    cypher::node_pat(&ws, "a", Some("id")),
+                    cypher::edge_pat("r", false),
+                    cypher::node_pat(&ws, "b", None)
                 ),
                 Self::biz_params_with(biz_id, &[("ids", JsonValue::Array(ids))]),
             )
@@ -1508,5 +1671,68 @@ impl<O: Neo4jOps> GraphStorage for Neo4jGraphStorage<O> {
             .iter()
             .map(|id| (id.clone(), collected.get(id).cloned().unwrap_or_default()))
             .collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3.10 guardrails: the graph backend's retry loop moved onto
+// `core::with_retry`. `Neo4jDatabase::with_retry` itself needs a live connection
+// to reach, so the two things that could silently change are pinned directly —
+// the backoff curve (via `RETRY_CONFIG`) and the two outcome messages (via
+// `neo4j_retry_error`).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    /// `500 * 2^(attempt-1)` for the attempt that just failed.
+    fn delay_for(attempt: u32) -> u128 {
+        (RETRY_CONFIG.base_delay.as_millis() as f64
+            * RETRY_CONFIG.exponential_base.powi((attempt - 1) as i32)) as u128
+    }
+
+    #[test]
+    fn policy_reproduces_the_delays_the_old_loop_slept() {
+        assert_eq!(MAX_RETRIES, RETRY_CONFIG.max_attempts);
+        assert_eq!(
+            std::time::Duration::from_millis(RETRY_DELAY_MS),
+            RETRY_CONFIG.base_delay
+        );
+        // Jitter off: the curve has to stay deterministic and match the old one.
+        assert!(!RETRY_CONFIG.jitter);
+        // The old loop slept `RETRY_DELAY_MS * (attempt + 1)` over a 0-based
+        // attempt, i.e. 500ms then 1000ms across 3 tries (no sleep after the
+        // last). Exponential 500 * 2^n lands on exactly the same two values.
+        assert_eq!(500, delay_for(1), "first sleep must stay 500ms");
+        assert_eq!(1000, delay_for(2), "second sleep must stay 1000ms");
+        // The cap cannot bind at 3 attempts, so it must not shorten them.
+        assert!(RETRY_CONFIG.max_delay >= std::time::Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn an_exhausted_budget_reports_the_attempt_count() {
+        let err = Neo4jRetryError {
+            inner: neo4rs::Error::ConnectionError,
+            retryable: true,
+        };
+        let msg = neo4j_retry_error(err).to_string();
+        assert!(
+            msg.starts_with("Neo4j operation failed after 3 retries: "),
+            "exhausted-budget message changed: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_non_transient_failure_surfaces_the_driver_error_immediately() {
+        let err = Neo4jRetryError {
+            inner: neo4rs::Error::ConnectionError,
+            retryable: false,
+        };
+        let msg = neo4j_retry_error(err).to_string();
+        assert!(msg.starts_with("Neo4j error: "), "fatal message changed: {msg}");
+        assert!(
+            !msg.contains("retries"),
+            "a fatal error must not claim a retry budget it never used: {msg}"
+        );
     }
 }

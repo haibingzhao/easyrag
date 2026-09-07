@@ -1,0 +1,4 @@
+---
+source: crates/easyrag-llm/tests/openai_client.rs
+---
+{"model":"test-model","messages":[{"role":"system","content":"sys"},{"role":"user","content":"u1"},{"role":"assistant","content":"a1"},{"role":"user","content":"hello"}],"stream":false,"temperature":0.5,"max_tokens":100,"response_format":{"type":"json_object"}}

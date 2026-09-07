@@ -1,0 +1,7 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+len=2
+calls:
+on_parse_start(file_path=fp, parser=docling)
+on_query_start(query=q, mode=naive)

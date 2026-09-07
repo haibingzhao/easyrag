@@ -26,6 +26,33 @@ async fn last_request(server: &MockServer) -> (Value, Option<String>) {
     (body, auth)
 }
 
+/// Phase 0.6 — raw request-body bytes exactly as sent (full-byte golden). See the
+/// openai_client.rs helper of the same name for rationale.
+async fn last_request_body_raw(server: &MockServer) -> String {
+    let requests = server.received_requests().await.unwrap();
+    let last = requests.last().expect("at least one request");
+    String::from_utf8(last.body.clone()).expect("utf-8 request body")
+}
+
+fn llm_golden_dir() -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root above crates/easyrag-llm");
+    root.join("testdata").join("golden").join("llm")
+}
+
+fn snap_llm(name: &str, body: &str) {
+    insta::with_settings!({
+        snapshot_path => llm_golden_dir(),
+        prepend_module_to_snapshot => false,
+        omit_expression => true,
+    }, {
+        insta::assert_snapshot!(name, body);
+    });
+}
+
 fn docs() -> Vec<String> {
     vec!["doc-a".to_string(), "doc-b".to_string(), "doc-c".to_string()]
 }
@@ -52,6 +79,12 @@ async fn rerank_sends_golden_body_with_default_top_n() {
         body
     );
     assert_eq!(Some("Bearer rk-key".to_string()), auth);
+
+    // Full-byte golden: rerank request body (default top_n = documents.len()).
+    snap_llm(
+        "rerank_request_body",
+        &last_request_body_raw(&server).await,
+    );
 }
 
 #[tokio::test]

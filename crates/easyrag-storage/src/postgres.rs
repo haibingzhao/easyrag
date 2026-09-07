@@ -10,9 +10,11 @@
 //!   row-by-row semantics.
 
 use async_trait::async_trait;
+use easyrag_core::concurrency::{with_retry, RetryConfig};
 use easyrag_core::llm::{EmbeddingContext, EmbeddingFunc};
 use easyrag_core::model::{
     DocProcessingStatus, DocStatus, KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode,
+    TenantScopeRef,
 };
 use easyrag_core::storage::traits::{
     DocStatusStorage, GraphStorage, KVStorage, StorageNameSpace, VectorStorage,
@@ -27,6 +29,10 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgValueRef};
 use sqlx::{Column, Decode, Error as SqlxError, Pool, Postgres, Row, TypeInfo, ValueRef};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+
+use crate::drop_result::drop_result;
+use crate::pg_upsert::{batched_with_fallback, PgUpsertBuilder, TENANT_CONFLICT_TARGET};
+use crate::scope_sql::{sql_escape, sql_in_list, TenantScopeSql};
 
 /// PostgreSQL configuration for EasyRAG storage.
 #[derive(Clone, Debug)]
@@ -181,39 +187,47 @@ fn dynamic_query(
     sqlx::query(builder.into_sql())
 }
 
-/// Retry transient (connection-level) failures with exponential backoff:
-/// base 1s, factor 2, capped at 10s, 3 attempts.
+/// Postgres retry policy: base 1s, factor 2, capped at 10s, 3 attempts, no
+/// jitter — byte-for-byte the curve the hand-rolled loop used, so wiring it onto
+/// `core::with_retry` is [equivalent]: attempt 1 waits 1000ms, attempt 2 waits
+/// 2000ms, attempt 3 fails the operation.
+///
+/// Jitter stays off on purpose. The LLM clients enable it to de-synchronise a
+/// fan-out of concurrent completions; storage retries are driven one statement
+/// at a time and the fixed 1s/2s curve is what operators are told to expect.
+const PG_RETRY_CONFIG: RetryConfig = RetryConfig {
+    max_attempts: 3,
+    base_delay: Duration::from_secs(1),
+    max_delay: Duration::from_secs(10),
+    exponential_base: 2.0,
+    jitter: false,
+};
+
+/// Retry transient (connection-level) failures with exponential backoff.
+///
+/// *What counts as transient* lives in `CoreError::is_retryable` (core/error.rs)
+/// and is shared with the Neo4j backend — Phase 3.10 moved the classification out
+/// of this function precisely so the two backends cannot drift apart again.
+///
+/// The `on_retry` hook keeps the PG-specific warn line (`Transient PG failure
+/// …`) that operations grep for; `core::with_retry` additionally emits its own
+/// generic attempt line, so a retry now logs twice rather than once.
 async fn retry<F, Fut, T>(op: F) -> easyrag_core::Result<T>
 where
-    F: Fn() -> Fut,
+    F: FnMut() -> Fut,
     Fut: std::future::Future<Output = easyrag_core::Result<T>>,
 {
-    let max_attempts = 3usize;
-    let mut delay_ms = 1000u64;
-    for attempt in 1..=max_attempts {
-        match op().await {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                let retryable = matches!(
-                    &e,
-                    easyrag_core::CoreError::Internal(msg)
-                        if msg.contains("error occurred while waiting to get a connection")
-                            || msg.contains("error returned from database: connection refused")
-                            || msg.contains("error communicating with the server")
-                            || msg.contains("connection closed")
-                            || msg.contains("error communicating with database")
-                            || msg.contains("broken pipe")
-                ) || matches!(e, easyrag_core::CoreError::ApiTimeout);
-                if !retryable || attempt == max_attempts {
-                    return Err(e);
-                }
-                tracing::warn!("Transient PG failure (attempt {attempt}), retrying in {delay_ms}ms: {e}");
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                delay_ms = (delay_ms * 2).min(10_000);
-            }
-        }
-    }
-    unreachable!()
+    with_retry(
+        &PG_RETRY_CONFIG,
+        Some(|e: &easyrag_core::CoreError, attempt: u32, delay: Duration| {
+            tracing::warn!(
+                "Transient PG failure (attempt {attempt}), retrying in {}ms: {e}",
+                delay.as_millis()
+            );
+        }),
+        op,
+    )
+    .await
 }
 
 impl PgDatabase {
@@ -416,18 +430,65 @@ fn convert_pg_value(raw: PgValueRef<'_>) -> easyrag_core::Result<JsonValue> {
     }
 }
 
-fn sql_escape(s: &str) -> String {
-    s.replace('\'', "''")
+/// Shared tenant-scope rendering for every Pg backend.
+///
+/// Each backend supplies its workspace (as a borrow, so no query pays for a
+/// clone); the filter text itself is defined once in
+/// [`crate::scope_sql::TenantScopeSql`]. Both scope forms live here so a
+/// backend cannot accidentally pick its own: `scope_clause` pins the exact
+/// `(workspace, biz_id)` pair for single-record reads and writes, while
+/// `list_scope_clause` treats an empty `biz_id` as the read-path wildcard over
+/// every biz line of the workspace.
+trait PgScoped {
+    /// Borrow both halves of the scope without cloning: the workspace comes
+    /// from the backend, the biz line from the caller.
+    fn tenant_scope<'a>(&'a self, biz_id: &'a str) -> TenantScopeRef<'a>;
+
+    fn scope_clause(&self, biz_id: &str) -> String {
+        self.tenant_scope(biz_id).sql(None)
+    }
+
+    /// Alias-qualified scope for queries that join two scoped tables.
+    /// Completes the {exact,list} × {plain,alias} matrix. Both joined list paths
+    /// (`get_all_edges`, `get_popular_labels`) widen via
+    /// [`Self::list_scope_clause_as`], and no joined query currently needs the
+    /// exact scope, so this arm is retained for API symmetry.
+    #[allow(dead_code)]
+    fn scope_clause_as(&self, biz_id: &str, alias: &str) -> String {
+        self.tenant_scope(biz_id).sql(Some(alias))
+    }
+
+    /// List/count scope: an empty biz_id is the read-path wildcard matching
+    /// every biz line of the workspace. Single-document reads and writes keep
+    /// the exact scope (status writes must never land on the wrong biz line).
+    fn list_scope_clause(&self, biz_id: &str) -> String {
+        self.tenant_scope(biz_id).list_sql(None)
+    }
+
+    /// Alias-qualified [`Self::list_scope_clause`] for joined list queries.
+    fn list_scope_clause_as(&self, biz_id: &str, alias: &str) -> String {
+        self.tenant_scope(biz_id).list_sql(Some(alias))
+    }
 }
 
-/// Central tenant-scope filter fragment. Every business-table query MUST go
-/// through this helper so workspace and biz_id filtering can never diverge.
-fn scope_filter(workspace: &str, biz_id: &str) -> String {
-    format!(
-        "workspace = '{}' AND biz_id = '{}'",
-        sql_escape(workspace),
-        sql_escape(biz_id)
-    )
+// One workspace borrow per backend; everything else comes from the defaults
+// above, so the four storages cannot drift apart on tenant filtering.
+impl<D: PgDb> PgScoped for PgVectorStorage<D> {
+    fn tenant_scope<'a>(&'a self, biz_id: &'a str) -> TenantScopeRef<'a> {
+        TenantScopeRef::new(&self.workspace, biz_id)
+    }
+}
+
+impl<D: PgDb> PgScoped for PgGraphStorage<D> {
+    fn tenant_scope<'a>(&'a self, biz_id: &'a str) -> TenantScopeRef<'a> {
+        TenantScopeRef::new(&self.workspace, biz_id)
+    }
+}
+
+impl<D: PgDb> PgScoped for PgDocStatusStorage<D> {
+    fn tenant_scope<'a>(&'a self, biz_id: &'a str) -> TenantScopeRef<'a> {
+        TenantScopeRef::new(&self.workspace, biz_id)
+    }
 }
 
 /// Render an optional string as a SQL literal (`NULL` when absent).
@@ -485,11 +546,13 @@ struct PgCrudOps<'a, D: PgDb> {
     biz_id: String,
 }
 
-impl<'a, D: PgDb> PgCrudOps<'a, D> {
-    fn scope_clause(&self, biz_id: &str) -> String {
-        scope_filter(&self.workspace, biz_id)
+impl<D: PgDb> PgScoped for PgCrudOps<'_, D> {
+    fn tenant_scope<'a>(&'a self, biz_id: &'a str) -> TenantScopeRef<'a> {
+        TenantScopeRef::new(&self.workspace, biz_id)
     }
+}
 
+impl<'a, D: PgDb> PgCrudOps<'a, D> {
     // NOTE: PgCrudOps keeps workspace + biz_id as owned copies supplied by the
     // caller's `ops(biz_id)`; biz_id is a per-call filter, not instance state.
 
@@ -508,11 +571,7 @@ impl<'a, D: PgDb> PgCrudOps<'a, D> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let in_list = ids
-            .iter()
-            .map(|id| format!("'{}'", sql_escape(id)))
-            .collect::<Vec<_>>()
-            .join(",");
+        let in_list = sql_in_list(ids.iter().map(String::as_str));
         let sql = format!(
             "SELECT content FROM {} WHERE {} AND id IN ({in_list})",
             self.table_name,
@@ -526,11 +585,7 @@ impl<'a, D: PgDb> PgCrudOps<'a, D> {
         if keys.is_empty() {
             return Ok(HashSet::new());
         }
-        let in_list = keys
-            .iter()
-            .map(|k| format!("'{}'", sql_escape(k)))
-            .collect::<Vec<_>>()
-            .join(",");
+        let in_list = sql_in_list(keys.iter().map(String::as_str));
         let sql = format!(
             "SELECT id FROM {} WHERE {} AND id IN ({in_list})",
             self.table_name,
@@ -548,11 +603,7 @@ impl<'a, D: PgDb> PgCrudOps<'a, D> {
             return Ok(());
         }
         for batch in ids.chunks(PgBatchLimits::DELETE_MAX_RECORDS_PER_BATCH) {
-            let in_list = batch
-                .iter()
-                .map(|id| format!("'{}'", sql_escape(id)))
-                .collect::<Vec<_>>()
-                .join(",");
+            let in_list = sql_in_list(batch.iter().map(String::as_str));
             let sql = format!(
                 "DELETE FROM {} WHERE {} AND id IN ({in_list})",
                 self.table_name,
@@ -597,20 +648,17 @@ fn read_content(row: &JsonMap) -> Option<JsonMap> {
     }
 }
 
-fn drop_result(
-    outcome: easyrag_core::Result<()>,
-    success_message: String,
-) -> HashMap<String, String> {
-    match outcome {
-        Ok(()) => HashMap::from([
-            ("status".to_string(), "success".to_string()),
-            ("message".to_string(), success_message),
-        ]),
-        Err(e) => HashMap::from([
-            ("status".to_string(), "error".to_string()),
-            ("message".to_string(), e.to_string()),
-        ]),
-    }
+/// Read a timestamp column that lives on the row itself rather than inside the
+/// `content` payload. The driver normally renders these as JSON strings, but a
+/// non-string value is stringified instead of being dropped, so the pre-existing
+/// row-level shape is preserved verbatim.
+fn row_timestamp(row: &JsonMap, key: &str) -> String {
+    row.get(key)
+        .map(|v| match v {
+            JsonValue::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -713,10 +761,8 @@ impl<D: PgDb> StorageNameSpace for PgKVStorage<D> {
         Ok(())
     }
 
-    async fn index_done_callback(&self) -> easyrag_core::Result<()> {
-        // PostgreSQL commits immediately, no buffering.
-        Ok(())
-    }
+    // index_done_callback: PostgreSQL commits immediately, no buffering, so the
+    // trait default no-op is the whole implementation.
 
     async fn drop(&self, biz_id: &str) -> easyrag_core::Result<HashMap<String, String>> {
         let message = format!(
@@ -763,28 +809,17 @@ impl<D: PgDb> KVStorage for PgKVStorage<D> {
         if data.is_empty() {
             return Ok(());
         }
-        for batch in data
-            .iter()
-            .collect::<Vec<_>>()
-            .chunks(PgBatchLimits::UPSERT_MAX_RECORDS_PER_BATCH)
-        {
-            let result =
-                batch_upsert_kv(&self.db, &self.table_name, &self.workspace, biz_id, batch)
-                    .await;
-            if result.is_err() {
-                // Fall back to row-by-row (preserves per-record failure granularity).
-                for (id, content) in batch {
-                    batch_upsert_kv(
-                        &self.db,
-                        &self.table_name,
-                        &self.workspace,
-                        biz_id,
-                        &[(*id, content)],
-                    )
-                    .await?;
-                }
-            }
-        }
+        let entries: Vec<(&String, &JsonMap)> = data.iter().collect();
+        let (table, workspace) = (self.table_name.as_str(), self.workspace.as_str());
+        batched_with_fallback(
+            &self.db,
+            &entries,
+            PgBatchLimits::UPSERT_MAX_RECORDS_PER_BATCH,
+            // KV writes the entries themselves; there is nothing to prepare.
+            |batch| async move { Ok(batch.to_vec()) },
+            |rows| kv_upsert_sql(table, workspace, biz_id, rows),
+        )
+        .await?;
         tracing::debug!(
             "PgKVStorage upserted {} records to {}",
             data.len(),
@@ -802,33 +837,27 @@ impl<D: PgDb> KVStorage for PgKVStorage<D> {
     }
 }
 
-/// Batched multi-row upsert (plan P2.2 option B; single statement per batch).
-async fn batch_upsert_kv<D: PgDb>(
-    db: &D,
+/// Render the batched KV upsert (plan P2.2 option B; one statement per batch).
+fn kv_upsert_sql(
     table_name: &str,
     workspace: &str,
     biz_id: &str,
     batch: &[(&String, &JsonMap)],
-) -> easyrag_core::Result<()> {
-    let mut sql = format!(
-        "INSERT INTO {table_name} (id, workspace, biz_id, content, updated_at) VALUES "
+) -> String {
+    let upsert = PgUpsertBuilder::new(
+        table_name,
+        "id, workspace, biz_id, content, updated_at",
+        "content = EXCLUDED.content, updated_at = NOW()",
     );
-    for (idx, (id, content)) in batch.iter().enumerate() {
-        if idx > 0 {
-            sql.push_str(", ");
-        }
-        sql.push_str(&format!(
+    upsert.sql(batch.iter().map(|(id, content)| {
+        format!(
             "('{}', '{}', '{}', {}::jsonb, NOW())",
             sql_escape(id),
             sql_escape(workspace),
             sql_escape(biz_id),
             json_literal(content)
-        ));
-    }
-    sql.push_str(
-        " ON CONFLICT (id, workspace, biz_id) DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()",
-    );
-    db.execute(&sql).await
+        )
+    }))
 }
 
 
@@ -882,10 +911,6 @@ impl<D: PgDb> PgVectorStorage<D> {
             config,
             table_name,
         })
-    }
-
-    fn scope_clause(&self, biz_id: &str) -> String {
-        scope_filter(&self.workspace, biz_id)
     }
 
     fn ops(&self, biz_id: &str) -> PgCrudOps<'_, D> {
@@ -959,6 +984,59 @@ impl<D: PgDb> PgVectorStorage<D> {
         }
         s
     }
+
+    /// Embed one batch and zip the vectors back onto its entries: the
+    /// `prepare` step of [`batched_with_fallback`] for this backend.
+    ///
+    /// Entries with empty `content` get `None`, so the upsert leaves whatever
+    /// embedding the row already has alone (`COALESCE(EXCLUDED.embedding, ..)`).
+    /// The returned rows borrow the batch, which is why this runs once per
+    /// batch instead of per record.
+    async fn embed_batch<'e>(
+        &self,
+        batch: &'e [(String, JsonMap)],
+    ) -> easyrag_core::Result<Vec<(&'e String, &'e JsonMap, Option<Vec<f32>>)>> {
+        let texts: Vec<String> = batch
+            .iter()
+            .map(|(_, content)| {
+                content
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        let embeddings = self
+            .embedding_func
+            .invoke(texts, Some(EmbeddingContext::Document))
+            .await
+            .map_err(|e| {
+                // Propagate instead of silently inserting NULL vectors:
+                // embedding failure must not leave documents invisible
+                // to vector search.
+                easyrag_core::CoreError::Internal(format!(
+                    "PgVectorStorage embedding failed for table {}: {e}",
+                    self.table_name
+                ))
+            })?;
+        Ok(batch
+            .iter()
+            .enumerate()
+            .map(|(i, (id, content))| {
+                let text_empty = content
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true);
+                let emb = if text_empty {
+                    None
+                } else {
+                    embeddings.get(i).cloned()
+                };
+                (id, content, emb)
+            })
+            .collect())
+    }
 }
 
 #[async_trait]
@@ -1023,10 +1101,8 @@ impl<D: PgDb> StorageNameSpace for PgVectorStorage<D> {
         Ok(())
     }
 
-    async fn index_done_callback(&self) -> easyrag_core::Result<()> {
-        // PostgreSQL commits immediately, no buffering.
-        Ok(())
-    }
+    // index_done_callback: PostgreSQL commits immediately, no buffering, so the
+    // trait default no-op is the whole implementation.
 
     async fn drop(&self, biz_id: &str) -> easyrag_core::Result<HashMap<String, String>> {
         let message = format!(
@@ -1086,7 +1162,9 @@ impl<D: PgDb> VectorStorage for PgVectorStorage<D> {
              ORDER BY embedding <=> '{vector_str}'::vector
              LIMIT {top_k}",
             t = self.table_name,
-            scope = self.scope_clause(biz_id)
+            // List path: an empty biz_id searches every biz line of the
+            // workspace (BC-12/A-5), matching `list_scope_clause` on doc status.
+            scope = self.list_scope_clause(biz_id)
         );
         let rows = self.db.fetch_all(&sql).await?;
         let threshold = self.cosine_better_than_threshold();
@@ -1119,70 +1197,18 @@ impl<D: PgDb> VectorStorage for PgVectorStorage<D> {
         }
         let batch_size = self.config.upsert_batch_size.max(1);
         let entries: Vec<(String, JsonMap)> = data.into_iter().collect();
-        for batch in entries.chunks(batch_size.min(PgBatchLimits::UPSERT_MAX_RECORDS_PER_BATCH)) {
-            // One embed(texts) call per batch (option B); empty content skips embedding.
-            let texts: Vec<String> = batch
-                .iter()
-                .map(|(_, content)| {
-                    content
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                })
-                .collect();
-            let embeddings = self
-                .embedding_func
-                .invoke(texts, Some(EmbeddingContext::Document))
-                .await
-                .map_err(|e| {
-                    // Propagate instead of silently inserting NULL vectors:
-                    // embedding failure must not leave documents invisible
-                    // to vector search.
-                    easyrag_core::CoreError::Internal(format!(
-                        "PgVectorStorage embedding failed for table {}: {e}",
-                        self.table_name
-                    ))
-                })?;
-            let rows: Vec<(&String, &JsonMap, Option<Vec<f32>>)> = batch
-                .iter()
-                .enumerate()
-                .map(|(i, (id, content))| {
-                    let text_empty = content
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.is_empty())
-                        .unwrap_or(true);
-                    let emb = if text_empty {
-                        None
-                    } else {
-                        embeddings.get(i).cloned()
-                    };
-                    (id, content, emb)
-                })
-                .collect();
-            let result = batch_upsert_vector(
-                &self.db,
-                &self.table_name,
-                &self.workspace,
-                biz_id,
-                &rows,
-            )
-            .await;
-            if result.is_err() {
-                // Fall back to row-by-row.
-                for (id, content, emb) in &rows {
-                    batch_upsert_vector(
-                        &self.db,
-                        &self.table_name,
-                        &self.workspace,
-                        biz_id,
-                        &[(id, content, emb.clone())],
-                    )
-                    .await?;
-                }
-            }
-        }
+        let (table, workspace) = (self.table_name.as_str(), self.workspace.as_str());
+        batched_with_fallback(
+            &self.db,
+            &entries,
+            batch_size.min(PgBatchLimits::UPSERT_MAX_RECORDS_PER_BATCH),
+            // One embed(texts) call per batch (option B), and never during the
+            // row-by-row replay: a fallback must not re-embed (and re-pay for)
+            // the records it is retrying.
+            |batch| self.embed_batch(batch),
+            |rows| vector_upsert_sql(table, workspace, biz_id, rows),
+        )
+        .await?;
         tracing::debug!(
             "PgVectorStorage upserted {} records to {}",
             entries.len(),
@@ -1235,11 +1261,7 @@ impl<D: PgDb> VectorStorage for PgVectorStorage<D> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let in_list = ids
-            .iter()
-            .map(|id| format!("'{}'", sql_escape(id)))
-            .collect::<Vec<_>>()
-            .join(",");
+        let in_list = sql_in_list(ids.iter().map(String::as_str));
         let sql = format!(
             "SELECT id, embedding FROM {} WHERE {} AND id IN ({in_list})",
             self.table_name,
@@ -1261,40 +1283,37 @@ impl<D: PgDb> VectorStorage for PgVectorStorage<D> {
     }
 }
 
-/// Batched vector upsert. Rows without an embedding keep their existing
-/// embedding on conflict:
+/// Render the batched vector upsert. Rows without an embedding keep their
+/// existing embedding on conflict:
 /// `embedding = COALESCE(EXCLUDED.embedding, table.embedding)`.
-async fn batch_upsert_vector<D: PgDb>(
-    db: &D,
+fn vector_upsert_sql(
     table_name: &str,
     workspace: &str,
     biz_id: &str,
     rows: &[(&String, &JsonMap, Option<Vec<f32>>)],
-) -> easyrag_core::Result<()> {
-    let mut sql = format!(
-        "INSERT INTO {table_name} (id, workspace, biz_id, content, embedding, updated_at) VALUES "
+) -> String {
+    let assignments = format!(
+        "content = EXCLUDED.content, \
+         embedding = COALESCE(EXCLUDED.embedding, {table_name}.embedding), updated_at = NOW()"
     );
-    for (idx, (id, content, embedding)) in rows.iter().enumerate() {
-        if idx > 0 {
-            sql.push_str(", ");
-        }
+    let upsert = PgUpsertBuilder::new(
+        table_name,
+        "id, workspace, biz_id, content, embedding, updated_at",
+        &assignments,
+    );
+    upsert.sql(rows.iter().map(|(id, content, embedding)| {
         let emb_sql = match embedding {
             Some(e) => format!("'{}'::vector", vector_literal(e)),
             None => "NULL".to_string(),
         };
-        sql.push_str(&format!(
+        format!(
             "('{}', '{}', '{}', {}::jsonb, {emb_sql}, NOW())",
             sql_escape(id),
             sql_escape(workspace),
             sql_escape(biz_id),
             json_literal(content)
-        ));
-    }
-    sql.push_str(&format!(
-        " ON CONFLICT (id, workspace, biz_id) DO UPDATE SET content = EXCLUDED.content, \
-         embedding = COALESCE(EXCLUDED.embedding, {table_name}.embedding), updated_at = NOW()"
-    ));
-    db.execute(&sql).await
+        )
+    }))
 }
 
 #[async_trait]
@@ -1338,7 +1357,8 @@ impl<D: PgDb> KeywordSearchable for PgVectorStorage<D> {
              LIMIT {top_k}",
             tsq = sql_escape(&ts_query),
             t = self.table_name,
-            scope = self.scope_clause(biz_id)
+            // List path: see `query` (BC-12/A-5).
+            scope = self.list_scope_clause(biz_id)
         );
         let rows = self.db.fetch_all(&sql).await?;
         let mut results = Vec::new();
@@ -1426,16 +1446,30 @@ impl<D: PgDb> PgGraphStorage<D> {
         })
     }
 
-    fn scope_clause(&self, biz_id: &str) -> String {
-        scope_filter(&self.workspace, biz_id)
-    }
-
     fn parse_props(row: &JsonMap, key: &str) -> JsonMap {
         match row.get(key) {
             Some(JsonValue::Object(m)) => m.clone(),
             Some(JsonValue::String(s)) => serde_json::from_str(s).unwrap_or_default(),
             _ => JsonMap::new(),
         }
+    }
+
+    /// Read one node with an **already-rendered** scope clause, so a traversal
+    /// and the per-node lookups it drives cannot disagree on tenant filtering
+    /// (BC-12/A-5: `get_knowledge_graph` widens both, `get_node` widens neither).
+    async fn fetch_node(&self, node_id: &str, scope: &str) -> easyrag_core::Result<Option<JsonMap>> {
+        let sql = format!(
+            "SELECT id, properties FROM {} WHERE id = '{}' AND {}",
+            self.nodes_table,
+            sql_escape(node_id),
+            scope
+        );
+        let Some(row) = self.db.fetch_one(&sql).await? else {
+            return Ok(None);
+        };
+        let mut properties = Self::parse_props(&row, "properties");
+        properties.insert("id".to_string(), JsonValue::String(node_id.to_string()));
+        Ok(Some(properties))
     }
 }
 
@@ -1518,9 +1552,7 @@ impl<D: PgDb> StorageNameSpace for PgGraphStorage<D> {
         Ok(())
     }
 
-    async fn index_done_callback(&self) -> easyrag_core::Result<()> {
-        Ok(())
-    }
+    // index_done_callback: trait default no-op (postgres commits eagerly).
 
     async fn drop(&self, biz_id: &str) -> easyrag_core::Result<HashMap<String, String>> {
         let message = format!(
@@ -1610,18 +1642,8 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
     }
 
     async fn get_node(&self, node_id: &str, biz_id: &str) -> easyrag_core::Result<Option<JsonMap>> {
-        let sql = format!(
-            "SELECT id, properties FROM {} WHERE id = '{}' AND {}",
-            self.nodes_table,
-            sql_escape(node_id),
-            self.scope_clause(biz_id)
-        );
-        let Some(row) = self.db.fetch_one(&sql).await? else {
-            return Ok(None);
-        };
-        let mut properties = Self::parse_props(&row, "properties");
-        properties.insert("id".to_string(), JsonValue::String(node_id.to_string()));
-        Ok(Some(properties))
+        // Single-record read: exact scope, never the wildcard.
+        self.fetch_node(node_id, &self.scope_clause(biz_id)).await
     }
 
     async fn get_edge(
@@ -1688,8 +1710,9 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
             .execute(&format!(
                 "INSERT INTO {t} (id, workspace, biz_id, properties, updated_at)
                  VALUES ('{id}', '{ws}', '{biz}', {props}::jsonb, NOW())
-                 ON CONFLICT (id, workspace, biz_id) DO UPDATE SET properties = {props}::jsonb, updated_at = NOW()",
+                 ON CONFLICT ({conflict}) DO UPDATE SET properties = {props}::jsonb, updated_at = NOW()",
                 t = self.nodes_table,
+                conflict = TENANT_CONFLICT_TARGET,
                 id = sql_escape(node_id),
                 ws = sql_escape(&self.workspace),
                 biz = sql_escape(biz_id),
@@ -1710,8 +1733,9 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
             .execute(&format!(
                 "INSERT INTO {t} (id, workspace, biz_id, source, target, properties, updated_at)
                  VALUES ('{id}', '{ws}', '{biz}', '{src}', '{tgt}', {props}::jsonb, NOW())
-                 ON CONFLICT (id, workspace, biz_id) DO UPDATE SET properties = {props}::jsonb, updated_at = NOW()",
+                 ON CONFLICT ({conflict}) DO UPDATE SET properties = {props}::jsonb, updated_at = NOW()",
                 t = self.edges_table,
+                conflict = TENANT_CONFLICT_TARGET,
                 id = sql_escape(&edge_id),
                 ws = sql_escape(&self.workspace),
                 biz = sql_escape(biz_id),
@@ -1793,7 +1817,11 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
         let Some(label) = node_label.filter(|l| *l != "*") else {
             let nodes = self.get_all_nodes(biz_id).await?;
             let edges = self.get_all_edges(biz_id).await?;
-            let truncated = nodes.len() > max_nodes;
+            // BC-1/A-6: `>=`, not `>`. A graph that exactly fills the budget is
+            // reported truncated, matching the CTE path below, the in-memory
+            // backend and Neo4j. `nodes` is the pre-`take` count, so this is the
+            // total visible node count, not the number actually returned.
+            let truncated = nodes.len() >= max_nodes;
             let graph_nodes: Vec<KnowledgeGraphNode> = nodes
                 .into_iter()
                 .take(max_nodes)
@@ -1802,11 +1830,7 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
                         .remove("id")
                         .and_then(|v| v.as_str().map(|s| s.to_string()))
                         .unwrap_or_default();
-                    KnowledgeGraphNode {
-                        id: id.clone(),
-                        labels: vec![id],
-                        properties: stringify_props(&props),
-                    }
+                    KnowledgeGraphNode::self_labeled(id, stringify_props(&props))
                 })
                 .collect();
             let graph_edges: Vec<KnowledgeGraphEdge> = edges
@@ -1822,13 +1846,7 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    KnowledgeGraphEdge {
-                        id: format!("{src}-{tgt}"),
-                        edge_type: None,
-                        source: src,
-                        target: tgt,
-                        properties: JsonMap::new(),
-                    }
+                    KnowledgeGraphEdge::untyped(src, tgt, JsonMap::new())
                 })
                 .collect();
             return Ok(KnowledgeGraph {
@@ -1851,17 +1869,15 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
             )
             SELECT DISTINCT source, target FROM graph_traversal LIMIT {max_nodes}",
             e = self.edges_table,
-            scope = self.scope_clause(biz_id),
-            e_scope = format!(
-                "e.workspace = '{}' AND e.biz_id = '{}'",
-                sql_escape(&self.workspace),
-                sql_escape(biz_id)
-            ),
+            // List path: an empty biz_id spans every biz line (BC-12/A-5),
+            // matching `Neo4jGraphStorage::get_sub_graph`. The per-node lookups
+            // below render the SAME scope so traversal and properties agree.
+            scope = self.list_scope_clause(biz_id),
+            e_scope = self.list_scope_clause_as(biz_id, "e"),
             label = sql_escape(label)
         );
         let rows = self.db.fetch_all(&sql).await?;
 
-        let mut node_ids: Vec<String> = vec![label.to_string()];
         let mut edges = Vec::new();
         for row in rows {
             let Some(src) = row.get("source").and_then(|v| v.as_str()) else {
@@ -1870,31 +1886,24 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
             let Some(tgt) = row.get("target").and_then(|v| v.as_str()) else {
                 continue;
             };
-            if !node_ids.contains(&src.to_string()) {
-                node_ids.push(src.to_string());
-            }
-            if !node_ids.contains(&tgt.to_string()) {
-                node_ids.push(tgt.to_string());
-            }
-            edges.push(KnowledgeGraphEdge {
-                id: format!("{src}-{tgt}"),
-                edge_type: None,
-                source: src.to_string(),
-                target: tgt.to_string(),
-                properties: JsonMap::new(),
-            });
+            edges.push(KnowledgeGraphEdge::untyped(src, tgt, JsonMap::new()));
         }
+        // Seed first, then endpoints in first-seen order; that ordering decides
+        // which nodes survive the per-node fetch below (shared with the other
+        // backends — see `KnowledgeGraph::expand_from_edges`).
+        let node_ids = KnowledgeGraph::expand_from_edges(label, &edges);
 
         let mut nodes = Vec::with_capacity(node_ids.len());
+        // Same (possibly widened) scope the traversal used — see the CTE above.
+        let node_scope = self.list_scope_clause(biz_id);
         for node_id in &node_ids {
-            let node_data = self.get_node(node_id, biz_id).await?;
+            let node_data = self.fetch_node(node_id, &node_scope).await?;
             let mut properties = node_data.unwrap_or_default();
             properties.remove("id");
-            nodes.push(KnowledgeGraphNode {
-                id: node_id.clone(),
-                labels: vec![node_id.clone()],
-                properties: stringify_props(&properties),
-            });
+            nodes.push(KnowledgeGraphNode::self_labeled(
+                node_id.clone(),
+                stringify_props(&properties),
+            ));
         }
 
         Ok(KnowledgeGraph {
@@ -1908,7 +1917,9 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
         let sql = format!(
             "SELECT id, properties FROM {} WHERE {}",
             self.nodes_table,
-            self.scope_clause(biz_id)
+            // List path: an empty biz_id spans every biz line (BC-12/A-5),
+            // matching `Neo4jGraphStorage::node_scope`.
+            self.list_scope_clause(biz_id)
         );
         let rows = self.db.fetch_all(&sql).await?;
         Ok(rows
@@ -1927,7 +1938,8 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
         let sql = format!(
             "SELECT source, target, properties FROM {} WHERE {}",
             self.edges_table,
-            self.scope_clause(biz_id)
+            // List path: see `get_all_nodes`.
+            self.list_scope_clause(biz_id)
         );
         let rows = self.db.fetch_all(&sql).await?;
         Ok(rows
@@ -1950,14 +1962,19 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
             "SELECT n.id, COUNT(e.id) as degree
              FROM {n} n
              LEFT JOIN {e} e ON n.workspace = e.workspace AND n.biz_id = e.biz_id AND (n.id = e.source OR n.id = e.target)
-             WHERE n.workspace = '{ws}' AND n.biz_id = '{biz}'
+             WHERE {scope}
              GROUP BY n.id
              ORDER BY degree DESC
              LIMIT {limit}",
             n = self.nodes_table,
             e = self.edges_table,
-            ws = sql_escape(&self.workspace),
-            biz = sql_escape(biz_id)
+            // List path: the `/api/graph/labels` route reaches this through
+            // `read_bundle`, which blanks an omitted biz_id to the read-path
+            // wildcard. An empty biz_id must span every biz line (BC-12/A-5),
+            // matching `Neo4jGraphStorage::get_popular_labels` (`node_scope`)
+            // and the in-memory backend. The JOIN still links a node to edges
+            // on its own biz line via `n.biz_id = e.biz_id`.
+            scope = self.list_scope_clause_as(biz_id, "n")
         );
         let rows = self.db.fetch_all(&sql).await?;
         Ok(rows
@@ -1975,7 +1992,8 @@ impl<D: PgDb> GraphStorage for PgGraphStorage<D> {
         let sql = format!(
             "SELECT id FROM {} WHERE {} AND id ILIKE '%{}%' LIMIT {limit}",
             self.nodes_table,
-            self.scope_clause(biz_id),
+            // List path: see `get_all_nodes`. Neo4j widens `search_labels` too.
+            self.list_scope_clause(biz_id),
             sql_escape(query)
         );
         let rows = self.db.fetch_all(&sql).await?;
@@ -2032,21 +2050,6 @@ impl<D: PgDb> PgDocStatusStorage<D> {
         })
     }
 
-    fn scope_clause(&self, biz_id: &str) -> String {
-        scope_filter(&self.workspace, biz_id)
-    }
-
-    /// List/count scope: an empty biz_id is the read-path wildcard matching
-    /// every biz line of the workspace. Single-document reads and writes keep
-    /// the exact scope (status writes must never land on the wrong biz line).
-    fn list_scope_clause(&self, biz_id: &str) -> String {
-        if biz_id.is_empty() {
-            format!("workspace = '{}'", sql_escape(&self.workspace))
-        } else {
-            self.scope_clause(biz_id)
-        }
-    }
-
     fn ops(&self, biz_id: &str) -> PgCrudOps<'_, D> {
         PgCrudOps {
             db: &self.db,
@@ -2057,62 +2060,30 @@ impl<D: PgDb> PgDocStatusStorage<D> {
     }
 
     /// Map a result row to a DocProcessingStatus.
+    ///
+    /// The payload fields come from the shared core mapper over the unwrapped
+    /// `content` JSONB, which is what lets `chunks_list`/`error_msg`/`metadata`/
+    /// `multimodal_processed` survive the round-trip instead of being hardcoded
+    /// empty (A-1 / BC-9). Only the columns postgres stores *outside* `content`
+    /// are read from the row and take precedence.
     fn map_row_to_doc_status(row: &JsonMap) -> DocProcessingStatus {
         let content = read_content(row).unwrap_or_default();
-        let get_str = |key: &str| -> String {
-            content
-                .get(key)
+        let mut status = DocProcessingStatus::from_json(&content);
+        // Envelope columns: real table columns, authoritative over `content`.
+        status.status = DocStatus::from_value(
+            row.get("status")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
-        let get_opt_str = |key: &str| -> Option<String> {
-            content
-                .get(key)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        };
-        let status_str = row
-            .get("status")
+                .unwrap_or("pending"),
+        )
+        .unwrap_or(DocStatus::Pending);
+        status.created_at = row_timestamp(row, "created_at");
+        status.updated_at = row_timestamp(row, "updated_at");
+        status.biz_id = row
+            .get("biz_id")
             .and_then(|v| v.as_str())
-            .unwrap_or("pending");
-        DocProcessingStatus {
-            content_summary: get_str("content_summary"),
-            content_length: content
-                .get("content_length")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0),
-            file_path: get_str("file_path"),
-            status: DocStatus::from_value(status_str).unwrap_or(DocStatus::Pending),
-            created_at: row
-                .get("created_at")
-                .map(|v| match v {
-                    JsonValue::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .unwrap_or_default(),
-            updated_at: row
-                .get("updated_at")
-                .map(|v| match v {
-                    JsonValue::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .unwrap_or_default(),
-            track_id: get_opt_str("track_id"),
-            chunks_count: content.get("chunks_count").and_then(|v| v.as_i64()),
-            chunks_list: Vec::new(),
-            error_msg: None,
-            metadata: JsonMap::new(),
-            multimodal_processed: None,
-            content_hash: get_opt_str("content_hash"),
-            has_structure: content.get("has_structure").and_then(|v| v.as_bool()) == Some(true),
-            external_id: get_opt_str("external_id"),
-            biz_id: row
-                .get("biz_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        }
+            .unwrap_or_default()
+            .to_string();
+        status
     }
 
     async fn fetch_docs_by_condition(
@@ -2192,9 +2163,7 @@ impl<D: PgDb> StorageNameSpace for PgDocStatusStorage<D> {
         Ok(())
     }
 
-    async fn index_done_callback(&self) -> easyrag_core::Result<()> {
-        Ok(())
-    }
+    // index_done_callback: trait default no-op (postgres commits eagerly).
 
     async fn drop(&self, biz_id: &str) -> easyrag_core::Result<HashMap<String, String>> {
         let message = format!(
@@ -2257,7 +2226,7 @@ impl<D: PgDb> KVStorage for PgDocStatusStorage<D> {
                 .execute(&format!(
                     "INSERT INTO {t} (id, workspace, biz_id, content, status, track_id, file_path, content_hash, updated_at)
                      VALUES ('{id}', '{ws}', '{biz}', {content}::jsonb, COALESCE({status}, 'pending'), {track}, {path}, {hash}, NOW())
-                     ON CONFLICT (id, workspace, biz_id) DO UPDATE
+                     ON CONFLICT ({conflict}) DO UPDATE
                      SET content = COALESCE({t}.content, '{{}}'::jsonb) || {content}::jsonb,
                          status = COALESCE({status}, {t}.status),
                          track_id = COALESCE({track}, NULLIF({t}.track_id, '')),
@@ -2265,6 +2234,7 @@ impl<D: PgDb> KVStorage for PgDocStatusStorage<D> {
                          content_hash = COALESCE({hash}, NULLIF({t}.content_hash, '')),
                          updated_at = NOW()",
                     t = self.table_name,
+                    conflict = TENANT_CONFLICT_TARGET,
                     id = sql_escape(id),
                     ws = sql_escape(&self.workspace),
                     biz = sql_escape(biz_id),
@@ -2333,11 +2303,7 @@ impl<D: PgDb> DocStatusStorage for PgDocStatusStorage<D> {
         if statuses.is_empty() {
             return Ok(HashMap::new());
         }
-        let in_list = statuses
-            .iter()
-            .map(|s| format!("'{}'", sql_escape(s.value())))
-            .collect::<Vec<_>>()
-            .join(",");
+        let in_list = sql_in_list(statuses.iter().map(|s| s.value()));
         self.fetch_docs_by_condition(&format!(" AND status IN ({in_list})"), biz_id)
             .await
     }
@@ -2371,11 +2337,7 @@ impl<D: PgDb> DocStatusStorage for PgDocStatusStorage<D> {
             Some(values) if !values.is_empty() => {
                 let mut sorted: Vec<&String> = values.iter().collect();
                 sorted.sort();
-                let in_list = sorted
-                    .iter()
-                    .map(|s| format!("'{}'", sql_escape(s)))
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let in_list = sql_in_list(sorted.iter().map(|s| s.as_str()));
                 format!(" AND status IN ({in_list})")
             }
             _ => String::new(),
@@ -2806,5 +2768,156 @@ impl<D: PgDb> TenantConfigStorage for PgTenantConfigStorage<D> {
             )
             .await?;
         Ok(rows.iter().filter_map(Self::row_to_config).collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3.10 guardrails. The retry LOOP moved to `core::with_retry` and the
+// retry CLASSIFICATION moved to `CoreError::is_retryable`; these pin both halves
+// of the [equivalent] claim.
+//
+// `start_paused = true` makes the 1s/2s sleeps virtual, so each test asserts the
+// exact backoff the old hand-rolled loop produced without waiting for it. Elapsed
+// virtual time is the sum of the delays, which pins the curve: base 1000ms with
+// factor 2 gives 1000 + 2000 = 3000, and any other curve lands elsewhere.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Attempt counter shared with the closure under test.
+    fn counter() -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let c = Arc::new(AtomicUsize::new(0));
+        (c.clone(), c)
+    }
+
+    fn transient() -> easyrag_core::CoreError {
+        easyrag_core::CoreError::Internal("error communicating with the server".to_string())
+    }
+
+    #[test]
+    fn policy_is_the_curve_the_hand_rolled_loop_used() {
+        assert_eq!(3, PG_RETRY_CONFIG.max_attempts, "3 attempts, as before");
+        assert_eq!(Duration::from_secs(1), PG_RETRY_CONFIG.base_delay, "base 1s");
+        assert_eq!(Duration::from_secs(10), PG_RETRY_CONFIG.max_delay, "capped at 10s");
+        assert_eq!(2.0, PG_RETRY_CONFIG.exponential_base, "factor 2");
+        // Jitter must stay off: the fixed curve is what the runbook documents,
+        // and a random factor would make the delay assertions below flaky.
+        assert!(!PG_RETRY_CONFIG.jitter);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_failure_exhausts_three_attempts_sleeping_1s_then_2s() {
+        let (bump, attempts) = counter();
+        let start = tokio::time::Instant::now();
+
+        let result: easyrag_core::Result<()> = retry(move || {
+            bump.fetch_add(1, Ordering::SeqCst);
+            async { Err(transient()) }
+        })
+        .await;
+
+        assert!(result.is_err(), "the transient error must still surface");
+        assert_eq!(3, attempts.load(Ordering::SeqCst));
+        assert_eq!(
+            Duration::from_millis(3000),
+            start.elapsed(),
+            "backoff must stay 1000ms then 2000ms, and never sleep after the last attempt"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fatal_failure_is_returned_immediately_without_sleeping() {
+        let (bump, attempts) = counter();
+        let start = tokio::time::Instant::now();
+
+        let result: easyrag_core::Result<()> = retry(move || {
+            bump.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(easyrag_core::CoreError::Internal(
+                    "duplicate key value violates unique constraint \"pk_docs\"".to_string(),
+                ))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(1, attempts.load(Ordering::SeqCst), "no retry for a fatal error");
+        assert_eq!(Duration::ZERO, start.elapsed(), "no sleep for a fatal error");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_on_the_second_attempt_stops_retrying() {
+        let (bump, attempts) = counter();
+        let start = tokio::time::Instant::now();
+
+        let result = retry(move || {
+            let seen = bump.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if seen == 0 {
+                    Err(easyrag_core::CoreError::Internal(
+                        "connection closed".to_string(),
+                    ))
+                } else {
+                    Ok(7u32)
+                }
+            }
+        })
+        .await;
+
+        // `CoreError` is not `PartialEq`, so unwrap the success value instead of
+        // comparing the whole `Result`.
+        assert_eq!(7u32, result.expect("recovery on the second attempt must succeed"));
+        assert_eq!(2, attempts.load(Ordering::SeqCst));
+        assert_eq!(
+            Duration::from_millis(1000),
+            start.elapsed(),
+            "exactly one 1000ms sleep before the successful attempt"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn api_timeout_is_still_retried() {
+        // The old loop accepted `CoreError::ApiTimeout` alongside the six
+        // `Internal` messages; that arm now lives in `CoreError::is_retryable`.
+        let (bump, attempts) = counter();
+
+        let result: easyrag_core::Result<()> = retry(move || {
+            bump.fetch_add(1, Ordering::SeqCst);
+            async { Err(easyrag_core::CoreError::ApiTimeout) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(3, attempts.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bc3_a_deadlock_is_now_retried_where_it_used_to_fail_fast() {
+        // [BC-3 widening] Before Phase 3.10 this message fell through to the
+        // `_ => false` arm of the old inline `matches!`, so a deadlock aborted
+        // the operation on attempt 1. It now consumes the full budget.
+        let (bump, attempts) = counter();
+        let start = tokio::time::Instant::now();
+
+        let result: easyrag_core::Result<()> = retry(move || {
+            bump.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(easyrag_core::CoreError::Internal(
+                    "error returned from database: deadlock detected (SQLSTATE 40P01)".to_string(),
+                ))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            3,
+            attempts.load(Ordering::SeqCst),
+            "BC-3: a deadlock must now be retried"
+        );
+        assert_eq!(Duration::from_millis(3000), start.elapsed());
     }
 }

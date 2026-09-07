@@ -1,0 +1,5 @@
+---
+source: crates/easyrag-pipeline/tests/modal_processor_fallback.rs
+---
+description: /figures/nonexistent_figure.png
+entity: {entity_name="image_5af0ff9c4e36a2db635d8130808ebc60", entity_type="image", summary="Image content: /figures/nonexistent_figure.png"}

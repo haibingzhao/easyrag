@@ -1,0 +1,14 @@
+---
+source: crates/easyrag-storage/tests/neo4j_graph_storage.rs
+---
+--- query[0] ---
+MERGE (n:`test` {entity_id: $id, biz_id: $biz}) SET n += $props
+--- params[0] ---
+{
+  "biz": "default",
+  "id": "node1",
+  "props": {
+    "entity_type": "Person",
+    "description": "A test"
+  }
+}

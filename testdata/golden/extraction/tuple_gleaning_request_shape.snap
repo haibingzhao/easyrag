@@ -1,0 +1,6 @@
+---
+source: crates/easyrag-pipeline/tests/extraction_golden.rs
+---
+requests=2
+[0] response_format=None temperature=0 max_tokens=None system_prompt=present prompt_len=1328 history=[]
+[1] response_format=None temperature=0 max_tokens=None system_prompt=present prompt_len=2004 history=[User:1328, Assistant:220]

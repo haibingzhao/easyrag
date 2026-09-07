@@ -11,8 +11,7 @@ use easyrag_core::JsonMap;
 use serde_json::Value as JsonValue;
 
 use super::super::model::{ContentItem, ParseResult};
-use super::{file_mtime_millis, kwargs_value_to_string};
-use super::mineru::path_to_absolute;
+use super::{file_mtime_millis, kwargs_value_to_string, path_to_absolute};
 
 /// Kwargs that influence parsing output and therefore the cache key.
 const RELEVANT_KWARGS: &[&str] = &[

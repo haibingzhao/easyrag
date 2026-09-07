@@ -1,0 +1,7 @@
+---
+source: crates/easyrag-storage/tests/postgres_storage.rs
+assertion_line: 332
+---
+INSERT INTO graph_nodes_graph (id, workspace, biz_id, properties, updated_at)
+                 VALUES ('Alice', 'test_ws', 'default', '{"entity_type":"person"}'::jsonb, NOW())
+                 ON CONFLICT (id, workspace, biz_id) DO UPDATE SET properties = '{"entity_type":"person"}'::jsonb, updated_at = NOW()

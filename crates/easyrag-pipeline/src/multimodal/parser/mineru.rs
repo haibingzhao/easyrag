@@ -2,16 +2,15 @@
 //! Invokes the `magic-pdf` CLI tool.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use async_trait::async_trait;
-use easyrag_core::{CoreError, JsonMap};
+use easyrag_core::JsonMap;
 use serde_json::Value as JsonValue;
 
 use super::super::model::{ContentItem, ParseResult};
 use super::{
-    run_installation_check, take_last_chars, walk_top_down, MultimodalParser,
-    ParserExecutionError, IMAGE_FORMATS, OFFICE_FORMATS, PDF_FORMATS,
+    first_json_file, path_to_absolute, walk_top_down, ExternalCliParser, MultimodalParser,
+    IMAGE_FORMATS, OFFICE_FORMATS, PDF_FORMATS,
 };
 
 /// MinerU document parser implementation.
@@ -31,7 +30,7 @@ impl MinerUParser {
         Self { timeout_seconds }
     }
 
-    fn build_command(&self, file: &Path, output_dir: &str, method: &str, kwargs: &JsonMap) -> Vec<String> {
+    pub(super) fn build_command(&self, file: &Path, output_dir: &str, method: &str, kwargs: &JsonMap) -> Vec<String> {
         let mut cmd: Vec<String> = vec!["magic-pdf".to_string()];
 
         // Input file.
@@ -62,85 +61,34 @@ impl MinerUParser {
         cmd
     }
 
-    async fn execute_command(&self, command: &[String], file: &Path) -> easyrag_core::Result<String> {
-        let mut cmd = tokio::process::Command::new(&command[0]);
-        cmd.args(&command[1..])
-            .current_dir(file.parent().unwrap_or_else(|| Path::new(".")))
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        let mut child = cmd.spawn().map_err(|e| {
-            CoreError::Internal(format!("Failed to start MinerU process: {e}"))
-        })?;
-
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let stdout_task = tokio::spawn(super::read_stream(stdout));
-        let stderr_task = tokio::spawn(super::read_stream(stderr));
-
-        let wait_result =
-            tokio::time::timeout(Duration::from_secs(self.timeout_seconds), child.wait()).await;
-
-        let status = match wait_result {
-            Ok(Ok(status)) => status,
-            Ok(Err(e)) => {
-                return Err(CoreError::Internal(format!(
-                    "MinerU process error: {e}"
-                )))
-            }
-            Err(_) => {
-                let _ = child.start_kill();
-                // Reap the killed child to avoid a zombie process.
-                let _ = child.wait().await;
-                return Err(ParserExecutionError::new(
-                    -1,
-                    format!("MinerU timed out after {}s", self.timeout_seconds),
-                    self.name(),
-                ));
-            }
-        };
-
-        // Drain reader tasks briefly.
-        let stdout = tokio::time::timeout(Duration::from_secs(5), stdout_task)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
+    /// Where MinerU actually left its JSON.
+    ///
+    /// Recomputed from the file name instead of reusing the resolved output
+    /// directory: this has always looked in `<parent>/<stem>_mineru_output`
+    /// regardless of a `kwargs["output_dir"]` override, so pointing MinerU at a
+    /// custom directory makes it parse nothing. Preserved verbatim — closing
+    /// that gap would change behaviour, not refactor it.
+    pub(super) fn resolve_json_output_dir(&self, file: &Path) -> String {
+        let stem = file
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        let stderr = tokio::time::timeout(Duration::from_secs(5), stderr_task)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
-
-        if !status.success() {
-            let code = status.code().unwrap_or(-1);
-            let error_msg = take_last_chars(&stderr, 2000);
-            tracing::error!("MinerU failed (code={}): {}", code, error_msg);
-            return Err(ParserExecutionError::new(code, error_msg, self.name()));
-        }
-        let _ = stdout;
-
-        // Determine output JSON directory (default layout).
-        let stem = file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         let output_base = file
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join(format!("{stem}_mineru_output"));
-        let json_dir = find_json_output_dir(&output_base);
-        Ok(json_dir
+            .join(format!("{stem}_{}_output", self.name()));
+        find_json_output_dir(&output_base)
             .map(|p| path_to_absolute(&p))
-            .unwrap_or_else(|| path_to_absolute(&output_base)))
+            .unwrap_or_else(|| path_to_absolute(&output_base))
     }
 
-    fn parse_output_json(&self, json_dir: &str, _original_file: &Path) -> Vec<ContentItem> {
-        let dir = Path::new(json_dir);
-        if !dir.exists() {
-            tracing::warn!("MinerU output directory not found: {}", json_dir);
+    pub(super) fn parse_output_json(&self, json_dir: &str, _original_file: &Path) -> Vec<ContentItem> {
+        if !self.output_dir_exists(json_dir) {
             return Vec::new();
         }
 
         // Find the content_list.json file.
-        let walked = walk_top_down(dir);
+        let walked = walk_top_down(Path::new(json_dir));
         let content_list_file = walked
             .iter()
             .filter(|p| p.is_file())
@@ -154,12 +102,7 @@ impl MinerUParser {
             Some(f) => f,
             None => {
                 // Fallback: look for any JSON file.
-                let Some(any_json) = walked
-                    .iter()
-                    .filter(|p| p.is_file())
-                    .find(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-                    .cloned()
-                else {
+                let Some(any_json) = first_json_file(&walked) else {
                     tracing::warn!("No JSON output found in {}", json_dir);
                     return Vec::new();
                 };
@@ -197,6 +140,23 @@ impl MinerUParser {
                 }]
             }
         }
+    }
+}
+
+impl ExternalCliParser for MinerUParser {
+    const DISPLAY_NAME: &'static str = "MinerU";
+    const INSTALL_CHECK: &'static [&'static str] = &["magic-pdf", "--version"];
+    const INSTALL_CHECK_TIMEOUT: u64 = 10;
+    const FORMAT_LISTS: &'static [&'static [&'static str]] =
+        &[PDF_FORMATS, IMAGE_FORMATS, OFFICE_FORMATS];
+
+    fn timeout_seconds(&self) -> u64 {
+        self.timeout_seconds
+    }
+
+    /// MinerU quotes stderr alone; the stdout it drained is discarded.
+    fn failure_output(&self, _stdout: &str, stderr: &str) -> String {
+        stderr.to_string()
     }
 }
 
@@ -252,20 +212,6 @@ fn dir_has_json(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Closest Rust analogue of (absolute, but not
-/// normalized).
-pub(super) fn path_to_absolute(path: &Path) -> String {
-    if path.is_absolute() {
-        path.to_string_lossy().to_string()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-            .to_string_lossy()
-            .to_string()
-    }
-}
-
 #[async_trait]
 impl MultimodalParser for MinerUParser {
     fn name(&self) -> &str {
@@ -273,11 +219,7 @@ impl MultimodalParser for MinerUParser {
     }
 
     fn supported_formats(&self) -> Vec<String> {
-        let mut formats = Vec::new();
-        for list in [PDF_FORMATS, IMAGE_FORMATS, OFFICE_FORMATS] {
-            formats.extend(list.iter().map(|f| (*f).to_string()));
-        }
-        formats
+        self.supported_format_list()
     }
 
     async fn parse(
@@ -286,26 +228,7 @@ impl MultimodalParser for MinerUParser {
         parse_method: Option<&str>,
         kwargs: &JsonMap,
     ) -> easyrag_core::Result<ParseResult> {
-        if !file.exists() {
-            return Err(CoreError::InvalidArgument(format!(
-                "File not found: {}",
-                path_to_absolute(file)
-            )));
-        }
-
-        let stem = file
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let default_output = file
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(format!("{stem}_mineru_output"));
-        let output_dir = kwargs
-            .get("output_dir")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| path_to_absolute(&default_output));
+        let output_dir = self.resolve_output_dir(file, kwargs)?;
 
         let method = parse_method
             .map(|s| s.to_string())
@@ -318,40 +241,33 @@ impl MultimodalParser for MinerUParser {
             .unwrap_or_else(|| "auto".to_string());
 
         tracing::info!(
-            "Parsing {} with MinerU (method={}, output={})",
+            "Parsing {} with {} (method={}, output={})",
             file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            Self::DISPLAY_NAME,
             method,
             output_dir
         );
 
         // Build command.
         let command = self.build_command(file, &output_dir, &method, kwargs);
-        tracing::debug!("MinerU command: {}", command.join(" "));
+        tracing::debug!("{} command: {}", Self::DISPLAY_NAME, command.join(" "));
 
         // Execute with timeout.
-        let output_json_dir = self.execute_command(&command, file).await?;
+        self.execute_command(&command, file).await?;
 
         // Parse output JSON into content list.
+        let output_json_dir = self.resolve_json_output_dir(file);
         let content_list = self.parse_output_json(&output_json_dir, file);
 
-        let mut metadata = JsonMap::new();
-        metadata.insert("parser".to_string(), JsonValue::from("mineru"));
-        metadata.insert("parse_method".to_string(), JsonValue::from(method));
-        metadata.insert("output_dir".to_string(), JsonValue::from(output_dir));
-
-        Ok(ParseResult {
+        Ok(self.cli_parse_result(
             content_list,
-            doc_id: String::new(),
-            file_path: path_to_absolute(file),
-            metadata,
-        })
+            file,
+            &output_dir,
+            Some(("parse_method", JsonValue::from(method))),
+        ))
     }
 
     fn check_installation(&self) -> bool {
-        let ok = run_installation_check(&["magic-pdf", "--version"], 10);
-        if !ok {
-            tracing::debug!("MinerU installation check failed");
-        }
-        ok
+        self.installation_ok()
     }
 }

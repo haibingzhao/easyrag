@@ -37,6 +37,162 @@ impl TextChunk {
     }
 }
 
+/// Shared state of the five chunkers: one tokenizer plus the two size knobs.
+///
+/// Each chunker used to hold the same triple under its own names
+/// (`chunk_token_size` / `chunk_size` / `max_chunk_tokens` for the size,
+/// `chunk_overlap_token_size` / `chunk_overlap` / nothing for the overlap) and
+/// each fetched `TokenizerProvider::get_tokenizer()` itself. Both are here once
+/// now. This is composition, not a base class to inherit from, so every chunker
+/// keeps its own public constructor.
+pub(super) struct ChunkerBase {
+    tokenizer: Arc<Tokenizer>,
+    /// The chunker's size knob, whatever its own config key calls it.
+    chunk_size: usize,
+    /// The chunker's overlap knob; 0 where it has none.
+    overlap: usize,
+}
+
+impl ChunkerBase {
+    fn new(chunk_size: usize, overlap: usize) -> Self {
+        Self {
+            tokenizer: TokenizerProvider::get_tokenizer(),
+            chunk_size,
+            overlap,
+        }
+    }
+
+    /// For the one chunker that needs encode/decode rather than a count.
+    fn tokenizer(&self) -> &Arc<Tokenizer> {
+        &self.tokenizer
+    }
+
+    fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    fn overlap(&self) -> usize {
+        self.overlap
+    }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        self.tokenizer.count_tokens(text)
+    }
+
+    /// Turn finished pieces of text into chunks numbered from 0, counting each
+    /// piece's own tokens — the `TextChunk` output contract every chunker
+    /// shares.
+    fn assemble(&self, pieces: Vec<String>, doc_id: &str) -> Vec<TextChunk> {
+        pieces
+            .into_iter()
+            .enumerate()
+            .map(|(index, content)| {
+                let tokens = self.tokenizer.count_tokens(&content);
+                TextChunk::new(content, index as u32, doc_id, tokens)
+            })
+            .collect()
+    }
+
+    /// One chunk at an explicit order index, for the chunkers that number as
+    /// they go rather than from a finished list.
+    fn assemble_at(&self, content: String, order_index: u32, doc_id: &str) -> TextChunk {
+        let tokens = self.tokenizer.count_tokens(&content);
+        TextChunk::new(content, order_index, doc_id, tokens)
+    }
+}
+
+/// The blank-input guard all five `chunk()` implementations open with.
+fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+/// What a [`SlidingWindow`] keeps behind after a flush.
+enum Retention {
+    /// Drop leading pieces while more than this many tokens stay buffered —
+    /// `RecursiveCharacterChunker`'s overlap.
+    Overlap(usize),
+    /// Drop everything — the sentence-level window has no overlap.
+    Clear,
+}
+
+/// Pieces accumulated until the next one would overflow a token budget.
+///
+/// Both callers that share this compared *before* adding the next piece
+/// (`current + tokens > max`) and refused to flush an empty buffer, so that
+/// comparison lives here once. They differed only in what stayed behind, which
+/// is [`Retention`] — kept as data rather than folded into `Overlap(0)`, so the
+/// equivalence is structural instead of resting on no piece ever counting as
+/// zero tokens. `sliding_window_tests` constructs the case where the two really
+/// do diverge, which no text fixture reaches.
+///
+/// Two windows are deliberately NOT built on this:
+///
+/// * `TokenSizeChunker` slides over raw token ids and `decode`s each window.
+///   Routing it through pieces would mean re-encoding decoded text, and BPE
+///   decode-then-encode is not the identity at arbitrary boundaries, so token
+///   counts would move. That is a behaviour change, not a refactor.
+/// * `ParagraphSemanticChunker::find_breakpoints` counts *after* adding and
+///   breaks on `>=` — the opposite comparison — and yields indices rather than
+///   batches. Sharing a window with it would mean parameterising the
+///   comparison away, which leaves nothing shared.
+struct SlidingWindow {
+    max_tokens: usize,
+    retention: Retention,
+    /// Piece plus the token count it was added with, so the overlap walk does
+    /// not have to re-tokenise what the caller already counted.
+    batch: Vec<(String, usize)>,
+    tokens: usize,
+}
+
+impl SlidingWindow {
+    fn new(max_tokens: usize, retention: Retention) -> Self {
+        Self {
+            max_tokens,
+            retention,
+            batch: Vec::new(),
+            tokens: 0,
+        }
+    }
+
+    /// Whether `tokens` more would overflow. Never true on an empty buffer, so
+    /// a single oversized piece still lands in a window of its own.
+    fn should_flush(&self, tokens: usize) -> bool {
+        self.tokens + tokens > self.max_tokens && !self.batch.is_empty()
+    }
+
+    /// Hand over the buffered pieces, keeping what [`Retention`] says.
+    fn flush(&mut self) -> Vec<String> {
+        let out = self.batch.iter().map(|(piece, _)| piece.clone()).collect();
+        match self.retention {
+            Retention::Clear => {
+                self.batch.clear();
+                self.tokens = 0;
+            }
+            Retention::Overlap(overlap) => {
+                while !self.batch.is_empty() && self.tokens > overlap {
+                    let first = self.batch[0].1;
+                    self.tokens = self.tokens.saturating_sub(first);
+                    self.batch.remove(0);
+                }
+            }
+        }
+        out
+    }
+
+    fn add(&mut self, piece: String, tokens: usize) {
+        self.batch.push((piece, tokens));
+        self.tokens += tokens;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.batch.is_empty()
+    }
+
+    fn into_pieces(self) -> Vec<String> {
+        self.batch.into_iter().map(|(piece, _)| piece).collect()
+    }
+}
+
 /// Base chunker interface.
 #[async_trait]
 pub trait Chunker: Send + Sync {
@@ -58,9 +214,7 @@ impl std::fmt::Debug for dyn Chunker {
 /// Token-size based chunker: approximately `chunk_token_size` tokens per
 /// chunk with token overlap.
 pub struct TokenSizeChunker {
-    chunk_token_size: usize,
-    chunk_overlap_token_size: usize,
-    tokenizer: Arc<Tokenizer>,
+    base: ChunkerBase,
 }
 
 impl Default for TokenSizeChunker {
@@ -72,9 +226,7 @@ impl Default for TokenSizeChunker {
 impl TokenSizeChunker {
     pub fn new(chunk_token_size: usize, chunk_overlap_token_size: usize) -> Self {
         Self {
-            chunk_token_size,
-            chunk_overlap_token_size,
-            tokenizer: TokenizerProvider::get_tokenizer(),
+            base: ChunkerBase::new(chunk_token_size, chunk_overlap_token_size),
         }
     }
 }
@@ -82,11 +234,11 @@ impl TokenSizeChunker {
 #[async_trait]
 impl Chunker for TokenSizeChunker {
     async fn chunk(&self, text: &str, doc_id: &str) -> easyrag_core::Result<Vec<TextChunk>> {
-        if text.trim().is_empty() {
+        if is_blank(text) {
             return Ok(Vec::new());
         }
-        let tokens = self.tokenizer.encode(text);
-        if tokens.len() <= self.chunk_token_size {
+        let tokens = self.base.tokenizer().encode(text);
+        if tokens.len() <= self.base.chunk_size() {
             return Ok(vec![TextChunk::new(text.to_string(), 0, doc_id, tokens.len())]);
         }
 
@@ -94,9 +246,9 @@ impl Chunker for TokenSizeChunker {
         let mut start = 0usize;
         let mut order_index = 0u32;
         while start < tokens.len() {
-            let end = (start + self.chunk_token_size).min(tokens.len());
+            let end = (start + self.base.chunk_size()).min(tokens.len());
             let chunk_tokens = &tokens[start..end];
-            let content = self.tokenizer.decode(chunk_tokens)?;
+            let content = self.base.tokenizer().decode(chunk_tokens)?;
             chunks.push(TextChunk::new(
                 content,
                 order_index,
@@ -111,7 +263,7 @@ impl Chunker for TokenSizeChunker {
             // (overlap >= chunk size or chunk size 0), which would loop
             // forever in the original.
             start = end
-                .saturating_sub(self.chunk_overlap_token_size)
+                .saturating_sub(self.base.overlap())
                 .max(start + 1);
         }
         Ok(chunks)
@@ -125,10 +277,8 @@ impl Chunker for TokenSizeChunker {
 /// Recursive character text splitter: splits recursively by separators,
 /// keeping semantically related pieces together.
 pub struct RecursiveCharacterChunker {
-    chunk_size: usize,
-    chunk_overlap: usize,
+    base: ChunkerBase,
     separators: Vec<String>,
-    tokenizer: Arc<Tokenizer>,
 }
 
 impl Default for RecursiveCharacterChunker {
@@ -140,13 +290,11 @@ impl Default for RecursiveCharacterChunker {
 impl RecursiveCharacterChunker {
     pub fn new(chunk_size: usize, chunk_overlap: usize) -> Self {
         Self {
-            chunk_size,
-            chunk_overlap,
+            base: ChunkerBase::new(chunk_size, chunk_overlap),
             separators: ["\n\n", "\n", "。", ".", " ", ""]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            tokenizer: TokenizerProvider::get_tokenizer(),
         }
     }
 
@@ -157,7 +305,7 @@ impl RecursiveCharacterChunker {
     }
 
     fn split_text(&self, text: &str, seps: &[String]) -> Vec<String> {
-        if self.tokenizer.count_tokens(text) <= self.chunk_size {
+        if self.base.count_tokens(text) <= self.base.chunk_size() {
             let trimmed = text.trim();
             return if trimmed.is_empty() {
                 Vec::new()
@@ -181,7 +329,7 @@ impl RecursiveCharacterChunker {
         let mut results: Vec<String> = Vec::new();
 
         for split in splits {
-            if self.tokenizer.count_tokens(&split) < self.chunk_size {
+            if self.base.count_tokens(&split) < self.base.chunk_size() {
                 good_splits.push(split);
             } else {
                 if !good_splits.is_empty() {
@@ -208,26 +356,22 @@ impl RecursiveCharacterChunker {
 
     fn merge_splits(&self, splits: &[String], separator: &str) -> Vec<String> {
         let mut results: Vec<String> = Vec::new();
-        let mut current_batch: Vec<String> = Vec::new();
-        let mut current_len = 0usize;
+        let mut window = SlidingWindow::new(
+            self.base.chunk_size(),
+            // Keep overlap.
+            Retention::Overlap(self.base.overlap()),
+        );
 
         for split in splits {
-            let split_len = self.tokenizer.count_tokens(split);
-            if current_len + split_len > self.chunk_size && !current_batch.is_empty() {
-                results.push(current_batch.join(separator).trim().to_string());
-                // Keep overlap.
-                while !current_batch.is_empty() && current_len > self.chunk_overlap {
-                    let first_tokens = self.tokenizer.count_tokens(&current_batch[0]);
-                    current_len = current_len.saturating_sub(first_tokens);
-                    current_batch.remove(0);
-                }
+            let split_len = self.base.count_tokens(split);
+            if window.should_flush(split_len) {
+                results.push(window.flush().join(separator).trim().to_string());
             }
-            current_batch.push(split.clone());
-            current_len += split_len;
+            window.add(split.clone(), split_len);
         }
 
-        if !current_batch.is_empty() {
-            results.push(current_batch.join(separator).trim().to_string());
+        if !window.is_empty() {
+            results.push(window.into_pieces().join(separator).trim().to_string());
         }
         results
     }
@@ -236,18 +380,11 @@ impl RecursiveCharacterChunker {
 #[async_trait]
 impl Chunker for RecursiveCharacterChunker {
     async fn chunk(&self, text: &str, doc_id: &str) -> easyrag_core::Result<Vec<TextChunk>> {
-        if text.trim().is_empty() {
+        if is_blank(text) {
             return Ok(Vec::new());
         }
         let chunks = self.split_text(text, &self.separators);
-        Ok(chunks
-            .into_iter()
-            .enumerate()
-            .map(|(index, content)| {
-                let tokens = self.tokenizer.count_tokens(&content);
-                TextChunk::new(content, index as u32, doc_id, tokens)
-            })
-            .collect())
+        Ok(self.base.assemble(chunks, doc_id))
     }
 
     fn chunker_type(&self) -> &'static str {
@@ -310,10 +447,9 @@ fn split_into_sentences(text: &str, custom_regex: Option<&Regex>) -> Vec<String>
 /// while respecting a max chunk token size.
 pub struct SemanticVectorChunker {
     embedding_func: Arc<EmbeddingFunc>,
-    max_chunk_tokens: usize,
+    base: ChunkerBase,
     similarity_threshold: f32,
     sentence_split_regex: Option<Regex>,
-    tokenizer: Arc<Tokenizer>,
 }
 
 impl SemanticVectorChunker {
@@ -332,25 +468,26 @@ impl SemanticVectorChunker {
         };
         Ok(Self {
             embedding_func,
-            max_chunk_tokens,
+            // Overlap 0: this chunker's window empties completely on flush
+            // (there is no overlap knob), so it takes `Retention::Clear` below
+            // rather than expressing "nothing kept" as `Overlap(0)`.
+            base: ChunkerBase::new(max_chunk_tokens, 0),
             similarity_threshold,
             sentence_split_regex: regex,
-            tokenizer: TokenizerProvider::get_tokenizer(),
         })
     }
 
     fn create_chunk(&self, sentences: &[String], order_index: u32, doc_id: &str) -> TextChunk {
         let content = sentences.join(" ");
         let content = content.trim().to_string();
-        let tokens = self.tokenizer.count_tokens(&content);
-        TextChunk::new(content, order_index, doc_id, tokens)
+        self.base.assemble_at(content, order_index, doc_id)
     }
 }
 
 #[async_trait]
 impl Chunker for SemanticVectorChunker {
     async fn chunk(&self, text: &str, doc_id: &str) -> easyrag_core::Result<Vec<TextChunk>> {
-        if text.trim().is_empty() {
+        if is_blank(text) {
             return Ok(Vec::new());
         }
         let sentences = split_into_sentences(text, self.sentence_split_regex.as_ref());
@@ -359,7 +496,7 @@ impl Chunker for SemanticVectorChunker {
                 text.to_string(),
                 0,
                 doc_id,
-                self.tokenizer.count_tokens(text),
+                self.base.count_tokens(text),
             )]);
         }
 
@@ -383,35 +520,27 @@ impl Chunker for SemanticVectorChunker {
         }
 
         let mut chunks = Vec::new();
-        let mut current_sentences: Vec<String> = Vec::new();
-        let mut current_tokens = 0usize;
+        let mut window = SlidingWindow::new(self.base.chunk_size(), Retention::Clear);
         let mut order_index = 0u32;
 
         for i in 0..sentences.len() {
-            let sentence_tokens = self.tokenizer.count_tokens(&sentences[i]);
-            if current_tokens + sentence_tokens > self.max_chunk_tokens
-                && !current_sentences.is_empty()
-            {
-                chunks.push(self.create_chunk(&current_sentences, order_index, doc_id));
+            let sentence_tokens = self.base.count_tokens(&sentences[i]);
+            if window.should_flush(sentence_tokens) {
+                chunks.push(self.create_chunk(&window.flush(), order_index, doc_id));
                 order_index += 1;
-                current_sentences.clear();
-                current_tokens = 0;
             }
-            current_sentences.push(sentences[i].clone());
-            current_tokens += sentence_tokens;
+            window.add(sentences[i].clone(), sentence_tokens);
             // literal semantics: flush after pushing the sentence
             // whose index is a recorded breakpoint, so that sentence stays
             // in the flushed chunk (off-by-one vs. the intuitive "break
             // before sentence i", intentionally preserved).
-            if breakpoints.contains(&i) && !current_sentences.is_empty() {
-                chunks.push(self.create_chunk(&current_sentences, order_index, doc_id));
+            if breakpoints.contains(&i) && !window.is_empty() {
+                chunks.push(self.create_chunk(&window.flush(), order_index, doc_id));
                 order_index += 1;
-                current_sentences.clear();
-                current_tokens = 0;
             }
         }
-        if !current_sentences.is_empty() {
-            chunks.push(self.create_chunk(&current_sentences, order_index, doc_id));
+        if !window.is_empty() {
+            chunks.push(self.create_chunk(&window.into_pieces(), order_index, doc_id));
         }
 
         tracing::debug!(
@@ -444,9 +573,8 @@ pub struct HeadingBlock {
 /// [`SemanticVectorChunker`] for heading-less text.
 pub struct ParagraphSemanticChunker {
     embedding_func: Arc<EmbeddingFunc>,
-    max_chunk_tokens: usize,
+    base: ChunkerBase,
     similarity_threshold: f32,
-    tokenizer: Arc<Tokenizer>,
 }
 
 const IDEAL_RATIO: f64 = 0.75;
@@ -462,9 +590,20 @@ impl ParagraphSemanticChunker {
     ) -> Self {
         Self {
             embedding_func,
-            max_chunk_tokens,
+            base: ChunkerBase::new(max_chunk_tokens, 0),
             similarity_threshold,
-            tokenizer: TokenizerProvider::get_tokenizer(),
+        }
+    }
+
+    /// A piece of an oversized block, carrying the parent block's heading
+    /// context and its own freshly counted token total.
+    fn sub_block(&self, block: &HeadingBlock, content: &str) -> HeadingBlock {
+        HeadingBlock {
+            heading: block.heading.clone(),
+            level: block.level,
+            parent_headings: block.parent_headings.clone(),
+            content: content.to_string(),
+            tokens: self.base.count_tokens(content),
         }
     }
 
@@ -487,7 +626,7 @@ impl ParagraphSemanticChunker {
                 level: 0,
                 parent_headings: Vec::new(),
                 content: preamble.to_string(),
-                tokens: self.tokenizer.count_tokens(preamble),
+                tokens: self.base.count_tokens(preamble),
             });
         }
 
@@ -514,7 +653,7 @@ impl ParagraphSemanticChunker {
                 text.len()
             };
             let content = text[content_start..content_end].trim().to_string();
-            let tokens = self.tokenizer.count_tokens(&content);
+            let tokens = self.base.count_tokens(&content);
             blocks.push(HeadingBlock {
                 heading,
                 level,
@@ -548,9 +687,9 @@ impl ParagraphSemanticChunker {
         let mut breakpoints = Vec::new();
         let mut current_tokens = 0usize;
         for i in 0..sentences.len() {
-            current_tokens += self.tokenizer.count_tokens(&sentences[i]);
+            current_tokens += self.base.count_tokens(&sentences[i]);
             // Force break if exceeding max tokens.
-            if current_tokens >= self.max_chunk_tokens && i < sentences.len() - 1 {
+            if current_tokens >= self.base.chunk_size() && i < sentences.len() - 1 {
                 breakpoints.push(i + 1);
                 current_tokens = 0;
                 continue;
@@ -571,7 +710,7 @@ impl ParagraphSemanticChunker {
     ) -> easyrag_core::Result<Vec<HeadingBlock>> {
         let mut result = Vec::new();
         for block in blocks {
-            if block.tokens <= self.max_chunk_tokens || block.content.trim().is_empty() {
+            if block.tokens <= self.base.chunk_size() || block.content.trim().is_empty() {
                 result.push(block);
                 continue;
             }
@@ -588,13 +727,7 @@ impl ParagraphSemanticChunker {
                 let sub = sentences[start..bp].join(" ");
                 let sub = sub.trim();
                 if !sub.is_empty() {
-                    result.push(HeadingBlock {
-                        heading: block.heading.clone(),
-                        level: block.level,
-                        parent_headings: block.parent_headings.clone(),
-                        content: sub.to_string(),
-                        tokens: self.tokenizer.count_tokens(sub),
-                    });
+                    result.push(self.sub_block(&block, sub));
                 }
                 start = bp;
             }
@@ -602,13 +735,7 @@ impl ParagraphSemanticChunker {
                 let sub = sentences[start..].join(" ");
                 let sub = sub.trim();
                 if !sub.is_empty() {
-                    result.push(HeadingBlock {
-                        heading: block.heading.clone(),
-                        level: block.level,
-                        parent_headings: block.parent_headings.clone(),
-                        content: sub.to_string(),
-                        tokens: self.tokenizer.count_tokens(sub),
-                    });
+                    result.push(self.sub_block(&block, sub));
                 }
             }
         }
@@ -616,7 +743,7 @@ impl ParagraphSemanticChunker {
     }
 
     fn merge_undersized_blocks(&self, blocks: Vec<HeadingBlock>) -> Vec<HeadingBlock> {
-        let ideal_tokens = (self.max_chunk_tokens as f64 * IDEAL_RATIO) as usize;
+        let ideal_tokens = (self.base.chunk_size() as f64 * IDEAL_RATIO) as usize;
         let mut result = Vec::new();
         let mut i = 0usize;
 
@@ -657,7 +784,7 @@ impl ParagraphSemanticChunker {
                 heading: block.heading.clone(),
                 level: block.level,
                 parent_headings: block.parent_headings.clone(),
-                tokens: self.tokenizer.count_tokens(&merged),
+                tokens: self.base.count_tokens(&merged),
                 content: merged,
             });
             i = j;
@@ -675,11 +802,18 @@ impl ParagraphSemanticChunker {
                 } else {
                     block.content.clone()
                 };
+                // Deliberately not `assemble_at`: the stored content is the
+                // trimmed string while the token count is taken on the
+                // *untrimmed* one. Blocks that have a body are already trimmed
+                // at every producer, so the two agree there — but a heading with
+                // an empty body stores `"# X"` while counting `"# X\n"`. That
+                // is existing observable behaviour, pinned by the
+                // `paragraph_semantic_nested` golden, and must not change here.
                 let mut chunk = TextChunk::new(
                     full_content.trim().to_string(),
                     index as u32,
                     doc_id,
-                    self.tokenizer.count_tokens(&full_content),
+                    self.base.count_tokens(&full_content),
                 );
                 chunk.metadata.insert(
                     "heading".to_string(),
@@ -708,14 +842,14 @@ impl ParagraphSemanticChunker {
 #[async_trait]
 impl Chunker for ParagraphSemanticChunker {
     async fn chunk(&self, text: &str, doc_id: &str) -> easyrag_core::Result<Vec<TextChunk>> {
-        if text.trim().is_empty() {
+        if is_blank(text) {
             return Ok(Vec::new());
         }
         if !HEADING_REGEX.is_match(text) {
             tracing::debug!("No headings found, falling back to SemanticVectorChunker");
             let fallback = SemanticVectorChunker::new(
                 Arc::clone(&self.embedding_func),
-                self.max_chunk_tokens,
+                self.base.chunk_size(),
                 self.similarity_threshold,
                 None,
             )?;
@@ -740,15 +874,19 @@ impl Chunker for ParagraphSemanticChunker {
 /// becomes chunk(s) with hierarchy metadata. Falls back to
 /// [`TokenSizeChunker`] for heading-less documents and oversized sections.
 pub struct StructureAwareChunker {
-    max_chunk_tokens: usize,
-    tokenizer: Arc<Tokenizer>,
+    base: ChunkerBase,
 }
+
+/// Overlap handed to the [`TokenSizeChunker`] this chunker delegates to, for
+/// both the heading-less fallback and the oversized-section split. It is the
+/// sub-chunker's overlap, not this chunker's own — sections are emitted whole,
+/// so `ChunkerBase::overlap` stays 0 here.
+const SUB_CHUNK_OVERLAP: usize = 100;
 
 impl StructureAwareChunker {
     pub fn new(max_chunk_tokens: usize) -> Self {
         Self {
-            max_chunk_tokens,
-            tokenizer: TokenizerProvider::get_tokenizer(),
+            base: ChunkerBase::new(max_chunk_tokens, 0),
         }
     }
 
@@ -767,14 +905,14 @@ impl StructureAwareChunker {
 #[async_trait]
 impl Chunker for StructureAwareChunker {
     async fn chunk(&self, text: &str, doc_id: &str) -> easyrag_core::Result<Vec<TextChunk>> {
-        if text.trim().is_empty() {
+        if is_blank(text) {
             return Ok(Vec::new());
         }
         if !crate::heading::has_headings(text) {
             tracing::debug!(
                 "No headings found in document {doc_id}, falling back to TokenSizeChunker"
             );
-            let fallback = TokenSizeChunker::new(self.max_chunk_tokens, 100);
+            let fallback = TokenSizeChunker::new(self.base.chunk_size(), SUB_CHUNK_OVERLAP);
             return fallback.chunk(text, doc_id).await;
         }
 
@@ -837,8 +975,11 @@ impl Chunker for StructureAwareChunker {
         let mut chunks = Vec::new();
         let mut order_index = 0u32;
         for section in &sections {
-            let section_tokens = self.tokenizer.count_tokens(&section.content);
-            if section_tokens <= self.max_chunk_tokens {
+            let section_tokens = self.base.count_tokens(&section.content);
+            if section_tokens <= self.base.chunk_size() {
+                // `assemble_at` would re-count tokens this branch already has,
+                // and both branches overwrite `metadata` outright, so the
+                // constructor stays explicit here.
                 let mut chunk = TextChunk::new(
                     section.content.clone(),
                     order_index,
@@ -849,7 +990,7 @@ impl Chunker for StructureAwareChunker {
                 chunks.push(chunk);
                 order_index += 1;
             } else {
-                let sub_chunker = TokenSizeChunker::new(self.max_chunk_tokens, 100);
+                let sub_chunker = TokenSizeChunker::new(self.base.chunk_size(), SUB_CHUNK_OVERLAP);
                 let sub_chunks = sub_chunker.chunk(&section.content, doc_id).await?;
                 for sub in sub_chunks {
                     let mut chunk = TextChunk::new(sub.content, order_index, doc_id, sub.tokens);
@@ -936,5 +1077,87 @@ impl ChunkerRegistry {
             )),
             _ => Arc::new(TokenSizeChunker::default()),
         })
+    }
+}
+
+/// Unit-level pins for [`SlidingWindow`].
+///
+/// The byte-level chunker goldens (`tests/chunker_golden.rs`) cover the window
+/// through real text, but three of its guarantees are hard to reach from a
+/// fixture: the strictness of each comparison, and the case where
+/// [`Retention::Clear`] and `Retention::Overlap(0)` genuinely diverge. These
+/// drive the window directly with explicit token counts, so each assertion
+/// names one comparison rather than hoping a text fixture happens to land on
+/// it.
+#[cfg(test)]
+mod sliding_window_tests {
+    use super::{Retention, SlidingWindow};
+
+    /// The overlap walk keeps pieces while `tokens > overlap`, strictly. With
+    /// `>=` it would drop one more piece and the retained tail would shrink.
+    #[test]
+    fn overlap_walk_stops_at_strictly_greater() {
+        let mut w = SlidingWindow::new(3, Retention::Overlap(2));
+        for (piece, tokens) in [("a", 1), ("b", 1), ("c", 1)] {
+            w.add(piece.to_string(), tokens);
+        }
+        assert!(w.should_flush(1), "3 buffered + 1 more must overflow a budget of 3");
+        assert_eq!(w.flush(), vec!["a", "b", "c"], "flush yields the pre-trim batch");
+        // Retained exactly 2 tokens' worth; a third piece refills to the budget.
+        w.add("d".to_string(), 1);
+        assert_eq!(w.flush(), vec!["b", "c", "d"], "overlap must retain 2 pieces, not 1");
+    }
+
+    /// `should_flush` compares *before* adding and never fires on an empty
+    /// buffer, so a single oversized piece still gets a window of its own.
+    #[test]
+    fn should_flush_compares_before_adding_and_never_on_empty() {
+        let mut w = SlidingWindow::new(3, Retention::Clear);
+        assert!(!w.should_flush(99), "empty buffer must never flush");
+        w.add("x".to_string(), 1);
+        w.add("y".to_string(), 1);
+        assert!(!w.should_flush(1), "2 + 1 == 3 is not > 3");
+        assert!(w.should_flush(2), "2 + 2 == 4 is > 3");
+        let mut big = SlidingWindow::new(3, Retention::Clear);
+        big.add("oversized".to_string(), 99);
+        assert!(big.should_flush(0), "a buffered oversized piece flushes on the next one");
+    }
+
+    /// Why `Retention` is an enum rather than `Overlap(0)` for "keep nothing".
+    ///
+    /// The two agree whenever every buffered piece has a nonzero token count,
+    /// but a trailing zero-token piece (an empty split, which the recursive
+    /// chunker's separator pass really can produce) is drained by `Clear` and
+    /// left behind by `Overlap(0)`, whose walk stops as soon as the running
+    /// total hits zero. Folding them together would therefore rest on that
+    /// never happening; keeping them apart makes the equivalence structural.
+    #[test]
+    fn clear_and_overlap_zero_diverge_on_a_trailing_zero_token_piece() {
+        let mut clear = SlidingWindow::new(10, Retention::Clear);
+        let mut zero = SlidingWindow::new(10, Retention::Overlap(0));
+        for w in [&mut clear, &mut zero] {
+            w.add("a".to_string(), 1);
+            w.add(String::new(), 0);
+        }
+        assert_eq!(clear.flush(), zero.flush(), "the flushed chunk itself is identical");
+        assert!(clear.is_empty(), "Clear drains the zero-token tail");
+        assert!(!zero.is_empty(), "Overlap(0) strands it");
+
+        for w in [&mut clear, &mut zero] {
+            w.add("b".to_string(), 1);
+        }
+        assert_eq!(clear.flush(), vec!["b"]);
+        assert_eq!(zero.flush(), vec!["", "b"], "the stranded piece leaks into the next chunk");
+    }
+
+    /// `into_pieces` and `is_empty` see the retained tail, not the flushed one.
+    #[test]
+    fn into_pieces_returns_the_retained_tail() {
+        let mut w = SlidingWindow::new(2, Retention::Overlap(1));
+        w.add("a".to_string(), 1);
+        w.add("b".to_string(), 1);
+        assert_eq!(w.flush(), vec!["a", "b"]);
+        assert!(!w.is_empty());
+        assert_eq!(w.into_pieces(), vec!["b"]);
     }
 }

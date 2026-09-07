@@ -1,0 +1,20 @@
+---
+source: crates/easyrag-core/tests/prompt_golden.rs
+---
+---Task---
+Classify the following user query into exactly one category:
+- no_retrieval: greetings, chitchat, simple calculations, opinions, or questions no document corpus could answer
+- single_hop: a straightforward factual question answerable from a single retrieval
+- multi_hop: a complex question requiring multiple pieces of information that should be decomposed
+
+Also detect if the query contains a false premise (an assumption that is likely incorrect).
+
+---Output Format---
+Return ONLY a JSON object (no markdown, no explanation):
+{"query_type": "no_retrieval"|"single_hop"|"multi_hop", "sub_queries": ["sub-question 1", "sub-question 2"], "has_false_premise": true|false}
+
+For single_hop and no_retrieval, sub_queries should be an empty array.
+For multi_hop, provide 2-3 self-contained sub-questions.
+
+---Query---
+{query}

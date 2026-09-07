@@ -1,0 +1,7 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+on_event(parse_start)
+on_parse_start(file_path=, doc_id=d1)
+on_event(parse_start)
+on_parse_start(file_path=, doc_id=d1)

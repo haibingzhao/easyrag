@@ -1,0 +1,13 @@
+---
+source: crates/easyrag-pipeline/tests/extraction_golden.rs
+---
+node_writes=1
+node id="Ada Lovelace"
+keys=[entity_type, description, source_id]
+{
+  "entity_type": "Person",
+  "description": "only",
+  "source_id": "chunk-1<SEP>chunk-7"
+}
+
+edge_writes=0

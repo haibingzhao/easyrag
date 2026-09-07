@@ -1,0 +1,15 @@
+---
+source: crates/easyrag-core/tests/prompt_golden.rs
+---
+---Task---
+You are a strict fact-checker. For each CLAIM below, determine whether the CONTEXT supports it.
+
+---Output Format---
+Return a JSON object with a "verdicts" array, one per claim in order:
+{"verdicts": [{"claim": "...", "supported": true|false, "confidence": 0.0-1.0}]}
+
+---Context---
+{context}
+
+---Claims---
+{claims}

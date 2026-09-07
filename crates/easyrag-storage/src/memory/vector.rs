@@ -8,6 +8,8 @@ use easyrag_core::JsonMap;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 
+use crate::drop_result::drop_success;
+
 struct VectorEntry {
     vector: Vec<f32>,
     metadata: JsonMap,
@@ -99,10 +101,6 @@ impl StorageNameSpace for InMemoryVectorStorage {
     }
 
     // initialize / finalize / index_done_callback: no-op, data immediately visible.
-    async fn index_done_callback(&self) -> easyrag_core::Result<()> {
-        Ok(())
-    }
-
     async fn drop(&self, biz_id: &str) -> easyrag_core::Result<HashMap<String, String>> {
         let removed = {
             let mut data = self.data.lock();
@@ -110,13 +108,9 @@ impl StorageNameSpace for InMemoryVectorStorage {
             data.retain(|_, entry| entry.biz != biz_id);
             before - data.len()
         };
-        let mut result = HashMap::new();
-        result.insert("status".to_string(), "success".to_string());
-        result.insert(
-            "message".to_string(),
-            format!("data dropped ({removed} vectors for biz {biz_id})"),
-        );
-        Ok(result)
+        Ok(drop_success(format!(
+            "data dropped ({removed} vectors for biz {biz_id})"
+        )))
     }
 }
 

@@ -1,0 +1,8 @@
+---
+source: crates/easyrag-pipeline/tests/chunker_golden.rs
+---
+chunks=4
+order=0 tokens=29 doc_id="doc-1" content="alpha beta gamma delta epsilon zeta eta theta\nalpha beta gamma delta epsilon zeta eta theta\nalpha beta gamma delta epsilon zeta eta theta"
+order=1 tokens=29 doc_id="doc-1" content="alpha beta gamma delta epsilon zeta eta theta\nalpha beta gamma delta epsilon zeta eta theta\nalpha beta gamma delta epsilon zeta eta theta"
+order=2 tokens=29 doc_id="doc-1" content="alpha beta gamma delta epsilon zeta eta theta\nalpha beta gamma delta epsilon zeta eta theta\nalpha beta gamma delta epsilon zeta eta theta"
+order=3 tokens=29 doc_id="doc-1" content="alpha beta gamma delta epsilon zeta eta theta\nalpha beta gamma delta epsilon zeta eta theta\nalpha beta gamma delta epsilon zeta eta theta"

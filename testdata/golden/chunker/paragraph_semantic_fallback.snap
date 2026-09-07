@@ -1,0 +1,6 @@
+---
+source: crates/easyrag-pipeline/tests/chunker_golden.rs
+---
+chunks=2
+order=0 tokens=18 doc_id="doc-1" content="Sentence number 0 discusses topic 0. Sentence number 1 discusses topic 1."
+order=1 tokens=36 doc_id="doc-1" content="Sentence number 2 discusses topic 2. Sentence number 3 discusses topic 3. Sentence number 4 discusses topic 0. Sentence number 5 discusses topic 1."

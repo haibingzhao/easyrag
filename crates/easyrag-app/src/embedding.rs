@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use easyrag_core::llm::embedding_func::{EmbeddingContext, EmbeddingFunc, EmbeddingFunction};
-use easyrag_llm::openai::{OpenAiClient, OpenAiConfig};
+use easyrag_llm::openai::OpenAiClient;
 use easyrag_server::ServerConfig;
 
 /// Wraps an OpenAI-compatible embedding client, applying the asymmetric
@@ -42,13 +42,10 @@ impl EmbeddingFunction for PrefixedEmbedding {
 
 /// Build the embedding function bean. Stateless,
 /// so callers may construct multiple identical instances.
-pub(crate) fn make_embedding_func(config: &ServerConfig) -> anyhow::Result<EmbeddingFunc> {
-    // `config.embedding_api_key` already reflects EMBEDDING_BINDING_API_KEY
-    // through the injected getter; no second env read here.
-    let mut client_config = OpenAiConfig::new(config.embedding_api_key.clone());
-    client_config.base_url = config.embedding_base_url.clone();
-    client_config.model = config.embedding_model.clone();
-    client_config.embedding_dimension = config.embedding_dim;
+pub fn make_embedding_func(config: &ServerConfig) -> anyhow::Result<EmbeddingFunc> {
+    // The `ServerConfig` → `OpenAiConfig` mapping is shared with the chat client
+    // in `crate::llm`, so the two bindings cannot drift apart silently.
+    let client_config = crate::llm::embedding_config(config);
     let mut func = EmbeddingFunc::new(
         config.embedding_dim,
         Arc::new(PrefixedEmbedding {

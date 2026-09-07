@@ -2,7 +2,7 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import Textarea from '@/components/ui/Textarea'
 import Button from '@/components/ui/Button'
 import ChatMessageBubble from '@/components/retrieval/ChatMessage'
-import { queryApi, type QueryRequest } from '@/api/easyrag'
+import { queryApi, authHeaders, handleUnauthorized, withWorkspace, type QueryRequest } from '@/api/easyrag'
 import { useSettingsStore } from '@/stores/settings'
 import { errorMessage } from '@/lib/utils'
 import { SendIcon, EraserIcon, SquareIcon } from 'lucide-react'
@@ -117,21 +117,24 @@ export default function RetrievalView() {
       }
 
       if (querySettings.stream) {
-        // Streaming response (uses native fetch, so workspace must be added manually)
-        const currentWorkspace = useSettingsStore.getState().workspace
-        const streamBody: Record<string, unknown> = { ...request }
-        if (currentWorkspace && currentWorkspace !== 'default') {
-          streamBody.workspace = currentWorkspace
-        }
+        // Streaming response: axios cannot hand back a ReadableStream in the
+        // browser, so this stays on native fetch — but through the shared
+        // helpers, so auth/workspace injection and 401 recovery match every
+        // apiClient call.
+        const streamBody = withWorkspace<Record<string, unknown>>({ ...request })
         const response = await fetch('/api/query/stream', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${localStorage.getItem('easyrag_token') || ''}`
-          },
+          headers: authHeaders(),
           body: JSON.stringify(streamBody),
           signal: abortController.signal
         })
+
+        if (response.status === 401) {
+          // BC-14 (A-12): an expired session now clears the token and returns
+          // to the login page instead of surfacing a bare "HTTP 401" bubble.
+          handleUnauthorized()
+          return
+        }
 
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`)

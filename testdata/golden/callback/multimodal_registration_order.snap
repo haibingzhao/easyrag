@@ -1,0 +1,6 @@
+---
+source: crates/easyrag-pipeline/tests/callback_golden.rs
+---
+first: on_query_start(query=q, mode=naive)
+second: on_query_start(query=q, mode=naive)
+third: on_query_start(query=q, mode=naive)
