@@ -16,6 +16,7 @@ use easyrag_core::storage::traits::StorageNameSpace;
 use easyrag_core::util::hash::compute_args_hash;
 use easyrag_core::JsonMap;
 use easyrag_pipeline::parser::DocumentProcessingOptions;
+use easyrag_pipeline::PipelineService;
 
 use crate::error::{AppError, AppResult};
 use crate::pagination::Paginated;
@@ -248,12 +249,25 @@ async fn read_scope(state: &AppServices, q: &ScopeQuery) -> AppResult<ResolvedSc
     Ok(scope)
 }
 
-/// Spawn the pipeline on a background task
-/// pending documents of the given business line.
-fn spawn_pipeline(pipeline: Arc<easyrag_pipeline::IngestionPipeline>, biz_id: String) {
-    tokio::spawn(async move {
-        pipeline.start(&biz_id).await;
-    });
+/// Kick document processing for the given business line.
+///
+/// With streaming enabled (`pipeline_service` is `Some`) the persistent
+/// discovery loop finds pending documents on its own, so this only makes sure
+/// it is running (and nudges it). Otherwise it falls back to the one-shot batch
+/// run — byte-for-byte the previous behaviour.
+fn spawn_pipeline(
+    pipeline_service: Option<Arc<PipelineService>>,
+    pipeline: Arc<easyrag_pipeline::IngestionPipeline>,
+    biz_id: String,
+) {
+    match pipeline_service {
+        Some(service) => service.ensure_running(),
+        None => {
+            tokio::spawn(async move {
+                pipeline.start(&biz_id).await;
+            });
+        }
+    }
 }
 
 async fn insert_text(
@@ -393,7 +407,11 @@ async fn process_documents(
     Query(q): Query<ScopeQuery>,
 ) -> AppResult<Json<Value>> {
     let scope = query_scope(&state, &q).await?;
-    spawn_pipeline(Arc::clone(&state.pipeline), scope.biz_id);
+    spawn_pipeline(
+        state.pipeline_service.clone(),
+        Arc::clone(&scope.context.pipeline),
+        scope.biz_id,
+    );
     Ok(Json(success_response("Pipeline started", None)))
 }
 
@@ -617,7 +635,38 @@ async fn pipeline_status(
         .doc_status_storage
         .get_status_counts(&scope.biz_id)
         .await?;
-    Ok(Json(json!({ "status": "idle", "counts": counts })))
+    // Additive merge: keep `status`/`counts`, fold in the live pipeline state
+    // (batch flags) plus the streaming counters. `active_count`/`channel_len`/
+    // `total_processed` are atomic reads (no DB cost); `pending_count` derives
+    // from `counts` so the webui's busy/pending indicators work — previously
+    // `busy` was absent and the UI showed a permanent "Idle".
+    let live = scope.context.pipeline.pipeline_status();
+    let busy = live.get("busy").and_then(Value::as_bool).unwrap_or(false);
+    let pending_count = counts
+        .get(DocStatus::Pending.value())
+        .copied()
+        .unwrap_or(0);
+    let (streaming, channel_len, total_processed) = match &state.pipeline_service {
+        Some(service) => (
+            service.is_active(),
+            service.channel_len(),
+            service.total_processed(),
+        ),
+        None => (false, 0, 0),
+    };
+    Ok(Json(json!({
+        "status": if busy { "running" } else { "idle" },
+        "counts": counts,
+        "busy": busy,
+        "cancel_requested": live.get("cancel_requested").and_then(Value::as_bool).unwrap_or(false),
+        "docs_processed": live.get("docs_processed").and_then(Value::as_u64).unwrap_or(0),
+        "last_run_at": live.get("last_run_at").cloned().unwrap_or(Value::Null),
+        "active_count": live.get("active_count").and_then(Value::as_u64).unwrap_or(0),
+        "channel_len": channel_len,
+        "total_processed": total_processed,
+        "pending_count": pending_count,
+        "streaming": streaming,
+    })))
 }
 
 /// Background auto-scanner observability (BC-11). Reports whether the scanner
@@ -726,7 +775,11 @@ async fn reprocess_failed(
     }
     // Empty biz_id starts a wildcard pipeline run; per-document biz lines
     // are resolved inside run_pipeline.
-    spawn_pipeline(Arc::clone(&state.pipeline), scope.biz_id);
+    spawn_pipeline(
+        state.pipeline_service.clone(),
+        Arc::clone(&state.pipeline),
+        scope.biz_id,
+    );
     Ok(Json(json!({
         "status": "success",
         "message": format!("Reprocessing {} failed documents", failed_docs.len()),
@@ -756,7 +809,11 @@ async fn insert_batch(
     }
     // Auto-start pipeline.
     let scope = default_scope(&state).await?;
-    spawn_pipeline(Arc::clone(&state.pipeline), scope.biz_id);
+    spawn_pipeline(
+        state.pipeline_service.clone(),
+        Arc::clone(&state.pipeline),
+        scope.biz_id,
+    );
     let count = doc_ids.len();
     Ok(Json(json!({ "status": "success", "doc_ids": doc_ids, "count": count })))
 }
@@ -798,7 +855,11 @@ async fn scan_input_dir(
     // Auto-start pipeline.
     let doc_ids = outcome.inserted_doc_ids;
     if !doc_ids.is_empty() {
-        spawn_pipeline(Arc::clone(&state.pipeline), scope.biz_id);
+        spawn_pipeline(
+            state.pipeline_service.clone(),
+            Arc::clone(&state.pipeline),
+            scope.biz_id,
+        );
     }
     let count = doc_ids.len();
     Ok(Json(json!({
@@ -810,7 +871,10 @@ async fn scan_input_dir(
 }
 
 async fn cancel_pipeline(state: AppState) -> Json<Value> {
-    state.pipeline.cancel();
+    match &state.pipeline_service {
+        Some(service) => service.cancel(),
+        None => state.pipeline.cancel(),
+    }
     Json(success_response("Pipeline cancellation requested", None))
 }
 

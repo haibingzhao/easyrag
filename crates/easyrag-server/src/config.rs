@@ -124,6 +124,15 @@ pub struct ServerConfig {
     pub auto_scan_input_dir: String,
     pub auto_scan_extensions: String,
     pub auto_scan_max_files_per_cycle: usize,
+
+    // Streaming ingestion pipeline (BC-11 gradual rollout). Default-off keeps
+    // the batch `run_pipeline` path byte-for-byte equivalent to the status quo;
+    // enabling it swaps in the discovery→channel→processor `PipelineService`.
+    pub pipeline_streaming_enabled: bool,
+    /// DocDiscovery idle poll interval in milliseconds (adaptive backoff floor).
+    pub pipeline_poll_interval_ms: u64,
+    /// Bounded mpsc channel capacity between discovery and processor.
+    pub pipeline_channel_capacity: usize,
 }
 
 impl ServerConfig {
@@ -282,6 +291,11 @@ impl Default for ServerConfig {
             auto_scan_input_dir: String::new(),
             auto_scan_extensions: ".txt,.md,.pdf".to_string(),
             auto_scan_max_files_per_cycle: 100,
+
+            // Streaming pipeline defaults: disabled, 2s poll, 256 channel slots.
+            pipeline_streaming_enabled: false,
+            pipeline_poll_interval_ms: 2000,
+            pipeline_channel_capacity: 256,
         }
     }
 }
@@ -333,6 +347,10 @@ mod tests {
         assert_eq!(c.lucene_index_dir, "");
         assert_eq!(c.language, "English");
         assert_eq!(c.log_level, "INFO");
+        // Streaming pipeline defaults (BC-11 gradual rollout: disabled by default).
+        assert!(!c.pipeline_streaming_enabled);
+        assert_eq!(c.pipeline_poll_interval_ms, 2000);
+        assert_eq!(c.pipeline_channel_capacity, 256);
     }
 
     fn empty_tenant(workspace: &str) -> TenantConfig {

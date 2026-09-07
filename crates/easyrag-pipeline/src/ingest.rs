@@ -67,8 +67,8 @@ pub struct IngestionPipeline {
     #[allow(dead_code)]
     language: String,
     max_concurrency: usize,
-    /// Accepted for API compatibility; unused.
-    #[allow(dead_code)]
+    /// Bounded-channel capacity for the streaming `PipelineService` (read via
+    /// [`IngestionPipeline::queue_size`]); the batch path does not use it.
     queue_size: usize,
     keyword_search: Option<Arc<dyn KeywordSearchable>>,
     structure_tree_builder: StructureTreeBuilder,
@@ -78,6 +78,12 @@ pub struct IngestionPipeline {
     is_running: AtomicBool,
     cancel_requested: AtomicBool,
     pipeline_active: AtomicBool,
+    /// Documents currently in flight in the streaming `TaskProcessor`
+    /// (always 0 when streaming is disabled). Folded into
+    /// [`IngestionPipeline::pipeline_status`]'s `busy` so a persistent consumer
+    /// still reports busy while it has work, without touching
+    /// `check_pipeline_busy`.
+    active_count: AtomicUsize,
     last_processed_count: AtomicUsize,
     last_run_at: Mutex<Option<String>>,
 }
@@ -117,6 +123,7 @@ impl IngestionPipeline {
             is_running: AtomicBool::new(false),
             cancel_requested: AtomicBool::new(false),
             pipeline_active: AtomicBool::new(false),
+            active_count: AtomicUsize::new(0),
             last_processed_count: AtomicUsize::new(0),
             last_run_at: Mutex::new(None),
         }
@@ -160,7 +167,16 @@ impl IngestionPipeline {
     /// Pipeline state for external monitoring.
     pub fn pipeline_status(&self) -> JsonMap {
         let mut map = JsonMap::new();
-        map.insert("busy".into(), JsonValue::Bool(self.pipeline_active.load(Ordering::SeqCst)));
+        // `busy` keeps its "only while actually processing" contract: the batch
+        // flag OR any in-flight streaming document. With streaming disabled
+        // `active_count` is always 0, so this is identical to the previous
+        // `pipeline_active` read.
+        let active = self.active_count.load(Ordering::SeqCst);
+        map.insert(
+            "busy".into(),
+            JsonValue::Bool(self.pipeline_active.load(Ordering::SeqCst) || active > 0),
+        );
+        map.insert("active_count".into(), JsonValue::from(active as u64));
         map.insert(
             "cancel_requested".into(),
             JsonValue::Bool(self.cancel_requested.load(Ordering::SeqCst)),
@@ -178,6 +194,46 @@ impl IngestionPipeline {
             },
         );
         map
+    }
+
+    /// Documents currently in flight in the streaming processor (0 when the
+    /// streaming path is disabled).
+    pub(crate) fn active_count(&self) -> usize {
+        self.active_count.load(Ordering::SeqCst)
+    }
+
+    /// Record one more in-flight streaming document.
+    pub(crate) fn incr_active(&self) {
+        self.active_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Record one fewer in-flight streaming document.
+    pub(crate) fn decr_active(&self) {
+        self.active_count.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Global concurrency ceiling; the streaming `Semaphore` is built with the
+    /// same permit count the batch path uses (invariant: concurrency unchanged).
+    pub(crate) fn max_concurrency(&self) -> usize {
+        self.max_concurrency
+    }
+
+    /// Bounded-channel capacity default for the streaming `PipelineService`.
+    pub(crate) fn queue_size(&self) -> usize {
+        self.queue_size
+    }
+
+    /// Commit every storage index. This is the tail of
+    /// [`IngestionPipeline::process_document_inner`], factored out so graceful
+    /// shutdown can force one final commit after in-flight documents drain.
+    pub(crate) async fn commit_indexes(&self) -> easyrag_core::Result<()> {
+        self.kv_storage.index_done_callback().await?;
+        self.vector_storage.index_done_callback().await?;
+        self.graph_storage.index_done_callback().await?;
+        if let Some(keyword_search) = &self.keyword_search {
+            keyword_search.commit_index().await?;
+        }
+        Ok(())
     }
 
     /// Insert a document into the pipeline. Supports per-document
@@ -502,12 +558,7 @@ impl IngestionPipeline {
         .await;
 
         // Commit all storage operations.
-        self.kv_storage.index_done_callback().await?;
-        self.vector_storage.index_done_callback().await?;
-        self.graph_storage.index_done_callback().await?;
-        if let Some(keyword_search) = &self.keyword_search {
-            keyword_search.commit_index().await?;
-        }
+        self.commit_indexes().await?;
 
         tracing::info!(
             "Document {doc_id} processed successfully ({} chunks)",

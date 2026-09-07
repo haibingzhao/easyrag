@@ -215,6 +215,9 @@ async fn build_env(auth_enabled: bool, with_structure: bool) -> Env {
         query_engine,
         structure_strategy,
         pipeline,
+        // Streaming ingestion is default-off; None keeps the batch path (and
+        // every assertion in this contract suite) byte-for-byte unchanged.
+        pipeline_service: None,
         vector_storage: vector as Arc<dyn VectorStorage>,
         graph_storage: graph as Arc<dyn GraphStorage>,
         kv_storage: kv as Arc<dyn KVStorage>,
@@ -493,11 +496,30 @@ async fn documents_insert_list_status_counts_delete() {
 #[tokio::test]
 async fn pipeline_status_reports_idle_with_counts() {
     let env = build_env(false, false).await;
-    // getPipelineStatus: static {"status": "idle", "counts": ...}
+    // Additive merge (BC-11): the endpoint keeps `status`/`counts` and folds in
+    // the live batch flags (busy/cancel_requested/docs_processed/last_run_at),
+    // the streaming counters (active_count/channel_len/total_processed) and a
+    // `pending_count` derived from `counts`. With streaming default-off
+    // (`pipeline_service` is None) the streaming counters read 0 and
+    // `streaming` is false, but every field is present so the webui busy/pending
+    // indicators work — previously `busy` was absent and the UI showed a
+    // permanent "Idle".
     let (status, body) = get_json(&env, "/api/documents/pipeline_status").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "idle");
     assert!(body["counts"].is_object());
+    // Live batch flags (idle pipeline).
+    assert_eq!(body["busy"], false);
+    assert_eq!(body["cancel_requested"], false);
+    assert_eq!(body["docs_processed"], 0);
+    assert!(body["last_run_at"].is_null());
+    // Streaming counters: present and zero with the flag off.
+    assert_eq!(body["active_count"], 0);
+    assert_eq!(body["channel_len"], 0);
+    assert_eq!(body["total_processed"], 0);
+    assert_eq!(body["streaming"], false);
+    // pending_count derives from counts (no documents yet).
+    assert_eq!(body["pending_count"], 0);
 }
 
 #[tokio::test]

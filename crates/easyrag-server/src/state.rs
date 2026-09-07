@@ -5,7 +5,8 @@ use std::sync::Arc;
 use easyrag_core::storage::tenant_config::TenantConfigStorage;
 use easyrag_core::storage::traits::{DocStatusStorage, GraphStorage, KVStorage, VectorStorage};
 use easyrag_pipeline::{
-    EasyRAG, IngestionPipeline, TextParserRegistry, QueryEngine, RAGAnything, StructureQueryStrategy,
+    EasyRAG, IngestionPipeline, PipelineService, QueryEngine, RAGAnything, StructureQueryStrategy,
+    TextParserRegistry,
 };
 
 use crate::auth::{JwtAuthProvider, LoginRateLimiter};
@@ -25,6 +26,11 @@ pub struct AppServices {
     ///
     pub structure_strategy: Option<Arc<StructureQueryStrategy>>,
     pub pipeline: Arc<IngestionPipeline>,
+    /// Streaming ingestion service (BC-11 gradual rollout). `Some` only when
+    /// `PIPELINE_STREAMING_ENABLED` is set; handlers then drive the persistent
+    /// discovery/processor loop instead of the one-shot batch run. `None` keeps
+    /// the exact pre-streaming behaviour.
+    pub pipeline_service: Option<Arc<PipelineService>>,
     pub vector_storage: Arc<dyn VectorStorage>,
     pub graph_storage: Arc<dyn GraphStorage>,
     pub kv_storage: Arc<dyn KVStorage>,

@@ -24,6 +24,7 @@ pub mod multimodal;
 pub mod parser;
 pub mod query;
 pub mod repository;
+pub mod streaming;
 pub mod structure;
 pub mod summarizer;
 
@@ -49,6 +50,7 @@ pub use extraction::{EntityExtractor, EntityExtractorConfig, ExtractionResult};
 pub use graph_cleanup::{cleanup_graph_by_chunks, GraphCleanupReport};
 pub use heading::{has_headings, parse_headings, HeadingInfo};
 pub use ingest::{InsertDocumentExtras, IngestionPipeline};
+pub use streaming::{DocTask, PipelineService};
 pub use multimodal::{
     BatchProcessingResult, BatchProcessor, ContentItem, DocumentProcessor,
     ModalProcessResult, ModalType, MultimodalQueryEngine, ParseResult, RAGAnything,

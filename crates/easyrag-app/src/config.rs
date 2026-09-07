@@ -164,6 +164,16 @@ pub fn build_config(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Serv
             .map_err(|e| anyhow::anyhow!("invalid JSON for AUTO_SCAN_TASKS: {e}"))?;
     }
 
+    // Streaming ingestion pipeline (BC-11 gradual rollout). Default-disabled:
+    // `PIPELINE_STREAMING_ENABLED=false` keeps the batch `run_pipeline` path
+    // behaving exactly as before. When enabled, `PipelineService` runs a
+    // persistent discovery→channel→processor loop; the poll interval is the
+    // adaptive-backoff floor and the channel capacity bounds the queue.
+    // Defaults mirror `ServerConfig::default()`.
+    config.pipeline_streaming_enabled = env_bool(get, "PIPELINE_STREAMING_ENABLED", false)?;
+    config.pipeline_poll_interval_ms = env_parse(get, "PIPELINE_POLL_INTERVAL_MS", 2000u64)?;
+    config.pipeline_channel_capacity = env_parse(get, "PIPELINE_CHANNEL_CAPACITY", 256usize)?;
+
     Ok(config)
 }
 
@@ -222,6 +232,10 @@ mod tests {
         assert_eq!(config.auto_scan_input_dir, "");
         assert_eq!(config.auto_scan_extensions, ".txt,.md,.pdf");
         assert_eq!(config.auto_scan_max_files_per_cycle, 100);
+        // Streaming pipeline defaults (BC-11 gradual rollout: disabled by default).
+        assert!(!config.pipeline_streaming_enabled);
+        assert_eq!(config.pipeline_poll_interval_ms, 2000);
+        assert_eq!(config.pipeline_channel_capacity, 256);
     }
 
     #[test]
@@ -291,6 +305,18 @@ mod tests {
         assert_eq!(config.auto_scan_input_dir, "/data/inbox");
         assert_eq!(config.auto_scan_extensions, ".txt,.pdf");
         assert_eq!(config.auto_scan_max_files_per_cycle, 25);
+    }
+
+    #[test]
+    fn config_reads_pipeline_streaming_env() {
+        let mut vars: HashMap<&str, String> = HashMap::new();
+        vars.insert("PIPELINE_STREAMING_ENABLED", "true".into());
+        vars.insert("PIPELINE_POLL_INTERVAL_MS", "500".into());
+        vars.insert("PIPELINE_CHANNEL_CAPACITY", "64".into());
+        let config = build_config(&getter(vars)).unwrap();
+        assert!(config.pipeline_streaming_enabled);
+        assert_eq!(config.pipeline_poll_interval_ms, 500);
+        assert_eq!(config.pipeline_channel_capacity, 64);
     }
 
     #[test]

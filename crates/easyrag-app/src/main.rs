@@ -27,7 +27,7 @@ use easyrag_core::storage::user::UserStorage;
 use easyrag_llm::openai::OpenAiClient;
 use easyrag_llm::rerank::RerankClient;
 use easyrag_pipeline::multimodal::{RagAnythingConfig, RAGAnything, TextQueryBackend};
-use easyrag_pipeline::{EasyRAGConfigBuilder, EasyRAG, TextParserRegistry};
+use easyrag_pipeline::{EasyRAGConfigBuilder, EasyRAG, PipelineService, TextParserRegistry};
 use easyrag_server::auth::{JwtAuthProvider, LoginRateLimiter};
 use easyrag_server::service::{DocumentLifecycleService, WorkspaceContext, WorkspaceResolver};
 use easyrag_server::state::AppServices;
@@ -254,12 +254,40 @@ async fn main() -> anyhow::Result<()> {
         bail!("seed default admin user: {e:?}");
     }
 
+    // --- Streaming ingestion service (BC-11 gradual rollout) ----------------
+    // Default-off: when PIPELINE_STREAMING_ENABLED is unset the batch
+    // `run_pipeline` path is used verbatim (`pipeline_service` stays None).
+    // When enabled, one persistent PipelineService drives the default
+    // workspace's discovery→channel→processor loop; `ensure_running()` starts
+    // it now so pending documents are picked up without waiting for a trigger.
+    // A single default-workspace instance is intentional (matches `spawn_pipeline`
+    // always using `state.pipeline`); per-workspace + LRU lifecycle is Phase 5.
+    let pipeline_service: Option<Arc<PipelineService>> = if config.pipeline_streaming_enabled {
+        let service = Arc::new(PipelineService::new(
+            pipeline.clone(),
+            storage.doc_status.clone(),
+            storage.kv.clone(),
+            "", // wildcard: discovery resolves each document's own biz line
+            config.pipeline_poll_interval_ms,
+            Some(config.pipeline_channel_capacity),
+        ));
+        service.ensure_running();
+        tracing::info!("Streaming ingestion pipeline enabled and started");
+        Some(service)
+    } else {
+        tracing::debug!(
+            "Streaming ingestion pipeline disabled (PIPELINE_STREAMING_ENABLED not set/false)"
+        );
+        None
+    };
+
     let services = Arc::new(AppServices {
         config: config.clone(),
         easy_rag,
         query_engine,
         structure_strategy,
         pipeline,
+        pipeline_service: pipeline_service.clone(),
         vector_storage: storage.vector.clone(),
         graph_storage: storage.graph.clone(),
         kv_storage: storage.kv.clone(),
@@ -336,7 +364,8 @@ async fn main() -> anyhow::Result<()> {
             storage.kv.clone(),
             Arc::clone(&scan_stats),
             stop_rx,
-        );
+        )
+        .with_streaming(config.pipeline_streaming_enabled);
         let handle = tokio::spawn(auto_scanner.run());
         tracing::info!("Auto scanner spawned with {task_count} task(s)");
         Some((stop_tx, handle))
@@ -371,6 +400,13 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => tracing::warn!(
             "Shutdown drain timeout exceeded; forcing exit (open SSE streams dropped)"
         ),
+    }
+
+    // Stop the streaming ingestion service AFTER HTTP is drained and BEFORE
+    // storage finalize: it awaits in-flight documents and forces a final index
+    // commit (invariant #7), so no write races `finalize_all`/`pg_db.close`.
+    if let Some(service) = &pipeline_service {
+        service.stop().await;
     }
 
     // close pools and release resources.

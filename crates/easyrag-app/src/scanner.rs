@@ -91,6 +91,13 @@ pub struct AutoScanner {
     kv: Arc<dyn KVStorage>,
     stats: Arc<AutoScanStats>,
     stop_rx: oneshot::Receiver<()>,
+    /// When true, the persistent streaming `PipelineService` (started at app
+    /// wiring) already discovers and processes pending documents with per-doc
+    /// claim, so the scanner must NOT trigger the batch `start()` path — it
+    /// does not claim per-document and would race the streaming processor. Set
+    /// via `with_streaming`; `new()` leaves it false so existing callers/tests
+    /// are byte-for-byte unchanged.
+    streaming_enabled: bool,
 }
 
 impl AutoScanner {
@@ -108,7 +115,16 @@ impl AutoScanner {
             kv,
             stats,
             stop_rx,
+            streaming_enabled: false,
         }
+    }
+
+    /// Opt into the streaming pipeline path (BC-11 gradual rollout). Builder
+    /// style so `new()`'s signature — and every existing caller/test — stays
+    /// unchanged; defaults to false (batch behaviour).
+    pub fn with_streaming(mut self, enabled: bool) -> Self {
+        self.streaming_enabled = enabled;
+        self
     }
 
     /// Stats handle for observability endpoints and tests.
@@ -205,6 +221,15 @@ impl AutoScanner {
     /// workspace-specific storage via resolve, trigger the pipeline only
     /// when pending documents exist (`start` is idempotent/re-entrancy-safe).
     async fn run_pending_poll(&self, task: &ScanTaskSpec) -> CycleResult {
+        // Streaming mode: the persistent PipelineService discovery loop
+        // (started at app wiring via `ensure_running`, guaranteed alive before
+        // the scanner is spawned) already polls Pending and processes documents
+        // with per-doc claim. Triggering the batch `start()` here would race it
+        // (run_pipeline does not claim per-document), so this cycle is a no-op —
+        // discovery is the single source of pending-document work.
+        if self.streaming_enabled {
+            return Ok((0, 0));
+        }
         let scope = self
             .workspace_resolver
             .resolve(Some(&task.workspace), Some(&task.biz_id))
@@ -291,12 +316,24 @@ impl AutoScanner {
         .await
         .map_err(|e| format!("scan directory '{dir}': {e}"))?;
         if !outcome.inserted_doc_ids.is_empty() {
-            tracing::info!(
-                "Auto scan task '{}' inserted {} document(s) from '{dir}'; starting pipeline",
-                task.task_id,
-                outcome.inserted_doc_ids.len()
-            );
-            scope.context.pipeline.start(&biz).await;
+            if self.streaming_enabled {
+                // Streaming mode: inserted documents are already Pending and the
+                // persistent discovery loop picks them up (with per-doc claim).
+                // Do NOT call the batch `start()` — it would race the streaming
+                // processor. Directory scan/dedup logic is unchanged.
+                tracing::info!(
+                    "Auto scan task '{}' inserted {} document(s) from '{dir}'; streaming discovery will pick them up",
+                    task.task_id,
+                    outcome.inserted_doc_ids.len()
+                );
+            } else {
+                tracing::info!(
+                    "Auto scan task '{}' inserted {} document(s) from '{dir}'; starting pipeline",
+                    task.task_id,
+                    outcome.inserted_doc_ids.len()
+                );
+                scope.context.pipeline.start(&biz).await;
+            }
         }
         Ok((outcome.files_seen, outcome.inserted_doc_ids.len()))
     }
