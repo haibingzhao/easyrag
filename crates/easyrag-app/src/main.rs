@@ -124,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
     // separately, and is now an explicit argument instead of a silent omission.
     let structure_strategy = Some(factory::build_structure_strategy(
         llm.clone(),
+        &config,
         Some(tool_calling_llm.clone()),
         storage.kv.clone(),
         storage.vector.clone(),
@@ -139,6 +140,22 @@ async fn main() -> anyhow::Result<()> {
         rerank.clone(),
         structure_strategy.clone(),
     );
+
+    // R8 gradual rollout: log the gate once at startup, exactly as the streaming
+    // ingestion gate below does, so an operator can tell "structure retrieval is
+    // off by config" from "it is on but found nothing" without reading a
+    // response body.
+    if config.query_data_structure_enabled {
+        tracing::info!(
+            "Structure retrieval on /api/query/data enabled (tree limits: depth={}, sections={})",
+            config.structure_tree_max_depth,
+            config.structure_tree_max_sections
+        );
+    } else {
+        tracing::debug!(
+            "Structure retrieval on /api/query/data disabled (QUERY_DATA_STRUCTURE_ENABLED not set/false)"
+        );
+    }
 
     // --- Ingestion pipeline (Phase 6.5 factory) ---------------------------
     let pipeline = factory::build_pipeline(

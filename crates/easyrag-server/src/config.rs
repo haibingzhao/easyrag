@@ -133,6 +133,16 @@ pub struct ServerConfig {
     pub pipeline_poll_interval_ms: u64,
     /// Bounded mpsc channel capacity between discovery and processor.
     pub pipeline_channel_capacity: usize,
+
+    // Structure retrieval on the pure-data endpoint (R8 gradual rollout).
+    // Default-off keeps `/api/query/data` byte-for-byte equivalent to the
+    // pre-R8 body; enabling it lets a request that asks for sections actually
+    // run the tree search and pay its LLM cost.
+    pub query_data_structure_enabled: bool,
+    /// `TreeSearchEngine` depth ceiling. Bounds the drill-down LLM calls.
+    pub structure_tree_max_depth: usize,
+    /// `TreeSearchEngine` per-level fan-out ceiling.
+    pub structure_tree_max_sections: usize,
 }
 
 impl ServerConfig {
@@ -296,6 +306,14 @@ impl Default for ServerConfig {
             pipeline_streaming_enabled: false,
             pipeline_poll_interval_ms: 2000,
             pipeline_channel_capacity: 256,
+
+            // Structure data-endpoint defaults (R8): gate off, and the tree
+            // search limits equal the values `TreeSearchEngine::new` has always
+            // hardcoded — so turning the gate on cannot silently widen the
+            // LLM budget.
+            query_data_structure_enabled: false,
+            structure_tree_max_depth: 3,
+            structure_tree_max_sections: 3,
         }
     }
 }
@@ -351,6 +369,11 @@ mod tests {
         assert!(!c.pipeline_streaming_enabled);
         assert_eq!(c.pipeline_poll_interval_ms, 2000);
         assert_eq!(c.pipeline_channel_capacity, 256);
+        // Structure data-endpoint defaults (R8 gradual rollout: disabled, and
+        // tree-search limits unchanged from the hardcoded 3/3).
+        assert!(!c.query_data_structure_enabled);
+        assert_eq!(c.structure_tree_max_depth, 3);
+        assert_eq!(c.structure_tree_max_sections, 3);
     }
 
     fn empty_tenant(workspace: &str) -> TenantConfig {

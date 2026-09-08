@@ -104,6 +104,15 @@ pub struct QueryParam {
     pub metadata_filters: Option<std::collections::HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structure_scope: Option<String>,
+    /// Return raw structure-index hits alongside the chunk/entity payload (R8).
+    ///
+    /// `None` means "follow the mode": on for `structure`, off everywhere else.
+    /// The override exists so a caller can ask for sections without giving up
+    /// hybrid recall (`mode=mix` + `includeSections=true`), and so a scoped
+    /// `mix` query does not silently pay the tree-search LLM cost it never asked
+    /// for. Only the pure-data endpoint reads this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_sections: Option<bool>,
     /// Business-line filter; normalized to `DEFAULT_BIZ_ID` at the REST
     /// boundary when omitted.
     #[serde(default = "default_biz_id")]
@@ -175,6 +184,7 @@ impl Default for QueryParam {
             use_agent_mode: false,
             metadata_filters: None,
             structure_scope: None,
+            include_sections: None,
             biz_id: default_biz_id(),
             enable_verification: None,
             enable_citation_validation: None,

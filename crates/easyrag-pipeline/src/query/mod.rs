@@ -12,9 +12,11 @@
 //! - [`evidence_scorer`]: CRAG-style evidence quality scoring (Feature 2)
 //! - [`router`]: query routing and decomposition (Feature 6)
 //! - [`verifier`]: claim verification gate (Feature 1)
+//! - [`degrade`]: stable degradation markers reported by the pure-data path
 
 pub mod agent;
 pub mod citation_check;
+pub mod degrade;
 pub mod engine;
 pub mod evidence_scorer;
 pub mod router;
@@ -29,6 +31,8 @@ pub use engine::{
 };
 pub use evidence_scorer::EvidenceScorer;
 pub use router::QueryRouter;
-pub use structure::{StructureQueryResult, StructureQueryStrategy};
+pub use structure::{
+    SectionHit, StructureQueryResult, StructureQueryStrategy, StructureSectionsResult,
+};
 pub use tree_search::{ReasoningStep, TreeSearchEngine, TreeSearchResult};
 pub use verifier::ClaimVerifier;

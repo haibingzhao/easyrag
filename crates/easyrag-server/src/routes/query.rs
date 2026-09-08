@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use easyrag_core::model::query_param::{QueryMode, QueryParam};
+use easyrag_pipeline::query::ReasoningStep;
 
 use crate::error::{AppError, AppResult};
 use crate::state::{AppServices, AppState};
@@ -73,6 +74,10 @@ pub struct QueryRequest {
     // M5: file path prefix scoping cross-document structure queries
     #[serde(default)]
     pub structure_scope: Option<String>,
+    // R8: return raw structure hits from /api/query/data. Absent means "follow
+    // the mode" — on for `structure`, off elsewhere.
+    #[serde(default)]
+    pub include_sections: Option<bool>,
     // R2: request-level workspace routing (optional)
     #[serde(default)]
     pub workspace: Option<String>,
@@ -117,6 +122,7 @@ fn build_query_param(request: &QueryRequest, biz_id: &str) -> QueryParam {
     param.use_agent_mode = request.use_agent_mode.unwrap_or(false);
     param.metadata_filters = request.metadata_filters.clone();
     param.structure_scope = request.structure_scope.clone();
+    param.include_sections = request.include_sections;
     // Anti-hallucination guardrail per-request overrides
     param.enable_verification = request.enable_verification;
     param.enable_citation_validation = request.enable_citation_validation;
@@ -140,6 +146,26 @@ fn parse_query_mode(mode: Option<&str>) -> QueryMode {
         },
         None => QueryMode::Hybrid,
     }
+}
+
+/// Project a tree-search reasoning chain onto its wire shape.
+///
+/// Shared by `/api/query/structure` and the `reasoningChain` key of
+/// `/api/query/data` (R8) so the two cannot drift: a step that gained a field on
+/// one endpoint would otherwise silently stay missing on the other.
+fn reasoning_chain_json(chain: &[ReasoningStep]) -> Vec<Value> {
+    chain
+        .iter()
+        .map(|s| {
+            json!({
+                "level": s.level,
+                "thinking": s.thinking,
+                "considered": s.sections_considered,
+                "selected": s.sections_selected,
+                "confidence": s.confidence,
+            })
+        })
+        .collect()
 }
 
 async fn query(state: AppState, Json(request): Json<QueryRequest>) -> AppResult<Json<Value>> {
@@ -186,10 +212,19 @@ async fn query_data(
     let engine = resolved.context.query_engine;
     let param = build_query_param(&request, &resolved.biz_id);
     let result = engine.query_data(&request.query, &param).await?;
+    // The last four keys are the R8 additions; see
+    // `.docs/easyrag-data-endpoint-mode-matrix.md` for the mode matrix and the
+    // degradation-marker enumeration. `sections` and `reasoningChain` are empty
+    // — not absent — whenever structure retrieval did not run, so a client can
+    // read them unconditionally.
     Ok(Json(json!({
         "entities": result.entities,
         "relations": result.relations,
         "chunks": result.chunks,
+        "sections": result.sections,
+        "reasoningChain": reasoning_chain_json(&result.reasoning_chain),
+        "degraded": result.degraded,
+        "degradeReasons": result.degrade_reasons,
     })))
 }
 
@@ -230,19 +265,7 @@ async fn structure_query(
         })?;
     let param = build_query_param(&request, &resolved.biz_id);
     let result = strategy.query(&request.query, &param).await?;
-    let reasoning_chain: Vec<Value> = result
-        .reasoning_chain
-        .iter()
-        .map(|s| {
-            json!({
-                "level": s.level,
-                "thinking": s.thinking,
-                "considered": s.sections_considered,
-                "selected": s.sections_selected,
-                "confidence": s.confidence,
-            })
-        })
-        .collect();
+    let reasoning_chain = reasoning_chain_json(&result.reasoning_chain);
     Ok(Json(json!({
         "answer": result.answer,
         "reasoning_chain": reasoning_chain,

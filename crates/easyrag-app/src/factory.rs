@@ -105,8 +105,13 @@ pub fn build_pipeline(
 /// `tool_calling_llm` is `Some` on the default path and mirrors the resolver's
 /// own `Option` on the per-workspace path: when it is `None` the agent
 /// strategy is omitted exactly as `build_context` does today.
+///
+/// `config` supplies the two tree-search ceilings (R8 budget control). Their
+/// defaults equal the values `TreeSearchEngine::new` hardcoded, so this is a
+/// no-op for an operator who sets nothing.
 pub fn build_structure_strategy(
     llm: Arc<dyn LlmService>,
+    config: &ServerConfig,
     tool_calling_llm: Option<Arc<dyn ToolCallingLlmService>>,
     kv: Arc<dyn KVStorage>,
     vector: Arc<dyn VectorStorage>,
@@ -120,7 +125,11 @@ pub fn build_structure_strategy(
     });
     Arc::new(
         StructureQueryStrategy::new(
-            TreeSearchEngine::new(llm.clone()),
+            TreeSearchEngine::with_limits(
+                llm.clone(),
+                config.structure_tree_max_depth,
+                config.structure_tree_max_sections,
+            ),
             agent_strategy,
             kv,
             vector,
@@ -148,7 +157,8 @@ pub fn build_query_engine(
 ) -> Arc<QueryEngine> {
     let mut engine = QueryEngine::new(llm, vector, graph, kv)
         .with_language(config.language.clone())
-        .with_rrf_k(config.hybrid_rrf_k);
+        .with_rrf_k(config.hybrid_rrf_k)
+        .with_data_structure(config.query_data_structure_enabled);
     if let Some(keyword) = keyword {
         engine = engine.with_keyword_search(keyword);
     }

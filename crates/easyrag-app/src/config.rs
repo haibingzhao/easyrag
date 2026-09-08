@@ -174,6 +174,18 @@ pub fn build_config(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Serv
     config.pipeline_poll_interval_ms = env_parse(get, "PIPELINE_POLL_INTERVAL_MS", 2000u64)?;
     config.pipeline_channel_capacity = env_parse(get, "PIPELINE_CHANNEL_CAPACITY", 256usize)?;
 
+    // Structure retrieval on the pure-data endpoint (R8 gradual rollout).
+    // Default-disabled: `QUERY_DATA_STRUCTURE_ENABLED=false` leaves
+    // `/api/query/data` returning exactly its pre-R8 body, and a request that
+    // asks for sections is told so via `structure_disabled_by_config`. The two
+    // tree-search ceilings default to the values `TreeSearchEngine::new` has
+    // always hardcoded (3/3), so enabling the gate cannot silently widen the
+    // per-request LLM budget; lowering them is how an operator compresses it.
+    // Defaults mirror `ServerConfig::default()`.
+    config.query_data_structure_enabled = env_bool(get, "QUERY_DATA_STRUCTURE_ENABLED", false)?;
+    config.structure_tree_max_depth = env_parse(get, "STRUCTURE_TREE_MAX_DEPTH", 3usize)?;
+    config.structure_tree_max_sections = env_parse(get, "STRUCTURE_TREE_MAX_SECTIONS", 3usize)?;
+
     Ok(config)
 }
 
@@ -317,6 +329,29 @@ mod tests {
         assert!(config.pipeline_streaming_enabled);
         assert_eq!(config.pipeline_poll_interval_ms, 500);
         assert_eq!(config.pipeline_channel_capacity, 64);
+    }
+
+    #[test]
+    fn config_reads_query_data_structure_env() {
+        let mut vars: HashMap<&str, String> = HashMap::new();
+        vars.insert("QUERY_DATA_STRUCTURE_ENABLED", "true".into());
+        vars.insert("STRUCTURE_TREE_MAX_DEPTH", "2".into());
+        vars.insert("STRUCTURE_TREE_MAX_SECTIONS", "4".into());
+        let config = build_config(&getter(vars)).unwrap();
+        assert!(config.query_data_structure_enabled);
+        assert_eq!(config.structure_tree_max_depth, 2);
+        assert_eq!(config.structure_tree_max_sections, 4);
+    }
+
+    #[test]
+    fn config_defaults_query_data_structure_off_with_unchanged_tree_limits() {
+        // R8 rollout guard: an operator who sets nothing gets no structure
+        // retrieval, and the tree-search ceilings stay at the historical 3/3.
+        let empty: HashMap<&str, String> = HashMap::new();
+        let config = build_config(&getter(empty)).unwrap();
+        assert!(!config.query_data_structure_enabled);
+        assert_eq!(config.structure_tree_max_depth, 3);
+        assert_eq!(config.structure_tree_max_sections, 3);
     }
 
     #[test]

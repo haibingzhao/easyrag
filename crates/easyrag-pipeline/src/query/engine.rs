@@ -1,6 +1,7 @@
 //! Query engine — unified entry point for all query modes
 
-use super::structure::StructureQueryStrategy;
+use super::structure::{SectionHit, StructureQueryStrategy};
+use super::tree_search::ReasoningStep;
 use super::{ClaimVerifier, EvidenceScorer, QueryRouter};
 use easyrag_core::llm::service::{
     ChatMessage, LlmRequest, LlmService, MessageRole, RerankService, ResponseFormat,
@@ -35,11 +36,30 @@ pub struct KeywordsResult {
 
 /// Pure data retrieval result (no LLM generation).
 /// Returned by the /query/data endpoint.
+///
+/// The last four fields are the R8 additions: raw structure-index hits plus
+/// explicit degradation signalling. They stay empty on every request that did
+/// not ask for structure retrieval, so a structure-disabled deployment returns
+/// exactly the pre-R8 body plus three inert keys.
 #[derive(Clone, Debug, Default)]
 pub struct QueryDataResult {
     pub entities: Vec<JsonMap>,
     pub relations: Vec<JsonMap>,
     pub chunks: Vec<JsonMap>,
+    /// Raw structure hits (R8), camelCase-keyed to match the request DTO.
+    /// Unlike `chunks` — whose keys are snake_case for historical reasons and
+    /// stay that way — this field is new, so it follows the wire convention the
+    /// caller already sees on the way in.
+    pub sections: Vec<JsonMap>,
+    /// Tree-search reasoning steps behind `sections`; empty when structure
+    /// retrieval did not run or took the zero-LLM small-document path.
+    pub reasoning_chain: Vec<ReasoningStep>,
+    /// Mirror of `!degrade_reasons.is_empty()`, so a client that only cares
+    /// whether the answer is complete does not have to inspect the list.
+    pub degraded: bool,
+    /// Stable machine-readable degradation markers. Enumerated in
+    /// `.docs/easyrag-data-endpoint-mode-matrix.md`.
+    pub degrade_reasons: Vec<String>,
 }
 
 /// A single reference/citation in query results.
@@ -127,20 +147,28 @@ pub struct QueryEngine {
     evidence_scorer: Option<Arc<EvidenceScorer>>,
     query_router: Option<Arc<QueryRouter>>,
     enable_citation_validation: bool,
+    /// R8 gradual-rollout gate (`QUERY_DATA_STRUCTURE_ENABLED`). `false` keeps
+    /// `query_data` on its pre-R8 behaviour: no structure retrieval, and
+    /// `structure_disabled_by_config` is reported when a caller asks for it.
+    enable_data_structure: bool,
 }
 
 /// Recall strategy for a chunk retrieval.
 ///
 /// The two variants are not interchangeable: `Hybrid` fuses keyword hits in via
 /// RRF, so it can return chunks `Vector` never would. Which paths use which is
-/// pre-existing and stays that way.
+/// pre-existing and stays that way — with one R9 exception: the pure-data path
+/// no longer hardcodes `Vector` but takes it from [`data_plan`], so `hybrid` and
+/// `mix` requests recall the same way the synchronous answer paths always did.
+/// `naive` deliberately stays on `Vector`: that is the compatibility promise the
+/// data endpoint's existing callers rely on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Recall {
-    /// `vector_storage.query` alone — the reference-list, pure-data and both
-    /// streaming-prompt paths.
+    /// `vector_storage.query` alone — the reference list, both streaming-prompt
+    /// paths, and whichever pure-data modes [`data_plan`] maps here.
     Vector,
     /// `hybrid_chunk_query`: vector + keyword fused by RRF — the two synchronous
-    /// answer paths.
+    /// answer paths, plus the pure-data `hybrid`/`mix` modes.
     Hybrid,
 }
 
@@ -224,6 +252,7 @@ impl QueryEngine {
             evidence_scorer: None,
             query_router: None,
             enable_citation_validation: false,
+            enable_data_structure: false,
         }
     }
 
@@ -283,6 +312,16 @@ impl QueryEngine {
     /// Enable citation validity checking (Feature 3).
     pub fn with_citation_validation(mut self, enable: bool) -> Self {
         self.enable_citation_validation = enable;
+        self
+    }
+
+    /// Enable raw structure retrieval on the pure-data path (R8).
+    ///
+    /// Off by default so the endpoint's behaviour — and its LLM bill — is
+    /// unchanged until an operator opts in, mirroring the streaming-ingestion
+    /// rollout gate.
+    pub fn with_data_structure(mut self, enable: bool) -> Self {
+        self.enable_data_structure = enable;
         self
     }
 
@@ -400,31 +439,99 @@ impl QueryEngine {
     }
 
     /// Pure data retrieval without LLM generation.
+    ///
+    /// What each `mode` does here is decided in exactly one place —
+    /// [`data_plan`] — and every branch below reads a field off it rather than
+    /// re-matching on the mode. The caller-facing matrix, the `sections[]`
+    /// field dictionary and the degradation-marker enumeration live in
+    /// `.docs/easyrag-data-endpoint-mode-matrix.md`; they are deliberately not
+    /// restated here, because a second copy would drift.
+    ///
+    /// Structure retrieval (R8) returns the raw hits and never synthesises an
+    /// answer: the caller is an Agent tool, and an LLM retelling would cost an
+    /// extra round trip while destroying the provenance the Agent needs.
     pub async fn query_data(
         &self,
         query: &str,
         param: &QueryParam,
     ) -> easyrag_core::Result<QueryDataResult> {
-        let chunks = self
-            .retrieve_chunks(query, param, Recall::Vector, TopKField::ChunkTopK)
+        let plan = data_plan(param.mode);
+        let mut degrade_reasons: Vec<String> = Vec::new();
+
+        // R9 signalling. `hybrid_chunk_query` has always fallen back to
+        // vector-only when no keyword index is configured; only the reporting is
+        // new. It fires solely when *this* request asked for fusion — tagging
+        // every naive call would train clients to ignore the marker.
+        if plan.recall == Recall::Hybrid && self.keyword_search.is_none() {
+            degrade_reasons.push(super::degrade::KEYWORD_SEARCH_UNAVAILABLE.to_string());
+        }
+
+        let mut chunks = self
+            .retrieve_chunks(query, param, plan.recall, TopKField::ChunkTopK)
             .await?;
 
         let mut entities: Vec<JsonMap> = Vec::new();
         let mut relations: Vec<JsonMap> = Vec::new();
 
-        if !matches!(param.mode, QueryMode::Naive) {
-            let keywords = self.extract_keywords(query, &self.language.clone(), None).await?;
+        if plan.run_kg {
+            // R10: hand `param` over so caller-supplied hl/ll keywords
+            // short-circuit the extraction call, exactly as `kg_query` does.
+            let keywords = self
+                .extract_keywords(query, &self.language.clone(), Some(param))
+                .await?;
             let search_terms: Vec<String> = keywords
                 .high_level
                 .iter()
                 .chain(keywords.low_level.iter())
                 .cloned()
                 .collect();
-            let (found_entities, found_relations) =
-                self.search_entities_and_relations(&search_terms, param, false)
+            let (found_entities, found_relations) = self
+                .search_entities_and_relations(&search_terms, param)
+                .await?;
+
+            // R9 `mix`: fold in the chunks reachable from the entities just hit.
+            // Appended before the projection below so they carry the same
+            // `reference_id` / `score` / `metadata` shape as the recalled ones.
+            //
+            // Deliberate deviation, matching this endpoint's long-standing
+            // contract: vector hits are all entity/chunk rows (ingest never
+            // writes `rel-` rows to the vector store), so `relations` stays
+            // empty. Those rows carry `source_id` too, so letting them
+            // drive the backfill is correct, not merely tolerated.
+            if plan.backfill_entity_chunks {
+                let related = self
+                    .entity_related_chunks(&found_entities, &chunks, param)
                     .await?;
+                chunks.extend(related);
+            }
+
             entities.extend(found_entities);
             relations.extend(found_relations);
+        }
+
+        // R8: raw structure hits, opt-in per request and gated per deployment.
+        let mut sections: Vec<JsonMap> = Vec::new();
+        let mut reasoning_chain: Vec<ReasoningStep> = Vec::new();
+        if wants_sections(param) {
+            match &self.structure_strategy {
+                Some(strategy) if self.enable_data_structure => {
+                    let found = strategy.search_sections(query, param).await?;
+                    reasoning_chain = found.reasoning_chain;
+                    degrade_reasons.extend(found.degrade_reasons);
+                    sections = found
+                        .sections
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, hit)| section_json(hit, rank))
+                        .collect();
+                }
+                Some(_) => {
+                    degrade_reasons.push(super::degrade::STRUCTURE_DISABLED.to_string());
+                }
+                None => {
+                    degrade_reasons.push(super::degrade::STRUCTURE_UNAVAILABLE.to_string());
+                }
+            }
         }
 
         Ok(QueryDataResult {
@@ -525,6 +632,10 @@ impl QueryEngine {
                     m
                 })
                 .collect(),
+            sections,
+            reasoning_chain,
+            degraded: !degrade_reasons.is_empty(),
+            degrade_reasons,
         })
     }
 
@@ -638,15 +749,14 @@ impl QueryEngine {
 
         // Three deliberate deviations from the synchronous `kg_query`, all
         // long-standing: extraction runs WITHOUT `param`, so manual hl/ll
-        // keywords are ignored; `separate_relations` is false, so relationships
-        // land in `entities`; and there is no entity-related-chunk pass (4b),
+        // keywords are ignored; and there is no entity-related-chunk pass (4b),
         // no evidence gate and no conversation history.
         let language = self.language.clone();
         let keywords = self.extract_keywords(query, &language, None).await?;
 
         let search_terms = resolve_search_terms(&keywords, mode);
         let (entities, relations) = self
-            .search_entities_and_relations(&search_terms, param, false)
+            .search_entities_and_relations(&search_terms, param)
             .await?;
 
         let chunks = self
@@ -668,13 +778,10 @@ impl QueryEngine {
     }
 
     /// Search entities by terms and collect their connected graph edges.
-    /// When `separate_relations` is true, relationship results are added
-    /// to relations instead of entities.
     async fn search_entities_and_relations(
         &self,
         search_terms: &[String],
         param: &QueryParam,
-        separate_relations: bool,
     ) -> easyrag_core::Result<(Vec<JsonMap>, Vec<JsonMap>)> {
         let mut entities: Vec<JsonMap> = Vec::new();
         let mut relations: Vec<JsonMap> = Vec::new();
@@ -692,18 +799,9 @@ impl QueryEngine {
                     &param.biz_id,
                 )
                 .await?;
-            if separate_relations {
-                for result in results {
-                    let entity_type = result.get("entity_type").and_then(|v| v.as_str());
-                    if entity_type == Some("relationship") {
-                        relations.push(result);
-                    } else {
-                        entities.push(result);
-                    }
-                }
-            } else {
-                entities.extend(results);
-            }
+            // Ingest never writes `rel-` rows to the vector store, so every
+            // hit here is an entity/chunk row; there is nothing to separate.
+            entities.extend(results);
         }
 
         // Collect related edges from graph using batch operations
@@ -1110,6 +1208,72 @@ impl QueryEngine {
         Ok(response)
     }
 
+    /// Chunks reachable from a set of KG entities via their `source_id` lists.
+    ///
+    /// Returns **only** the chunks not already in `already_recalled`, each
+    /// tagged `"source": "entity_related"` so downstream prompt building can
+    /// tell them apart from directly recalled ones. Extracted verbatim from
+    /// `kg_query` step 4b so the `mix` data path (R9) and the KG answer path
+    /// share one implementation instead of drifting copies.
+    ///
+    /// Dedup happens on two levels: source ids that match a recalled row's
+    /// `id` are dropped *before* the KV query (recall rows carry the record
+    /// key, and ingest keys KV/vector rows with the same
+    /// `compute_mdhash_id(content, "chunk-")` value that entity `source_id`
+    /// points at — one identifier, all stores), and the surviving rows are
+    /// compared by content after the fetch, as this backfill always has.
+    ///
+    /// The two `take` caps are pre-existing budget guards, not tuning knobs:
+    /// 10 entities keep the id fan-out bounded, and 20 chunk ids keep the KV
+    /// `IN` query off the deep end on long documents.
+    async fn entity_related_chunks(
+        &self,
+        entities: &[JsonMap],
+        already_recalled: &[JsonMap],
+        param: &QueryParam,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        // `parse_source_ids` owns the split rule (array, or legacy `<SEP>`/`,`
+        // joined string); the old inline `split("<SEP>")` literal was a fourth
+        // copy of that rule and a drift source.
+        let recalled_ids: HashSet<&str> = already_recalled
+            .iter()
+            .filter_map(|c| c.get("id").and_then(|v| v.as_str()))
+            .collect();
+
+        let mut entity_chunk_ids: Vec<String> = Vec::new();
+        let mut seen_chunk_ids: HashSet<String> = HashSet::new();
+        for entity in entities.iter().take(10) {
+            for id in parse_source_ids(entity.get("source_id")) {
+                if !seen_chunk_ids.insert(id.clone()) || recalled_ids.contains(id.as_str()) {
+                    continue;
+                }
+                entity_chunk_ids.push(id);
+            }
+        }
+        if entity_chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<String> = entity_chunk_ids.into_iter().take(20).collect();
+        let mut extra: Vec<JsonMap> = Vec::new();
+        for chunk_data in self.kv_storage.get_by_ids(&ids, &param.biz_id).await? {
+            let Some(content) = chunk_data.get("content").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let duplicate = already_recalled
+                .iter()
+                .chain(extra.iter())
+                .any(|c| c.get("content").and_then(|v| v.as_str()) == Some(content));
+            if duplicate {
+                continue;
+            }
+            let mut with_source = chunk_data;
+            with_source.insert("source".into(), JsonValue::String("entity_related".into()));
+            extra.push(with_source);
+        }
+        Ok(extra)
+    }
+
     /// Knowledge graph query - uses entities and relationships from the graph.
     async fn kg_query(
         &self,
@@ -1130,7 +1294,7 @@ impl QueryEngine {
         // 2. Retrieve entities and relationships based on mode.
         let search_terms = resolve_search_terms(&keywords, mode);
         let (entities, relations) = self
-            .search_entities_and_relations(&search_terms, param, true)
+            .search_entities_and_relations(&search_terms, param)
             .await?;
 
         // 4. Retrieve text chunks (hybrid search + entity-related chunks).
@@ -1139,36 +1303,10 @@ impl QueryEngine {
             .await?;
 
         // 4b. Collect entity-related chunks via source_ids.
-        // `parse_source_ids` owns the split rule (array, or legacy `<SEP>`/`,`
-        // joined string); the old inline `split("<SEP>")` literal was a fourth
-        // copy of that rule and a drift source.
-        let mut entity_chunk_ids: Vec<String> = Vec::new();
-        let mut seen_chunk_ids: HashSet<String> = HashSet::new();
-        for entity in entities.iter().take(10) {
-            for id in parse_source_ids(entity.get("source_id")) {
-                if seen_chunk_ids.insert(id.clone()) {
-                    entity_chunk_ids.push(id);
-                }
-            }
-        }
-        if !entity_chunk_ids.is_empty() {
-            let ids: Vec<String> = entity_chunk_ids.into_iter().take(20).collect();
-            let related_chunks = self.kv_storage.get_by_ids(&ids, &param.biz_id).await?;
-            for chunk_data in related_chunks {
-                let Some(content) = chunk_data.get("content").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                if !chunks
-                    .iter()
-                    .any(|c| c.get("content").and_then(|v| v.as_str()) == Some(content))
-                {
-                    let mut with_source = chunk_data;
-                    with_source
-                        .insert("source".into(), JsonValue::String("entity_related".into()));
-                    chunks.push(with_source);
-                }
-            }
-        }
+        let related = self
+            .entity_related_chunks(&entities, &chunks, param)
+            .await?;
+        chunks.extend(related);
 
         // 5. Apply reranking if enabled and available — ranks the recall and
         // the entity-related chunks appended in 4b as one set.
@@ -1579,6 +1717,126 @@ fn compute_query_cache_key(query: &str, param: &QueryParam) -> String {
         param.enable_query_routing.map(|b| b.to_string()).as_deref().unwrap_or("null"),
     );
     compute_args_hash([raw])
+}
+
+/// What the pure-data path does for a given [`QueryMode`] (R8/R9).
+///
+/// This struct is the single source of truth for the `/api/query/data`
+/// behaviour matrix — every branch of `query_data` reads a field off it rather
+/// than re-matching on the mode, so the matrix cannot disagree with itself.
+/// Mirrored in `.docs/easyrag-data-endpoint-mode-matrix.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DataPlan {
+    /// Chunk recall strategy.
+    recall: Recall,
+    /// Whether to run the KG entity/relationship pass at all.
+    run_kg: bool,
+    /// Whether to additionally fold in the chunks those entities point at.
+    backfill_entity_chunks: bool,
+}
+
+/// Resolve a mode into the data path's behaviour (see [`DataPlan`]).
+///
+/// Three of the seven rows are byte-for-byte what `query_data` did before R9:
+/// `naive` stays `Vector` (the compatibility promise its existing callers rely
+/// on), and `local`/`global`/`bypass` stay vector-recall + KG pass. The R9
+/// change is confined to `hybrid` and `mix`, which now recall the same way the
+/// synchronous answer paths always did; the R8 change is that `structure`
+/// skips the KG pass, which is the mode's whole point.
+///
+/// `bypass` keeping `run_kg: true` is a pre-existing oddity (it means "echo the
+/// query" on the answer path but still retrieves on the data path). It is left
+/// alone deliberately — fixing it here would smuggle an unrelated behaviour
+/// change into R9.
+fn data_plan(mode: QueryMode) -> DataPlan {
+    match mode {
+        QueryMode::Naive => DataPlan {
+            recall: Recall::Vector,
+            run_kg: false,
+            backfill_entity_chunks: false,
+        },
+        QueryMode::Hybrid => DataPlan {
+            recall: Recall::Hybrid,
+            run_kg: true,
+            backfill_entity_chunks: false,
+        },
+        QueryMode::Mix => DataPlan {
+            recall: Recall::Hybrid,
+            run_kg: true,
+            backfill_entity_chunks: true,
+        },
+        QueryMode::Structure => DataPlan {
+            recall: Recall::Vector,
+            run_kg: false,
+            backfill_entity_chunks: false,
+        },
+        QueryMode::Local | QueryMode::Global | QueryMode::Bypass => DataPlan {
+            recall: Recall::Vector,
+            run_kg: true,
+            backfill_entity_chunks: false,
+        },
+    }
+}
+
+/// Whether this request asked for raw structure hits (R8).
+///
+/// `includeSections` is opt-in per request and defaults to
+/// "`mode == structure`". That default is what lets the two shapes the
+/// requirement asked for coexist: `mode=structure` retrieves structure, and
+/// `mode=mix` can still carry sections when the caller says so — without every
+/// scoped `mix` query silently paying the tree-search LLM bill.
+fn wants_sections(param: &QueryParam) -> bool {
+    param
+        .include_sections
+        .unwrap_or(matches!(param.mode, QueryMode::Structure))
+}
+
+/// Project one [`SectionHit`] onto the `sections[]` wire shape.
+///
+/// `score` is an **ordinal** score — `1.0 / (rank + 1)`, i.e. a value in
+/// `(0, 1]` derived purely from position — and not a similarity. There is no
+/// similarity to report: hits come from a persisted chunk join, and the
+/// tree-search confidence that could stand in for one is absent on the zero-LLM
+/// small-document path. `rank` is returned alongside it so a caller can order
+/// without having to invert the formula, and must never be threshold-compared
+/// against `chunks[].score`.
+fn section_json(hit: &SectionHit, rank: usize) -> JsonMap {
+    let mut m = JsonMap::new();
+    m.insert("docId".into(), JsonValue::String(hit.doc_id.clone()));
+    m.insert("filePath".into(), JsonValue::String(hit.file_path.clone()));
+    m.insert(
+        "sectionPath".into(),
+        JsonValue::String(hit.section_path.clone()),
+    );
+    m.insert("title".into(), JsonValue::String(hit.title.clone()));
+    m.insert("level".into(), JsonValue::from(hit.level as u64));
+    m.insert(
+        "summary".into(),
+        match &hit.summary {
+            Some(summary) => JsonValue::String(summary.clone()),
+            None => JsonValue::Null,
+        },
+    );
+    m.insert("content".into(), JsonValue::String(hit.content.clone()));
+    m.insert(
+        "contentTruncated".into(),
+        JsonValue::Bool(hit.content_truncated),
+    );
+    m.insert(
+        "chunkIds".into(),
+        JsonValue::Array(
+            hit.chunk_ids
+                .iter()
+                .map(|id| JsonValue::String(id.clone()))
+                .collect(),
+        ),
+    );
+    m.insert("rank".into(), JsonValue::from(rank as u64));
+    m.insert(
+        "score".into(),
+        JsonValue::from(1.0f64 / (rank as f64 + 1.0)),
+    );
+    m
 }
 
 /// R4: retrieval size is over-fetched 3x when metadata filters are active,

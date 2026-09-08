@@ -12,17 +12,22 @@ use easyrag_core::llm::service::{
     ChatMessage, LlmRequest, LlmService, LlmToolResponse, RerankResult, RerankService, ToolCall,
     ToolCallingLlmService, ToolDefinition,
 };
+use easyrag_core::model::doc_status::DocStatus;
 use easyrag_core::model::document_structure::{DocumentStructureIndex, SectionNode};
 use easyrag_core::model::query_param::{QueryParam, QueryMode};
 use easyrag_core::storage::keyword::KeywordSearchable;
-use easyrag_core::storage::traits::{GraphStorage, KVStorage, VectorStorage};
+use easyrag_core::storage::traits::{DocStatusStorage, GraphStorage, KVStorage, VectorStorage};
+use easyrag_core::util::hash::compute_mdhash_id;
 use easyrag_core::JsonMap;
+use easyrag_pipeline::query::degrade;
+use easyrag_pipeline::query::structure::{MAX_SECTION_CONTENT_CHARS, STRUCTURE_DATA_MAX_DOCS};
 use easyrag_pipeline::query::{
     ClaimVerifier, EvidenceScorer, QueryRouter, StructureAgentStrategy, StructureQueryStrategy,
     TreeSearchEngine,
 };
+use easyrag_pipeline::repository::DocChunkRepository;
 use easyrag_pipeline::QueryEngine;
-use easyrag_storage::memory::{InMemoryGraphStorage, InMemoryKVStorage};
+use easyrag_storage::memory::{InMemoryDocStatusStorage, InMemoryGraphStorage, InMemoryKVStorage};
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use serde_json::Value as JsonValue;
@@ -1577,7 +1582,7 @@ async fn only_the_answer_paths_fuse_keyword_hits() {
     assert_eq!(
         keyword.call_count(),
         1,
-        "query_data must not fuse keyword hits"
+        "the naive data path must not fuse keyword hits"
     );
 
     // Streaming naive prompt: vector recall only, like the sync data path.
@@ -1890,6 +1895,869 @@ async fn routing_requested_without_a_router_proceeds() {
         engine.query("What does Alice do?", &param).await.unwrap(),
         "the answer"
     );
+}
+
+// ---------------------------------------------------------------------
+// Pure-data endpoint: mode matrix (R9), manual keywords (R10), raw
+// structure hits (R8) and cross-document scope (R11)
+// ---------------------------------------------------------------------
+
+/// `leaf` with an explicit level, summary and children — the structure-index
+/// fixtures below need all four, `leaf` fixes them at level 1 / no summary.
+fn node(
+    title: &str,
+    level: usize,
+    summary: Option<&str>,
+    content_start: usize,
+    children: Vec<SectionNode>,
+) -> SectionNode {
+    SectionNode {
+        title: title.to_string(),
+        level,
+        summary: summary.map(|s| s.to_string()),
+        content_start,
+        content_end: content_start + 100,
+        children,
+    }
+}
+
+/// Store one chunk record under the content-hash id ingestion would have given
+/// it, so `DocChunkRepository` can reconstruct the same id on the way back.
+async fn seed_chunk(
+    kv: &InMemoryKVStorage,
+    content: &str,
+    doc_id: &str,
+    order: i64,
+    section_path: &[&str],
+) -> String {
+    let chunk_id = compute_mdhash_id(content, "chunk-");
+    let mut record = chunk_with_section_path(content, doc_id, section_path);
+    record.insert("chunk_order_index".into(), JsonValue::from(order));
+    let mut batch = HashMap::new();
+    batch.insert(chunk_id.clone(), record);
+    kv.upsert(batch, BIZ).await.unwrap();
+    chunk_id
+}
+
+/// Registry row for a processed document. `has_structure` and `chunks_list` are
+/// the two fields structure retrieval reads; the rest satisfy deserialization.
+async fn seed_registry_doc(
+    doc_status: &InMemoryDocStatusStorage,
+    doc_id: &str,
+    file_path: &str,
+    chunks_list: &[String],
+    has_structure: bool,
+) {
+    let mut row = JsonMap::new();
+    row.insert(
+        "content_summary".into(),
+        JsonValue::String("summary".to_string()),
+    );
+    row.insert("content_length".into(), JsonValue::from(10i64));
+    row.insert("file_path".into(), JsonValue::String(file_path.to_string()));
+    row.insert(
+        "status".into(),
+        JsonValue::String(DocStatus::Processed.value().to_string()),
+    );
+    row.insert(
+        "created_at".into(),
+        JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+    );
+    row.insert(
+        "updated_at".into(),
+        JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+    );
+    row.insert("has_structure".into(), JsonValue::Bool(has_structure));
+    row.insert(
+        "chunks_list".into(),
+        JsonValue::Array(
+            chunks_list
+                .iter()
+                .map(|c| JsonValue::String(c.clone()))
+                .collect(),
+        ),
+    );
+    let mut batch = HashMap::new();
+    batch.insert(doc_id.to_string(), row);
+    doc_status.upsert(batch, BIZ).await.unwrap();
+}
+
+/// Engine with a registry-backed structure strategy and the R8 gate open, so
+/// `query_data` can actually reach `search_sections`.
+fn structure_data_engine() -> (
+    Arc<QueryEngine>,
+    Arc<MockLlm>,
+    Arc<InMemoryKVStorage>,
+    Arc<InMemoryDocStatusStorage>,
+) {
+    let llm = Arc::new(MockLlm::new("SHOULD_NOT_APPEAR"));
+    let kv = Arc::new(InMemoryKVStorage::new("test", "test"));
+    let doc_status = Arc::new(InMemoryDocStatusStorage::new("status", "test"));
+    let strategy = StructureQueryStrategy::new(
+        TreeSearchEngine::new(llm.clone()),
+        None,
+        kv.clone(),
+        Arc::new(MockVectorStorage::new(Vec::new())),
+        llm.clone(),
+    )
+    .with_doc_status_storage(doc_status.clone());
+    let engine = Arc::new(
+        QueryEngine::new(
+            llm.clone(),
+            Arc::new(MockVectorStorage::new(Vec::new())),
+            Arc::new(InMemoryGraphStorage::new("test", "test")),
+            kv.clone(),
+        )
+        .with_structure_strategy(Arc::new(strategy))
+        .with_data_structure(true),
+    );
+    (engine, llm, kv, doc_status)
+}
+
+/// One section of `data.sections` as a string, for readable assertions.
+fn section_field(sections: &[JsonMap], index: usize, key: &str) -> Option<String> {
+    sections[index]
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// R9/R8: every mode's data-path behaviour, read off the two observable side
+/// effects — which recall budget the vector store was asked for, and whether
+/// the keyword store was consulted at all. This covers the private `data_plan`
+/// without an inline test module in `engine.rs`, which has never had one.
+#[tokio::test]
+async fn data_plan_truth_table() {
+    // (mode, vector top_k requests in order, keyword-store calls).
+    //
+    // `budgeted_param` sets top_k=3 / chunk_top_k=7 and one manual keyword, so
+    // a chunk recall reads 7 and a KG entity search reads 3 — a path reading the
+    // wrong budget cannot pass by coincidence.
+    let expectations: [(QueryMode, Vec<usize>, usize); 7] = [
+        // naive: vector-only recall, no KG pass. The compatibility promise.
+        (QueryMode::Naive, vec![7], 0),
+        // hybrid: fused recall (one vector + one keyword call), KG pass, no
+        // entity backfill.
+        (QueryMode::Hybrid, vec![7, 3], 1),
+        // mix: fused recall + KG pass + entity→chunk backfill (KV, not vector).
+        (QueryMode::Mix, vec![7, 3], 1),
+        // structure: vector-only recall and no KG pass — the mode is about the
+        // structure index, and paying for KG hits it discards was the R8 gap.
+        (QueryMode::Structure, vec![7], 0),
+        // Unchanged from before R9.
+        (QueryMode::Local, vec![7, 3], 0),
+        (QueryMode::Global, vec![7, 3], 0),
+        (QueryMode::Bypass, vec![7, 3], 0),
+    ];
+
+    for (mode, expected_top_k, expected_keyword_calls) in expectations {
+        let (engine, keyword) = fused_engine();
+        engine.query_data("q", &budgeted_param(mode)).await.unwrap();
+        assert_eq!(
+            keyword.call_count(),
+            expected_keyword_calls,
+            "mode {mode:?}: keyword-store calls"
+        );
+        // The vector store lives inside the engine, so read its budget back out
+        // through a second engine built the same way.
+        let (engine, vector) = recording_engine_with_keyword(keyword.clone());
+        engine.query_data("q", &budgeted_param(mode)).await.unwrap();
+        assert_eq!(
+            vector.top_k_requests(),
+            expected_top_k,
+            "mode {mode:?}: vector recall budgets"
+        );
+    }
+}
+
+/// `recording_engine` plus the keyword store, so the truth table can assert
+/// recall budgets on the hybrid modes too.
+fn recording_engine_with_keyword(
+    keyword: Arc<MockKeywordSearch>,
+) -> (Arc<QueryEngine>, Arc<MockVectorStorage>) {
+    let results: Vec<JsonMap> = (0..40)
+        .map(|i| identified_chunk(&format!("chunk {i}"), "doc1", &format!("id {i}")))
+        .collect();
+    let vector = Arc::new(MockVectorStorage::new(results));
+    let engine = Arc::new(
+        QueryEngine::new(
+            Arc::new(MockLlm::new("the answer")) as Arc<dyn LlmService>,
+            vector.clone() as Arc<dyn VectorStorage>,
+            Arc::new(InMemoryGraphStorage::new("test", "test")),
+            Arc::new(InMemoryKVStorage::new("test", "test")),
+        )
+        .with_keyword_search(keyword as Arc<dyn KeywordSearchable>),
+    );
+    (engine, vector)
+}
+
+/// R9: `hybrid` on the data endpoint fuses keyword hits, as the answer paths
+/// always have.
+#[tokio::test]
+async fn query_data_hybrid_mode_fuses_keyword_hits() {
+    let (engine, keyword) = fused_engine();
+    let data = engine
+        .query_data("q", &budgeted_param(QueryMode::Hybrid))
+        .await
+        .unwrap();
+    let contents: Vec<&str> = data
+        .chunks
+        .iter()
+        .filter_map(|c| c.get("content").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(contents, vec!["vector hit", "keyword-only hit"]);
+    assert_eq!(keyword.call_count(), 1);
+    assert!(
+        !data.degraded,
+        "a configured keyword store means no recall degradation: {:?}",
+        data.degrade_reasons
+    );
+}
+
+/// R9: `mix` on the data endpoint additionally folds in the chunks its KG
+/// entities point at, projected exactly like the recalled ones.
+#[tokio::test]
+async fn query_data_mix_mode_appends_entity_related_chunks() {
+    // The vector store answers every query with one entity-shaped hit that
+    // carries a `source_id`; the keyword store contributes a second hit; KV
+    // holds the chunk that `source_id` names.
+    let mut entity_hit = identified_chunk("vector hit", "docV", "chunkV");
+    entity_hit.insert("source_id".into(), JsonValue::String("chunkE".to_string()));
+    let keyword = Arc::new(MockKeywordSearch::new(vec![identified_chunk(
+        "keyword-only hit",
+        "docK",
+        "chunkK",
+    )]));
+    let kv = Arc::new(InMemoryKVStorage::new("test", "test"));
+    let mut related = chunk("entity-related body", "docE");
+    related.insert("chunk_order_index".into(), JsonValue::from(0i64));
+    let mut batch = HashMap::new();
+    batch.insert("chunkE".to_string(), related);
+    kv.upsert(batch, BIZ).await.unwrap();
+
+    let engine = Arc::new(
+        QueryEngine::new(
+            Arc::new(MockLlm::new("the answer")) as Arc<dyn LlmService>,
+            Arc::new(MockVectorStorage::new(vec![entity_hit])) as Arc<dyn VectorStorage>,
+            Arc::new(InMemoryGraphStorage::new("test", "test")),
+            kv.clone(),
+        )
+        .with_keyword_search(keyword.clone() as Arc<dyn KeywordSearchable>),
+    );
+
+    let data = engine
+        .query_data("q", &budgeted_param(QueryMode::Mix))
+        .await
+        .unwrap();
+    let contents: Vec<&str> = data
+        .chunks
+        .iter()
+        .filter_map(|c| c.get("content").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["vector hit", "keyword-only hit", "entity-related body"],
+        "mix must append the entity-related chunk after the fused recall"
+    );
+    // Appended *before* the projection, so it is numbered like any other hit
+    // and carries the same `score: null` a KV record has always produced.
+    let ids: Vec<i64> = data
+        .chunks
+        .iter()
+        .filter_map(|c| c.get("reference_id").and_then(|v| v.as_i64()))
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+    assert!(data.chunks[2].get("score").unwrap().is_null());
+    assert_eq!(data.entities.len(), 1);
+}
+
+/// R9 compatibility promise, pinned explicitly: `naive` stays vector-only no
+/// matter what else changes on this endpoint.
+#[tokio::test]
+async fn query_data_naive_mode_still_vector_only() {
+    let (engine, keyword) = fused_engine();
+    let data = engine
+        .query_data("q", &budgeted_param(QueryMode::Naive))
+        .await
+        .unwrap();
+    let contents: Vec<&str> = data
+        .chunks
+        .iter()
+        .filter_map(|c| c.get("content").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(contents, vec!["vector hit"]);
+    assert_eq!(
+        keyword.call_count(),
+        0,
+        "naive must never touch the keyword store"
+    );
+    assert!(data.entities.is_empty());
+    assert!(data.relations.is_empty());
+    assert!(data.sections.is_empty());
+    assert!(
+        !data.degraded,
+        "naive with no structure request is not degraded: {:?}",
+        data.degrade_reasons
+    );
+}
+
+/// R10 acceptance: a request carrying manual keywords makes **zero** LLM calls
+/// on the data path. (The requirement's own suggested wording — "entities and
+/// relations are identical with and without manual keywords" — only holds when
+/// the client's keywords happen to equal the LLM's, so the call count is the
+/// assertion that actually means something.)
+#[tokio::test]
+async fn query_data_with_manual_keywords_makes_zero_llm_calls() {
+    let llm = Arc::new(MockLlm::new("the answer"));
+    let engine = engine_with(llm.clone(), vec![chunk("data chunk", "doc1")]);
+
+    // `budgeted_param` already carries one manual high-level keyword.
+    engine
+        .query_data("q", &budgeted_param(QueryMode::Mix))
+        .await
+        .unwrap();
+    assert_eq!(
+        llm.call_count(),
+        0,
+        "manual keywords must short-circuit keyword extraction"
+    );
+
+    // Contrast: the same request without them pays exactly one extraction call.
+    let mut extracted = budgeted_param(QueryMode::Mix);
+    extracted.hl_keywords.clear();
+    extracted.ll_keywords.clear();
+    engine.query_data("q", &extracted).await.unwrap();
+    assert_eq!(llm.call_count(), 1);
+}
+
+/// R8: `mode=structure` returns the raw hits — path, level, summary, exact body,
+/// chunk ids, ordinal rank/score — and never synthesises an answer.
+#[tokio::test]
+async fn query_data_structure_mode_returns_raw_sections_without_llm_answer() {
+    let (engine, llm, kv, doc_status) = structure_data_engine();
+    let index = structure_index(vec![
+        node(
+            "Introduction",
+            1,
+            Some("What this document is about"),
+            0,
+            Vec::new(),
+        ),
+        node("Installation", 1, Some("How to install"), 100, Vec::new()),
+    ]);
+    seed_structure_index(&kv, "doc1", &index).await;
+    // Deliberately out of insertion order: `get_by_ids` is a hash lookup, so the
+    // join must sort by `chunk_order_index` rather than trust it.
+    let second = seed_chunk(&kv, "intro body two", "doc1", 1, &["Introduction"]).await;
+    let first = seed_chunk(&kv, "intro body one", "doc1", 0, &["Introduction"]).await;
+    seed_registry_doc(
+        &doc_status,
+        "doc1",
+        "docs/guide.md",
+        &[first.clone(), second.clone()],
+        true,
+    )
+    .await;
+
+    let mut param = QueryParam::default();
+    param.mode = QueryMode::Structure;
+    param.doc_id = Some("doc1".to_string());
+
+    let data = engine.query_data("q", &param).await.unwrap();
+
+    // Two top-level leaves ≤ 8 → the tree search takes its zero-LLM path, and
+    // no answer is synthesised on top of it.
+    assert_eq!(
+        llm.call_count(),
+        0,
+        "raw structure hits must cost no LLM call on a small document"
+    );
+    assert_eq!(data.sections.len(), 2);
+    assert_eq!(
+        section_field(&data.sections, 0, "sectionPath").as_deref(),
+        Some("Introduction")
+    );
+    assert_eq!(
+        section_field(&data.sections, 0, "docId").as_deref(),
+        Some("doc1")
+    );
+    assert_eq!(
+        section_field(&data.sections, 0, "filePath").as_deref(),
+        Some("docs/guide.md")
+    );
+    assert_eq!(
+        section_field(&data.sections, 0, "summary").as_deref(),
+        Some("What this document is about")
+    );
+    assert_eq!(
+        data.sections[0].get("level").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+    assert_eq!(
+        section_field(&data.sections, 0, "content").as_deref(),
+        Some("intro body one\n\nintro body two"),
+        "the body must follow chunk_order_index, not lookup order"
+    );
+    let chunk_ids: Vec<&str> = data.sections[0]
+        .get("chunkIds")
+        .and_then(|v| v.as_array())
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(chunk_ids, vec![first.as_str(), second.as_str()]);
+    // Ordinal score: rank 0 → 1.0, rank 1 → 0.5.
+    assert_eq!(
+        data.sections[0].get("rank").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+    assert_eq!(
+        data.sections[0].get("score").and_then(|v| v.as_f64()),
+        Some(1.0)
+    );
+    assert_eq!(
+        data.sections[1].get("rank").and_then(|v| v.as_i64()),
+        Some(1)
+    );
+    assert_eq!(
+        data.sections[1].get("score").and_then(|v| v.as_f64()),
+        Some(0.5)
+    );
+    assert!(!data.degraded, "{:?}", data.degrade_reasons);
+    // R8: the structure mode spends nothing on the KG pass.
+    assert!(data.entities.is_empty());
+    assert!(data.relations.is_empty());
+}
+
+/// R8/D1: prefix matching is mandatory, not an optimisation. The structure tree
+/// builder drops headings deeper than its max depth while the chunker does not,
+/// so a chunk can sit *below* the deepest indexed node — equality matching would
+/// return an empty body for exactly those documents.
+#[tokio::test]
+async fn section_content_uses_prefix_match_for_deep_headings() {
+    let (engine, _llm, kv, doc_status) = structure_data_engine();
+    // Index stops at depth 4 ("Deep"); the chunk carries a fifth-level path.
+    let index = structure_index(vec![node(
+        "A",
+        1,
+        None,
+        0,
+        vec![node(
+            "B",
+            2,
+            None,
+            10,
+            vec![node(
+                "C",
+                3,
+                None,
+                20,
+                vec![node("Deep", 4, None, 30, Vec::new())],
+            )],
+        )],
+    )]);
+    seed_structure_index(&kv, "doc1", &index).await;
+    let long_body = "x".repeat(MAX_SECTION_CONTENT_CHARS + 500);
+    let deep_id = seed_chunk(
+        &kv,
+        &long_body,
+        "doc1",
+        0,
+        &["A", "B", "C", "Deep", "Deeper"],
+    )
+    .await;
+    seed_registry_doc(&doc_status, "doc1", "docs/deep.md", &[deep_id], true).await;
+
+    let mut param = QueryParam::default();
+    param.mode = QueryMode::Structure;
+    param.doc_id = Some("doc1".to_string());
+    let data = engine.query_data("q", &param).await.unwrap();
+
+    assert_eq!(data.sections.len(), 1);
+    assert_eq!(
+        section_field(&data.sections, 0, "sectionPath").as_deref(),
+        Some("A > B > C > Deep")
+    );
+    let content = section_field(&data.sections, 0, "content").unwrap();
+    assert_eq!(
+        content.chars().count(),
+        MAX_SECTION_CONTENT_CHARS,
+        "the deep chunk's body must be found by prefix match, then capped"
+    );
+    assert_eq!(
+        data.sections[0]
+            .get("contentTruncated")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+}
+
+/// D1 dedupe: one chunk belongs to exactly one section, so no body is ever
+/// emitted twice.
+///
+/// The parent-and-child-both-selected form of this is unreachable —
+/// `TreeSearchEngine` always expands a non-leaf into its leaves before
+/// returning — so the reachable form is pinned instead: duplicate titles, which
+/// `section_paths` resolves first-wins, put two selected nodes on the *same*
+/// path. Longest-match-then-first-wins keeps the body on one of them.
+#[tokio::test]
+async fn section_bodies_are_never_duplicated_across_sections() {
+    let (engine, _llm, kv, doc_status) = structure_data_engine();
+    let index = structure_index(vec![
+        node("Intro", 1, None, 0, Vec::new()),
+        node("Details", 1, None, 100, Vec::new()),
+        node("Intro", 1, None, 200, Vec::new()),
+    ]);
+    seed_structure_index(&kv, "doc1", &index).await;
+    let id = seed_chunk(&kv, "shared body", "doc1", 0, &["Intro"]).await;
+    seed_registry_doc(&doc_status, "doc1", "docs/dup.md", &[id], true).await;
+
+    let mut param = QueryParam::default();
+    param.mode = QueryMode::Structure;
+    param.doc_id = Some("doc1".to_string());
+    let data = engine.query_data("q", &param).await.unwrap();
+
+    assert_eq!(
+        data.sections.len(),
+        3,
+        "the small-document path selects all"
+    );
+    let bodies: Vec<String> = data
+        .sections
+        .iter()
+        .map(|s| section_field(&[s.clone()], 0, "content").unwrap_or_default())
+        .collect();
+    assert_eq!(
+        bodies.iter().filter(|b| *b == "shared body").count(),
+        1,
+        "a chunk body must be reported once, not once per matching section: {bodies:?}"
+    );
+    assert_eq!(bodies[0], "shared body", "first-wins on duplicate titles");
+}
+
+/// D1: an empty body is a legitimate result, not a degradation. The chunker
+/// skips headings that carry no text while the structure index still records the
+/// heading, so `content: ""` must not set `degraded`.
+#[tokio::test]
+async fn empty_body_section_yields_empty_content_without_degrade() {
+    let (engine, _llm, kv, doc_status) = structure_data_engine();
+    let index = structure_index(vec![
+        node("Has Body", 1, None, 0, Vec::new()),
+        node("Heading Only", 1, None, 100, Vec::new()),
+    ]);
+    seed_structure_index(&kv, "doc1", &index).await;
+    let id = seed_chunk(&kv, "body text", "doc1", 0, &["Has Body"]).await;
+    // A preamble chunk (empty section path) belongs to no section at all.
+    let preamble = seed_chunk(&kv, "preamble text", "doc1", 1, &[]).await;
+    seed_registry_doc(&doc_status, "doc1", "docs/x.md", &[id, preamble], true).await;
+
+    let mut param = QueryParam::default();
+    param.mode = QueryMode::Structure;
+    param.doc_id = Some("doc1".to_string());
+    let data = engine.query_data("q", &param).await.unwrap();
+
+    assert_eq!(data.sections.len(), 2);
+    assert_eq!(
+        section_field(&data.sections, 0, "content").as_deref(),
+        Some("body text")
+    );
+    assert_eq!(
+        section_field(&data.sections, 1, "content").as_deref(),
+        Some(""),
+        "a heading with no body text is a valid empty section"
+    );
+    assert!(data.sections[1]
+        .get("chunkIds")
+        .and_then(|v| v.as_array())
+        .unwrap()
+        .is_empty());
+    assert!(
+        !data.degraded,
+        "an empty body must not be reported as degradation: {:?}",
+        data.degrade_reasons
+    );
+}
+
+/// R8 additional requirement: every way structure retrieval can fail to run is
+/// reported, so a client can tell "nothing matched" from "never attempted".
+#[tokio::test]
+async fn query_data_structure_degrades_explicitly() {
+    let mut param = QueryParam::default();
+    param.mode = QueryMode::Structure;
+
+    // (a) No strategy wired at all.
+    let llm = Arc::new(MockLlm::new("SHOULD_NOT_APPEAR"));
+    let bare = engine_with(llm.clone(), Vec::new());
+    let data = bare.query_data("q", &param).await.unwrap();
+    assert!(data.degraded);
+    assert_eq!(data.degrade_reasons, vec![degrade::STRUCTURE_UNAVAILABLE]);
+    assert!(data.sections.is_empty());
+
+    // (b) Strategy present but the deployment gate is off.
+    let (engine, _llm, kv, doc_status) = structure_data_engine();
+    let gated = Arc::new(
+        QueryEngine::new(
+            llm.clone(),
+            Arc::new(MockVectorStorage::new(Vec::new())),
+            Arc::new(InMemoryGraphStorage::new("test", "test")),
+            kv.clone(),
+        )
+        .with_structure_strategy(Arc::new(
+            StructureQueryStrategy::new(
+                TreeSearchEngine::new(llm.clone()),
+                None,
+                kv.clone(),
+                Arc::new(MockVectorStorage::new(Vec::new())),
+                llm.clone(),
+            )
+            .with_doc_status_storage(doc_status.clone()),
+        )),
+    );
+    let data = gated.query_data("q", &param).await.unwrap();
+    assert!(data.degraded);
+    assert_eq!(data.degrade_reasons, vec![degrade::STRUCTURE_DISABLED]);
+
+    // (c) Gate on, but nothing in scope carries a structure index.
+    let mut scoped = param.clone();
+    scoped.structure_scope = Some("docs/none/".to_string());
+    let data = engine.query_data("q", &scoped).await.unwrap();
+    assert!(data.degraded);
+    assert_eq!(
+        data.degrade_reasons,
+        vec![degrade::NO_DOCUMENT_IN_SCOPE],
+        "an empty scope must say so"
+    );
+
+    // (d) Gate on, a document in scope, but no structure index for it.
+    seed_registry_doc(&doc_status, "doc-noindex", "docs/plain.md", &[], true).await;
+    let mut located = param.clone();
+    located.structure_scope = Some("docs/".to_string());
+    let data = engine.query_data("q", &located).await.unwrap();
+    assert!(data.degraded);
+    assert_eq!(data.degrade_reasons, vec![degrade::NO_INDEX]);
+
+    // Signal hygiene: not asking for sections is not degradation.
+    let mut naive = QueryParam::default();
+    naive.mode = QueryMode::Naive;
+    let data = engine.query_data("q", &naive).await.unwrap();
+    assert!(
+        !data.degraded,
+        "a mode that never requested structure must not report structure reasons: {:?}",
+        data.degrade_reasons
+    );
+}
+
+/// R9/D3 signal hygiene: the missing-keyword-index marker fires only for a plan
+/// that actually asked for fusion. Tagging every naive request would train
+/// clients to ignore it.
+#[tokio::test]
+async fn keyword_search_unavailable_flagged_only_for_hybrid_plan() {
+    let llm = Arc::new(MockLlm::new("the answer"));
+    // No `.with_keyword_search`, so hybrid recall silently degrades to vector.
+    let engine = engine_with(llm, vec![chunk("only vector", "doc1")]);
+
+    let mut naive = QueryParam::default();
+    naive.mode = QueryMode::Naive;
+    let data = engine.query_data("q", &naive).await.unwrap();
+    assert!(
+        !data.degraded,
+        "naive never asked for a keyword index: {:?}",
+        data.degrade_reasons
+    );
+
+    let mut hybrid = QueryParam::default();
+    hybrid.mode = QueryMode::Hybrid;
+    hybrid.hl_keywords = vec!["manual".to_string()];
+    let data = engine.query_data("q", &hybrid).await.unwrap();
+    assert!(data.degraded);
+    assert_eq!(
+        data.degrade_reasons,
+        vec![degrade::KEYWORD_SEARCH_UNAVAILABLE],
+        "hybrid without a keyword index must be reported"
+    );
+    // The recall still happened — degraded, not failed.
+    assert_eq!(data.chunks.len(), 1);
+}
+
+/// R11: the registry walk is no longer capped at one page. Only the 120th
+/// document (last in `updated_at desc` order) carries a structure index, so a
+/// single-page read finds nothing and a full walk finds it.
+#[tokio::test]
+async fn list_structure_documents_paginates_beyond_one_page() {
+    let (engine, _llm, kv, doc_status) = structure_data_engine();
+    // 120 registry rows; ids sort descending, so `doc-000` lands on page 2.
+    for i in 0..120 {
+        let doc_id = format!("doc-{i:03}");
+        let structured = i == 0;
+        seed_registry_doc(
+            &doc_status,
+            &doc_id,
+            &format!("docs/{doc_id}.md"),
+            &[],
+            structured,
+        )
+        .await;
+    }
+    let index = structure_index(vec![node("Only Section", 1, None, 0, Vec::new())]);
+    seed_structure_index(&kv, "doc-000", &index).await;
+
+    let mut param = QueryParam::default();
+    param.mode = QueryMode::Structure;
+    param.structure_scope = Some("docs/".to_string());
+    let data = engine.query_data("q", &param).await.unwrap();
+
+    assert!(
+        !data
+            .degrade_reasons
+            .contains(&degrade::NO_DOCUMENT_IN_SCOPE.to_string()),
+        "the second page must be reachable: {:?}",
+        data.degrade_reasons
+    );
+    assert_eq!(data.sections.len(), 1);
+    assert_eq!(
+        section_field(&data.sections, 0, "docId").as_deref(),
+        Some("doc-000")
+    );
+    assert_eq!(
+        section_field(&data.sections, 0, "filePath").as_deref(),
+        Some("docs/doc-000.md"),
+        "filePath comes from the registry row the walk already read"
+    );
+}
+
+/// R11: a scope wider than the fan-out limit is searched up to the limit and
+/// says it was truncated, rather than silently dropping documents.
+#[tokio::test]
+async fn structure_scope_truncation_is_reported() {
+    let (engine, _llm, kv, doc_status) = structure_data_engine();
+    let index = structure_index(vec![node("S", 1, None, 0, Vec::new())]);
+    for i in 0..(STRUCTURE_DATA_MAX_DOCS + 3) {
+        let doc_id = format!("doc-{i}");
+        seed_registry_doc(
+            &doc_status,
+            &doc_id,
+            &format!("docs/{doc_id}.md"),
+            &[],
+            true,
+        )
+        .await;
+        seed_structure_index(&kv, &doc_id, &index).await;
+    }
+
+    let mut param = QueryParam::default();
+    param.mode = QueryMode::Structure;
+    param.structure_scope = Some("docs/".to_string());
+    let data = engine.query_data("q", &param).await.unwrap();
+
+    assert!(
+        data.degrade_reasons
+            .contains(&degrade::SCOPE_TRUNCATED.to_string()),
+        "{:?}",
+        data.degrade_reasons
+    );
+    // Every hit still carries its own document, so a caller can see which
+    // documents made the cut.
+    let doc_ids: HashSet<String> = data
+        .sections
+        .iter()
+        .filter_map(|s| section_field(&[s.clone()], 0, "docId"))
+        .collect();
+    assert_eq!(doc_ids.len(), STRUCTURE_DATA_MAX_DOCS);
+}
+
+/// D5/R-8: the LLM bill of a scoped structure query is bounded by the fan-out
+/// limit times the per-document tree-search ceiling — never by corpus size.
+#[tokio::test]
+async fn structure_data_llm_calls_bounded_by_fanout() {
+    let (engine, llm, kv, doc_status) = structure_data_engine();
+    // Three-level chain per document: with the default limits (depth 3,
+    // fan-out 3) and an unparseable LLM reply, tree search spends exactly one
+    // navigate call plus one drill per level = 3 calls.
+    let index = structure_index(vec![node(
+        "P",
+        1,
+        None,
+        0,
+        vec![node(
+            "C",
+            2,
+            None,
+            10,
+            vec![node("D", 3, None, 20, Vec::new())],
+        )],
+    )]);
+    let seeded = STRUCTURE_DATA_MAX_DOCS + 4;
+    for i in 0..seeded {
+        let doc_id = format!("doc-{i}");
+        seed_registry_doc(
+            &doc_status,
+            &doc_id,
+            &format!("docs/{doc_id}.md"),
+            &[],
+            true,
+        )
+        .await;
+        seed_structure_index(&kv, &doc_id, &index).await;
+    }
+
+    let mut param = QueryParam::default();
+    param.mode = QueryMode::Structure;
+    param.structure_scope = Some("docs/".to_string());
+    engine.query_data("q", &param).await.unwrap();
+
+    const PER_DOC_CEILING: usize = 13; // 1 navigate + 3 drills + 9 sub-drills
+    assert_eq!(
+        llm.call_count(),
+        STRUCTURE_DATA_MAX_DOCS * 3,
+        "only the fan-out limit's worth of documents may be searched"
+    );
+    assert!(
+        llm.call_count() <= STRUCTURE_DATA_MAX_DOCS * PER_DOC_CEILING,
+        "the worst-case budget must stay bounded: {}",
+        llm.call_count()
+    );
+    assert_eq!(
+        llm.call_count(),
+        STRUCTURE_DATA_MAX_DOCS * 3,
+        "no answer synthesis on top of the tree search"
+    );
+}
+
+/// R-6: `chunks_list` must survive a write/read round trip on the backend CI
+/// actually runs. The cross-backend guard for this is `#[cfg(feature =
+/// "postgres")]`-gated and therefore never executes in the default-feature CI
+/// job, so the in-memory half is pinned here.
+#[tokio::test]
+async fn chunks_list_round_trip_on_memory_backend() {
+    let kv = Arc::new(InMemoryKVStorage::new("test", "test"));
+    let doc_status = Arc::new(InMemoryDocStatusStorage::new("status", "test"));
+    // Written out of order on purpose: the repository must sort, because
+    // `get_by_ids` order is a backend detail.
+    let c2 = seed_chunk(&kv, "second", "doc1", 2, &["S"]).await;
+    let c0 = seed_chunk(&kv, "first", "doc1", 0, &["S"]).await;
+    let c1 = seed_chunk(&kv, "middle", "doc1", 1, &["S"]).await;
+    let unordered = vec![c2.clone(), c0.clone(), c1.clone()];
+    seed_registry_doc(&doc_status, "doc1", "docs/x.md", &unordered, true).await;
+
+    let doc_status: Arc<dyn DocStatusStorage> = doc_status;
+    let kv_store: Arc<dyn KVStorage> = kv.clone();
+    let repo = DocChunkRepository::new(&doc_status, &kv_store);
+    let chunks = repo.chunks_of("doc1", BIZ).await.unwrap();
+    let contents: Vec<&str> = chunks
+        .iter()
+        .filter_map(|c| c.get("content").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(contents, vec!["first", "middle", "second"]);
+    // A KV record has no self-identifying field; the repository restores it so
+    // `sections[].chunkIds` can be reported.
+    let ids: Vec<&str> = chunks
+        .iter()
+        .filter_map(|c| c.get("id").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(ids, vec![c0.as_str(), c1.as_str(), c2.as_str()]);
+
+    // An unknown document is an empty result, not an error.
+    assert!(repo.chunks_of("missing", BIZ).await.unwrap().is_empty());
 }
 
 // Keep the trait imports used.

@@ -252,6 +252,7 @@ impl WorkspaceResolverImpl {
 
         let structure = factory::build_structure_strategy(
             self.llm.clone(),
+            &resolved_config,
             self.tool_calling_llm.clone(),
             kv.clone(),
             vector.clone(),

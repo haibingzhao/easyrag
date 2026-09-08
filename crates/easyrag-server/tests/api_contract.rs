@@ -7,12 +7,16 @@
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use easyrag_core::constants::DEFAULT_BIZ_ID;
+use easyrag_core::constants::{DEFAULT_BIZ_ID, STRUCTURE_INDEX_KEY_PREFIX};
 use easyrag_core::llm::embedding_func::{EmbeddingContext, EmbeddingFunc, EmbeddingFunction};
 use easyrag_core::llm::service::{LlmRequest, LlmService};
+use easyrag_core::model::doc_status::DocStatus;
+use easyrag_core::model::document_structure::{DocumentStructureIndex, SectionNode};
 use easyrag_core::storage::traits::{
     DocStatusStorage, GraphStorage, KVStorage, StorageBundle, VectorStorage,
 };
+use easyrag_core::util::hash::compute_mdhash_id;
+use easyrag_core::{JsonMap, JsonValue};
 use easyrag_pipeline::{
     EasyRAG, EasyRAGConfigBuilder, IngestionPipeline, TextParserRegistry, QueryEngine,
     StructureQueryStrategy, TreeSearchEngine,
@@ -30,6 +34,7 @@ use easyrag_storage::memory::{
 use futures::stream::BoxStream;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -111,10 +116,26 @@ impl WorkspaceResolver for DefaultResolver {
 struct Env {
     router: axum::Router,
     resolver: Arc<DefaultResolver>,
+    /// Storage handles the same router reads through, so a case can seed
+    /// knowledge-base state (structure index, registry row, chunks) before
+    /// issuing its request instead of reaching into `resolver.context`.
+    kv: Arc<dyn KVStorage>,
+    doc_status: Arc<dyn DocStatusStorage>,
     _temp_dir: tempfile::TempDir,
 }
 
 async fn build_env(auth_enabled: bool, with_structure: bool) -> Env {
+    build_env_with_data_structure(auth_enabled, with_structure, false).await
+}
+
+/// `data_structure` opens the R8 rollout gate (`QUERY_DATA_STRUCTURE_ENABLED`)
+/// on the engine, which is what lets `/api/query/data` actually run the tree
+/// search instead of reporting `structure_disabled_by_config`.
+async fn build_env_with_data_structure(
+    auth_enabled: bool,
+    with_structure: bool,
+    data_structure: bool,
+) -> Env {
     let temp_dir = tempfile::tempdir().unwrap();
     let llm: Arc<dyn LlmService> = Arc::new(MockLlm {
         default: "MOCK-ANSWER".to_string(),
@@ -146,23 +167,43 @@ async fn build_env(auth_enabled: bool, with_structure: bool) -> Env {
     ));
     easy_rag.initialize().await.unwrap();
 
-    let query_engine = Arc::new(QueryEngine::new(
+    // Built before the engine on purpose: production hands the engine the same
+    // strategy the `/api/query/structure` handler resolves off the workspace
+    // context. Assembling the engine first left `query_data` with no strategy at
+    // all, so an R8 contract case could only ever reach the
+    // `structure_strategy_unavailable` branch and pass for the wrong reason.
+    //
+    // `.with_doc_status_storage` matters for the same reason: without the
+    // registry, the scoped/cross-document paths short-circuit before consulting
+    // any seeded document.
+    let structure_strategy = if with_structure {
+        Some(Arc::new(
+            StructureQueryStrategy::new(
+                TreeSearchEngine::new(llm.clone()),
+                None,
+                kv.clone() as Arc<dyn KVStorage>,
+                vector.clone() as Arc<dyn VectorStorage>,
+                llm.clone(),
+            )
+            .with_doc_status_storage(doc_status.clone() as Arc<dyn DocStatusStorage>),
+        ))
+    } else {
+        None
+    };
+    let mut query_engine = QueryEngine::new(
         llm.clone(),
         vector.clone() as Arc<dyn VectorStorage>,
         graph.clone() as Arc<dyn GraphStorage>,
         kv.clone() as Arc<dyn KVStorage>,
-    ));
-    let structure_strategy = if with_structure {
-        Some(Arc::new(StructureQueryStrategy::new(
-            TreeSearchEngine::new(llm.clone()),
-            None,
-            kv.clone() as Arc<dyn KVStorage>,
-            vector.clone() as Arc<dyn VectorStorage>,
-            llm.clone(),
-        )))
-    } else {
-        None
-    };
+    )
+    .with_data_structure(data_structure);
+    if let Some(strategy) = &structure_strategy {
+        query_engine = query_engine.with_structure_strategy(strategy.clone());
+    }
+    let query_engine = Arc::new(query_engine);
+    // Handles for `Env`, cloned before the originals are moved into `AppServices`.
+    let kv_handle: Arc<dyn KVStorage> = kv.clone();
+    let doc_status_handle: Arc<dyn DocStatusStorage> = doc_status.clone();
     let pipeline = Arc::new(IngestionPipeline::new(
         llm.clone(),
         kv.clone() as Arc<dyn KVStorage>,
@@ -199,6 +240,7 @@ async fn build_env(auth_enabled: bool, with_structure: bool) -> Env {
 
     let mut config = ServerConfig::default();
     config.auth_enabled = auth_enabled;
+    config.query_data_structure_enabled = data_structure;
     // Provider is unconditional: the login endpoint issues
     // tokens even when the middleware filter chain is disabled.
     let jwt_provider = Arc::new(JwtAuthProvider::new("test-secret", 24));
@@ -235,6 +277,8 @@ async fn build_env(auth_enabled: bool, with_structure: bool) -> Env {
     Env {
         router: build_router(services),
         resolver,
+        kv: kv_handle,
+        doc_status: doc_status_handle,
         _temp_dir: temp_dir,
     }
 }
@@ -382,6 +426,291 @@ async fn query_data_returns_entities_relations_chunks() {
     assert!(body["entities"].is_array());
     assert!(body["relations"].is_array());
     assert!(body["chunks"].is_array());
+}
+
+// ---------------------------------------------------------------------
+// /api/query/data structure retrieval (R8)
+//
+// The mode matrix and the degradation-marker enumeration these cases assert
+// against live in `.docs/easyrag-data-endpoint-mode-matrix.md`.
+// ---------------------------------------------------------------------
+
+fn section_node(
+    title: &str,
+    level: usize,
+    summary: Option<&str>,
+    content_start: usize,
+) -> SectionNode {
+    SectionNode {
+        title: title.to_string(),
+        level,
+        summary: summary.map(str::to_string),
+        content_start,
+        content_end: content_start + 100,
+        children: Vec::new(),
+    }
+}
+
+fn structure_index(doc_id: &str, sections: Vec<SectionNode>) -> DocumentStructureIndex {
+    DocumentStructureIndex {
+        doc_id: doc_id.to_string(),
+        doc_title: Some("Guide".to_string()),
+        doc_description: None,
+        sections,
+        total_chars: 1000,
+        version: 1,
+    }
+}
+
+/// Store a chunk under the content-hash id ingestion would have minted, so the
+/// section join can reconstruct it on the way back.
+async fn seed_chunk(env: &Env, doc_id: &str, content: &str, order: i64, path: &[&str]) -> String {
+    let chunk_id = compute_mdhash_id(content, "chunk-");
+    let mut metadata = JsonMap::new();
+    metadata.insert(
+        "section_path".into(),
+        JsonValue::Array(
+            path.iter()
+                .map(|p| JsonValue::String((*p).to_string()))
+                .collect(),
+        ),
+    );
+    let mut record = JsonMap::new();
+    record.insert("content".into(), JsonValue::String(content.to_string()));
+    record.insert("full_doc_id".into(), JsonValue::String(doc_id.to_string()));
+    record.insert("chunk_order_index".into(), JsonValue::from(order));
+    record.insert("metadata".into(), JsonValue::Object(metadata));
+    let mut batch = HashMap::new();
+    batch.insert(chunk_id.clone(), record);
+    env.kv.upsert(batch, DEFAULT_BIZ_ID).await.unwrap();
+    chunk_id
+}
+
+/// Registry row for a processed document. `has_structure` and `chunks_list` are
+/// the two fields structure retrieval reads; the rest satisfy deserialization.
+async fn seed_registry_doc(env: &Env, doc_id: &str, file_path: &str, chunks_list: &[String]) {
+    let mut row = JsonMap::new();
+    row.insert(
+        "content_summary".into(),
+        JsonValue::String("summary".to_string()),
+    );
+    row.insert("content_length".into(), JsonValue::from(10i64));
+    row.insert("file_path".into(), JsonValue::String(file_path.to_string()));
+    row.insert(
+        "status".into(),
+        JsonValue::String(DocStatus::Processed.value().to_string()),
+    );
+    row.insert(
+        "created_at".into(),
+        JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+    );
+    row.insert(
+        "updated_at".into(),
+        JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+    );
+    row.insert("has_structure".into(), JsonValue::Bool(true));
+    row.insert(
+        "chunks_list".into(),
+        JsonValue::Array(
+            chunks_list
+                .iter()
+                .map(|c| JsonValue::String(c.clone()))
+                .collect(),
+        ),
+    );
+    let mut batch = HashMap::new();
+    batch.insert(doc_id.to_string(), row);
+    env.doc_status.upsert(batch, DEFAULT_BIZ_ID).await.unwrap();
+}
+
+async fn seed_structure_index(env: &Env, doc_id: &str, index: &DocumentStructureIndex) {
+    let mut record = JsonMap::new();
+    record.insert("doc_id".into(), JsonValue::String(doc_id.to_string()));
+    record.insert(
+        "structure".into(),
+        JsonValue::String(serde_json::to_string(index).unwrap()),
+    );
+    let mut batch = HashMap::new();
+    batch.insert(format!("{STRUCTURE_INDEX_KEY_PREFIX}{doc_id}"), record);
+    env.kv.upsert(batch, DEFAULT_BIZ_ID).await.unwrap();
+}
+
+/// Seed a two-section document whose chunks are written out of order, so a body
+/// assembled in lookup order rather than `chunk_order_index` order cannot pass.
+async fn seed_guide_document(env: &Env) {
+    let index = structure_index(
+        "doc1",
+        vec![
+            section_node("Introduction", 1, Some("What this document is about"), 0),
+            section_node("Installation", 1, Some("How to install"), 100),
+        ],
+    );
+    seed_structure_index(env, "doc1", &index).await;
+    let second = seed_chunk(env, "doc1", "intro body two", 1, &["Introduction"]).await;
+    let first = seed_chunk(env, "doc1", "intro body one", 0, &["Introduction"]).await;
+    seed_registry_doc(env, "doc1", "docs/guide.md", &[first, second]).await;
+}
+
+#[tokio::test]
+async fn query_data_structure_mode_returns_sections() {
+    let env = build_env_with_data_structure(false, true, true).await;
+    seed_guide_document(&env).await;
+
+    let (status, body) = post_json(
+        &env,
+        "/api/query/data",
+        json!({"query": "how do I install it", "mode": "structure"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let sections = body["sections"]
+        .as_array()
+        .expect("sections is always an array, empty when structure retrieval did not run");
+    assert_eq!(sections.len(), 2);
+    assert_eq!(sections[0]["docId"], "doc1");
+    assert_eq!(sections[0]["filePath"], "docs/guide.md");
+    assert_eq!(sections[0]["sectionPath"], "Introduction");
+    assert_eq!(sections[0]["title"], "Introduction");
+    assert_eq!(sections[0]["level"], 1);
+    assert_eq!(sections[0]["summary"], "What this document is about");
+    assert_eq!(sections[0]["content"], "intro body one\n\nintro body two");
+    assert_eq!(sections[0]["contentTruncated"], false);
+    assert_eq!(sections[0]["chunkIds"].as_array().unwrap().len(), 2);
+    // `score` is an ordinal 1/(rank+1), not a similarity — pinning the exact
+    // values is what stops it being silently redefined as one.
+    assert_eq!(sections[0]["rank"], 0);
+    assert_eq!(sections[0]["score"], 1.0);
+    assert_eq!(sections[1]["rank"], 1);
+    assert_eq!(sections[1]["score"], 0.5);
+    assert_eq!(sections[1]["content"], "");
+
+    assert_eq!(body["degraded"], false);
+    assert_eq!(body["degradeReasons"], json!([]));
+    assert!(body["reasoningChain"].is_array());
+    // R8: this mode spends nothing on the KG pass and synthesises no answer.
+    assert_eq!(body["entities"], json!([]));
+    assert_eq!(body["relations"], json!([]));
+    assert!(!body.as_object().unwrap().contains_key("answer"));
+}
+
+/// `includeSections` is what resolves the contradiction between the R8 text
+/// (`mode=structure` retrieves structure) and the requirement's `mode=mix`
+/// sample: the field defaults to "follow the mode" and can be forced on, so a
+/// mix caller gets sections without every scoped query paying for a tree search.
+#[tokio::test]
+async fn query_data_include_sections_overrides_the_mode_default() {
+    let env = build_env_with_data_structure(false, true, true).await;
+    seed_guide_document(&env).await;
+
+    // Forced on for a mode that would not ask for it.
+    let (status, body) = post_json(
+        &env,
+        "/api/query/data",
+        json!({"query": "q", "mode": "mix", "includeSections": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["sections"].as_array().unwrap().len(), 2);
+    // The mix plan still fused recall and ran the KG pass — sections are added,
+    // not substituted. This fixture wires no keyword index, so the fusion gap is
+    // reported instead of silent.
+    assert_eq!(body["degraded"], true);
+    assert_eq!(
+        body["degradeReasons"],
+        json!(["keyword_search_unavailable"])
+    );
+
+    // Forced off for the mode that would ask for it.
+    let (status, body) = post_json(
+        &env,
+        "/api/query/data",
+        json!({"query": "q", "mode": "structure", "includeSections": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["sections"], json!([]));
+    // Opting out is a choice, not a degradation.
+    assert_eq!(body["degraded"], false);
+    assert_eq!(body["degradeReasons"], json!([]));
+}
+
+#[tokio::test]
+async fn query_data_structure_degrades_when_strategy_absent() {
+    // Gate open, but the deployment shape wired no strategy: the caller asked
+    // for structure retrieval and must be told it never ran.
+    let env = build_env_with_data_structure(false, false, true).await;
+    let (status, body) = post_json(
+        &env,
+        "/api/query/data",
+        json!({"query": "q", "mode": "structure"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["sections"], json!([]));
+    assert_eq!(body["degraded"], true);
+    assert_eq!(
+        body["degradeReasons"],
+        json!(["structure_strategy_unavailable"])
+    );
+}
+
+#[tokio::test]
+async fn query_data_structure_disabled_by_default() {
+    // The rollout gate defaults to closed, so a strategy being wired is not
+    // enough: the request is answered without a tree search and says so.
+    let env = build_env(false, true).await;
+    seed_guide_document(&env).await;
+
+    let (status, body) = post_json(
+        &env,
+        "/api/query/data",
+        json!({"query": "q", "mode": "structure"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["sections"], json!([]));
+    assert_eq!(body["degraded"], true);
+    assert_eq!(
+        body["degradeReasons"],
+        json!(["structure_disabled_by_config"])
+    );
+
+    // Signal hygiene: a mode that never asked for structure is not degraded,
+    // even with the gate closed and a strategy present.
+    let (status, naive) = post_json(
+        &env,
+        "/api/query/data",
+        json!({"query": "q", "mode": "naive"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(naive["degraded"], false);
+    assert_eq!(naive["degradeReasons"], json!([]));
+    assert_eq!(naive["sections"], json!([]));
+    assert_eq!(naive["reasoningChain"], json!([]));
+}
+
+#[tokio::test]
+async fn query_data_default_mode_body_shape_unchanged() {
+    let env = build_env(false, false).await;
+    let (status, body) = post_json(&env, "/api/query/data", json!({"query": "hello"})).await;
+    assert_eq!(status, StatusCode::OK);
+    // The three pre-R8 keys keep their shape, so an existing client is unaffected.
+    assert!(body["entities"].is_array());
+    assert!(body["relations"].is_array());
+    assert!(body["chunks"].is_array());
+    // The R8 keys are present but inert, so a client can read them
+    // unconditionally. No mode was supplied, which REST normalizes to hybrid —
+    // a plan that asks for keyword fusion this fixture cannot provide, so the
+    // gap is reported rather than silently absorbed.
+    assert_eq!(body["sections"], json!([]));
+    assert_eq!(body["reasoningChain"], json!([]));
+    assert_eq!(body["degraded"], true);
+    assert_eq!(
+        body["degradeReasons"],
+        json!(["keyword_search_unavailable"])
+    );
 }
 
 #[tokio::test]

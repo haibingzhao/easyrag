@@ -24,7 +24,7 @@ use easyrag_core::constants::STRUCTURE_INDEX_KEY_PREFIX;
 use easyrag_core::model::doc_status::DocStatus;
 use easyrag_core::model::document_structure::DocumentStructureIndex;
 use easyrag_core::storage::traits::{DocStatusStorage, KVStorage};
-use easyrag_core::util::hash::compute_args_hash;
+use easyrag_core::util::hash::{compute_args_hash, compute_mdhash_id};
 use easyrag_core::util::json::parse_json_value;
 use easyrag_core::JsonMap;
 use serde_json::Value as JsonValue;
@@ -224,5 +224,127 @@ impl<'a> StructureIndexRepository<'a> {
                 Ok(None)
             }
         }
+    }
+}
+
+/// Cap on how many chunk records one [`DocChunkRepository`] fetch may pull.
+///
+/// A chunk id carries no section information, so a long document's chunks cannot
+/// be filtered before the fetch — only bounded. 200 covers every document the
+/// structure-aware chunker produces at the default token budget; exceeding it
+/// means a very long document whose later sections may come back with partial
+/// content, which is logged rather than silently accepted.
+pub const MAX_DOC_CHUNK_FETCH: usize = 200;
+
+/// Reads a document's stored chunks, in document order.
+///
+/// Backs the exact `sections[].content` join (R8): the registry row's
+/// `chunks_list` names the chunks, KV storage holds them, and each chunk's
+/// `metadata.section_path` says which section it belongs to. That replaces the
+/// vector-similarity heuristic the answer path uses, which can hand back chunks
+/// from outside the requested section — tolerable when feeding an LLM, not when
+/// reporting provenance to an Agent.
+///
+/// Borrows the caller's `Arc`s like [`StructureIndexRepository`] does, so no new
+/// indirection layer is introduced.
+pub struct DocChunkRepository<'a> {
+    doc_status: Option<&'a Arc<dyn DocStatusStorage>>,
+    kv: &'a Arc<dyn KVStorage>,
+}
+
+impl<'a> DocChunkRepository<'a> {
+    pub fn new(doc_status: &'a Arc<dyn DocStatusStorage>, kv: &'a Arc<dyn KVStorage>) -> Self {
+        Self {
+            doc_status: Some(doc_status),
+            kv,
+        }
+    }
+
+    /// Repository over KV only, for callers that already hold the chunk-id list
+    /// (the cross-document structure path does, from `get_docs_paginated`) and
+    /// therefore never need [`chunks_of`](Self::chunks_of).
+    pub fn from_kv(kv: &'a Arc<dyn KVStorage>) -> Self {
+        Self {
+            doc_status: None,
+            kv,
+        }
+    }
+
+    /// All stored chunks of `doc_id`, ordered by `chunk_order_index`.
+    ///
+    /// Returns an empty vec — not an error — when the registry row is missing or
+    /// carries no chunk ids. Deciding what an empty result *means* (a document
+    /// with no structure sections, or a registry that predates `chunks_list`) is
+    /// the caller's business, so no heuristic fallback lives here.
+    pub async fn chunks_of(
+        &self,
+        doc_id: &str,
+        biz_id: &str,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        let Some(storage) = self.doc_status else {
+            return Ok(Vec::new());
+        };
+        let chunk_ids = storage
+            .get_by_id(doc_id, biz_id)
+            .await?
+            .and_then(|row| {
+                row.get("chunks_list")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .unwrap_or_default();
+        self.chunks_by_ids(&chunk_ids, biz_id).await
+    }
+
+    /// Fetch a known chunk-id list, ordered by `chunk_order_index`.
+    ///
+    /// Each returned map carries the stored fields plus an injected `"id"` key:
+    /// a KV record has no self-identifying field, and `get_by_ids` does not
+    /// guarantee it echoes the requested order (the in-memory backend happens
+    /// to, PostgreSQL does not), so the id is reconstructed here from the
+    /// content hash — the exact rule both ingestion paths used to mint it.
+    pub async fn chunks_by_ids(
+        &self,
+        chunk_ids: &[String],
+        biz_id: &str,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        if chunk_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if chunk_ids.len() > MAX_DOC_CHUNK_FETCH {
+            tracing::warn!(
+                "Document chunk list has {} ids, capping the fetch at {}",
+                chunk_ids.len(),
+                MAX_DOC_CHUNK_FETCH
+            );
+        }
+        let ids: Vec<String> = chunk_ids
+            .iter()
+            .take(MAX_DOC_CHUNK_FETCH)
+            .cloned()
+            .collect();
+        let mut records = self.kv.get_by_ids(&ids, biz_id).await?;
+        for record in records.iter_mut() {
+            let content = record
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            record.insert(
+                "id".into(),
+                JsonValue::String(compute_mdhash_id(content, "chunk-")),
+            );
+        }
+        // `sort_by_key` is stable, so records missing `chunk_order_index` keep
+        // their relative order instead of shuffling between runs.
+        records.sort_by_key(|r| {
+            r.get("chunk_order_index")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(i64::MAX)
+        });
+        Ok(records)
     }
 }
