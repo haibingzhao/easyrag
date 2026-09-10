@@ -16,8 +16,8 @@
 //!
 //! * A marker is emitted **only** when the request actually asked for the
 //!   capability it reports on. Not asking for structure retrieval is not
-//!   degradation, and neither is a naive request running without a keyword
-//!   index.
+//!   degradation, and neither is a vector-only recall plan running on a
+//!   deployment with no keyword index.
 //! * Structure degradation and recall degradation are independent and may both
 //!   appear in one response — which is why the field is a list and not a single
 //!   string.
@@ -54,8 +54,19 @@ pub const SCOPE_TRUNCATED: &str = "structure_scope_truncated";
 
 /// Hybrid recall was requested but no keyword index is configured, so recall
 /// silently degraded to vector-only. Emitted **only** when this request's plan
-/// asked for fusion — tagging every naive call would devalue the marker.
+/// asked for fusion — `naive`, `hybrid` and `mix` all do, so on a deployment
+/// without a keyword index this fires on the data endpoint's most common mode.
+/// The vector-only plans (`structure`/`local`/`global`/`bypass`) never trigger
+/// it: they were never promised a fusion they did not ask for.
 pub const KEYWORD_SEARCH_UNAVAILABLE: &str = "keyword_search_unavailable";
+
+/// The request carried multiple `bizIds` **and** asked for sections, so the R8
+/// tree-search projection did not run: the structure strategy still filters by
+/// a single biz line and would silently answer from one line of the set.
+/// Multi-biz recall itself is fully supported — only the structure branch is
+/// out of scope for this rollout. Never emitted for a single-biz request or
+/// when sections were not requested.
+pub const STRUCTURE_MULTI_BIZ_UNSUPPORTED: &str = "structure_multi_biz_unsupported";
 
 #[cfg(test)]
 mod tests {
@@ -75,6 +86,7 @@ mod tests {
             SECTION_CONTENT_APPROXIMATE,
             SCOPE_TRUNCATED,
             KEYWORD_SEARCH_UNAVAILABLE,
+            STRUCTURE_MULTI_BIZ_UNSUPPORTED,
         ];
         for marker in all {
             assert!(

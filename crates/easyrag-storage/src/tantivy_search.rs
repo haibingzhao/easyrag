@@ -293,6 +293,52 @@ impl TantivyKeywordSearch {
 
         Some(Box::new(BooleanQuery::new(clauses)))
     }
+    /// Search the shared index with a fully-built query and map the top docs
+    /// to scored records — the tail shared by the single- and multi-biz
+    /// keyword paths so the two cannot drift.
+    fn collect_keyword_hits(
+        &self,
+        query_obj: &dyn Query,
+        top_k: usize,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        let searcher = self.reader.searcher();
+        let top_docs = searcher
+            .search(query_obj, &TopDocs::with_limit(top_k))
+            .map_err(|e| easyrag_core::CoreError::Internal(format!("tantivy search: {e}")))?;
+
+        let mut results = Vec::with_capacity(top_docs.len());
+        for (score, doc_address) in top_docs {
+            let retrieved: tantivy::TantivyDocument = searcher
+                .doc(doc_address)
+                .map_err(|e| easyrag_core::CoreError::Internal(format!("tantivy doc: {e}")))?;
+            let get_str = |field: Field| -> String {
+                retrieved
+                    .get_first(field)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let mut map = JsonMap::new();
+            map.insert("id".to_string(), serde_json::Value::String(get_str(self.id_field)));
+            // Stored schema field: per-record biz provenance for the data
+            // endpoint's chunk projection (`biz_id`).
+            map.insert(
+                "biz_id".to_string(),
+                serde_json::Value::String(get_str(self.biz_field)),
+            );
+            map.insert(
+                "content".to_string(),
+                serde_json::Value::String(get_str(self.content_field)),
+            );
+            map.insert(
+                "file_path".to_string(),
+                serde_json::Value::String(get_str(self.file_path_field)),
+            );
+            map.insert("score".to_string(), serde_json::Value::from(score));
+            results.push(map);
+        }
+        Ok(results)
+    }
 }
 
 #[async_trait]
@@ -321,37 +367,47 @@ impl KeywordSearchable for TantivyKeywordSearch {
             (Occur::Must, biz_filter),
         ]);
 
-        let searcher = self.reader.searcher();
-        let top_docs = searcher
-            .search(&query_obj, &TopDocs::with_limit(top_k))
-            .map_err(|e| easyrag_core::CoreError::Internal(format!("tantivy search: {e}")))?;
+        self.collect_keyword_hits(&query_obj, top_k)
+    }
 
-        let mut results = Vec::with_capacity(top_docs.len());
-        for (score, doc_address) in top_docs {
-            let retrieved: tantivy::TantivyDocument = searcher
-                .doc(doc_address)
-                .map_err(|e| easyrag_core::CoreError::Internal(format!("tantivy doc: {e}")))?;
-            let get_str = |field: Field| -> String {
-                retrieved
-                    .get_first(field)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            };
-            let mut map = JsonMap::new();
-            map.insert("id".to_string(), serde_json::Value::String(get_str(self.id_field)));
-            map.insert(
-                "content".to_string(),
-                serde_json::Value::String(get_str(self.content_field)),
-            );
-            map.insert(
-                "file_path".to_string(),
-                serde_json::Value::String(get_str(self.file_path_field)),
-            );
-            map.insert("score".to_string(), serde_json::Value::from(score));
-            results.push(map);
+    /// Native set-filter keyword recall (bizIds): the biz constraint becomes a
+    /// disjunction of term queries so one search ranks the whole requested set
+    /// of biz lines globally. Empty query/set return nothing, matching the
+    /// single-biz path.
+    async fn keyword_query_multi_biz(
+        &self,
+        query: &str,
+        top_k: usize,
+        time_range_start: Option<i64>,
+        time_range_end: Option<i64>,
+        biz_ids: &[&str],
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        if biz_ids.is_empty() || query.trim().is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(results)
+        let Some(content_query) = self.build_query(query, time_range_start, time_range_end) else {
+            return Ok(Vec::new());
+        };
+        let biz_filter: Box<dyn Query> = Box::new(BooleanQuery::new(
+            biz_ids
+                .iter()
+                .map(|biz| {
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(
+                            Term::from_field_text(self.biz_field, biz),
+                            IndexRecordOption::Basic,
+                        )) as Box<dyn Query>,
+                    )
+                })
+                .collect(),
+        ));
+        let query_obj = BooleanQuery::new(vec![
+            (Occur::Must, content_query),
+            (Occur::Must, biz_filter),
+        ]);
+
+        self.collect_keyword_hits(&query_obj, top_k)
     }
 
     async fn index_documents(

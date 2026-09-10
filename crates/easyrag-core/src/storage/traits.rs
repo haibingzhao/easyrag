@@ -8,6 +8,75 @@ use crate::JsonMap;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 
+/// Shared merge rule for the multi-biz read fallbacks: records are deduped by
+/// their `id` field (first occurrence wins — callers pass biz_ids in request
+/// order), ordered by descending `score` (missing score sinks below every
+/// scored record; the sort is stable so scoreless records keep arrival order)
+/// and truncated to `top_k`. This is the recall-level merge that decides what
+/// a multi-biz request sees when a backend has no native set filter.
+pub(crate) fn merge_multi_biz_scored(results: Vec<Vec<JsonMap>>, top_k: usize) -> Vec<JsonMap> {
+    let mut seen = HashSet::new();
+    let mut merged: Vec<JsonMap> = Vec::new();
+    for batch in results {
+        for rec in batch {
+            let id = rec.get("id").and_then(|v| v.as_str()).map(str::to_string);
+            if let Some(id) = &id {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+            }
+            merged.push(rec);
+        }
+    }
+    merged.sort_by(|a, b| {
+        let key = |m: &JsonMap| {
+            m.get("score")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(f64::NEG_INFINITY)
+        };
+        key(b)
+            .partial_cmp(&key(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged.truncate(top_k);
+    merged
+}
+
+/// Dedupe-by-`id` merge for exact-key multi-biz lookups (`get_by_ids` family):
+/// no reordering, no truncation — an id is a content hash, so duplicates across
+/// biz lines are the same record and first occurrence wins.
+fn merge_multi_biz_exact(results: Vec<Vec<JsonMap>>) -> Vec<JsonMap> {
+    let mut seen = HashSet::new();
+    let mut merged: Vec<JsonMap> = Vec::new();
+    for batch in results {
+        for rec in batch {
+            let id = rec.get("id").and_then(|v| v.as_str()).map(str::to_string);
+            if let Some(id) = &id {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+            }
+            merged.push(rec);
+        }
+    }
+    merged
+}
+
+/// Tag each record of a per-biz batch with the biz line it was read from, so
+/// the `/api/query/data` chunk projection can report per-record provenance
+/// (`biz_id`) even when the backend does not echo it natively. The default
+/// multi-biz read variants call this — they are the only place that knows
+/// which biz each batch came from.
+pub(crate) fn tag_multi_biz_batch(mut batch: Vec<JsonMap>, biz: &str) -> Vec<JsonMap> {
+    for rec in batch.iter_mut() {
+        rec.insert(
+            "biz_id".to_string(),
+            serde_json::Value::String(biz.to_string()),
+        );
+    }
+    batch
+}
+
 /// Base storage namespace interface.
 #[async_trait]
 pub trait StorageNameSpace: Send + Sync {
@@ -79,6 +148,44 @@ pub trait VectorStorage: StorageNameSpace {
         biz_id: &str,
     ) -> crate::Result<Vec<JsonMap>>;
 
+    /// Multi-biz recall variant for `/api/query/data` (bizIds): the biz lines
+    /// are treated as one corpus and the result is a single global top_k.
+    /// Backends with a native set predicate (`biz_id IN (...)`, tantivy terms
+    /// filter, in-memory set membership) override this so the ordering is
+    /// exact; the default falls back to per-biz queries merged by the shared
+    /// score-descending rule — an approximation that only a backend ranking
+    /// per-partition could observe.
+    /// An empty `biz_ids` is a caller bug and returns an empty result.
+    async fn query_multi_biz(
+        &self,
+        query: &str,
+        top_k: usize,
+        query_embedding: Option<&[f32]>,
+        time_range_start: Option<i64>,
+        time_range_end: Option<i64>,
+        biz_ids: &[&str],
+    ) -> crate::Result<Vec<JsonMap>> {
+        if biz_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut batches = Vec::with_capacity(biz_ids.len());
+        for biz in biz_ids {
+            batches.push(tag_multi_biz_batch(
+                self.query(
+                    query,
+                    top_k,
+                    query_embedding,
+                    time_range_start,
+                    time_range_end,
+                    biz,
+                )
+                .await?,
+                biz,
+            ));
+        }
+        Ok(merge_multi_biz_scored(batches, top_k))
+    }
+
     /// Insert or update vectors in the storage.
     async fn upsert(&self, data: HashMap<String, JsonMap>, biz_id: &str) -> crate::Result<()>;
 
@@ -136,6 +243,24 @@ pub trait KVStorage: StorageNameSpace {
 
     /// Get values by ids.
     async fn get_by_ids(&self, ids: &[String], biz_id: &str) -> crate::Result<Vec<JsonMap>>;
+
+    /// Multi-biz variant for `/api/query/data` (bizIds): exact-key lookups
+    /// across several biz lines. Ids are content hashes, so a dedupe by `id`
+    /// with first-occurrence-wins is lossless; no ordering or truncation.
+    async fn get_by_ids_multi_biz(
+        &self,
+        ids: &[String],
+        biz_ids: &[&str],
+    ) -> crate::Result<Vec<JsonMap>> {
+        if biz_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut batches = Vec::with_capacity(biz_ids.len());
+        for biz in biz_ids {
+            batches.push(tag_multi_biz_batch(self.get_by_ids(ids, biz).await?, biz));
+        }
+        Ok(merge_multi_biz_exact(batches))
+    }
 
     /// Return keys that do NOT exist in storage.
     async fn filter_keys(
@@ -304,6 +429,25 @@ pub trait GraphStorage: StorageNameSpace {
         Ok(result)
     }
 
+    /// Multi-biz variant of [`Self::get_edges_batch`], same fallback contract
+    /// as [`Self::get_nodes_edges_batch_multi_biz`].
+    async fn get_edges_batch_multi_biz(
+        &self,
+        pairs: &[(String, String)],
+        biz_ids: &[&str],
+    ) -> crate::Result<HashMap<(String, String), JsonMap>> {
+        if biz_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut result = HashMap::new();
+        for biz in biz_ids {
+            for (pair, edge) in self.get_edges_batch(pairs, biz).await? {
+                result.entry(pair).or_insert(edge);
+            }
+        }
+        Ok(result)
+    }
+
     /// Get nodes' edges as a batch.
     async fn get_nodes_edges_batch(
         &self,
@@ -316,6 +460,28 @@ pub trait GraphStorage: StorageNameSpace {
                 node_id.clone(),
                 self.get_node_edges(node_id, biz_id).await?.unwrap_or_default(),
             );
+        }
+        Ok(result)
+    }
+
+    /// Multi-biz variant of [`Self::get_nodes_edges_batch`] for
+    /// `/api/query/data` (bizIds). Attribute-level reads over entity ids that
+    /// the recall layer already scoped, so a per-biz fallback merge (first biz
+    /// wins per node) is correct — a node id may legitimately exist in two biz
+    /// lines with identical content-hash identity.
+    async fn get_nodes_edges_batch_multi_biz(
+        &self,
+        node_ids: &[String],
+        biz_ids: &[&str],
+    ) -> crate::Result<HashMap<String, Vec<(String, String)>>> {
+        if biz_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut result = HashMap::new();
+        for biz in biz_ids {
+            for (node_id, edges) in self.get_nodes_edges_batch(node_ids, biz).await? {
+                result.entry(node_id).or_insert(edges);
+            }
         }
         Ok(result)
     }

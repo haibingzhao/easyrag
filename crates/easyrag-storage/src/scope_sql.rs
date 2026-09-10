@@ -69,6 +69,27 @@ pub(crate) trait TenantScopeSql: AsTenantScope {
             self.sql(alias)
         }
     }
+
+    /// Multi-biz list scope for `/api/query/data` (bizIds): pins the workspace
+    /// and filters `biz_id` against a set, so the recall query returns one
+    /// globally-ordered top_k instead of per-biz partitions. The workspace
+    /// half keeps the same rendering as [`Self::list_sql`]; every element is
+    /// escaped by [`sql_in_list`]. Alias-qualified the same way.
+    fn list_sql_in(&self, alias: Option<&str>, biz_ids: &[&str]) -> String {
+        let w = match alias {
+            Some(a) => format!("{a}.workspace"),
+            None => "workspace".to_string(),
+        };
+        let b = match alias {
+            Some(a) => format!("{a}.biz_id"),
+            None => "biz_id".to_string(),
+        };
+        format!(
+            "{w} = '{}' AND {b} IN ({})",
+            sql_escape(self.workspace()),
+            sql_in_list(biz_ids.iter().copied())
+        )
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -181,6 +202,25 @@ mod sql_tests {
         assert_eq!("'a','b'", sql_in_list(["a", "b"]));
         assert_eq!("'o''ne'", sql_in_list(["o'ne"]));
         assert_eq!("", sql_in_list(std::iter::empty::<&str>()));
+    }
+
+    #[test]
+    fn multi_biz_list_scope_pins_workspace_and_escapes_each_element() {
+        let scope = TenantScope::new("ws", "unused");
+        assert_eq!(
+            "workspace = 'ws' AND biz_id IN ('a','b')",
+            scope.list_sql_in(None, &["a", "b"])
+        );
+        assert_eq!(
+            "n.workspace = 'ws' AND n.biz_id IN ('a','o''ne')",
+            scope.list_sql_in(Some("n"), &["a", "o'ne"])
+        );
+        // Single-element set renders as a one-item IN, not the `=` form —
+        // callers pick the multi-biz path only when they asked for it.
+        assert_eq!(
+            "workspace = 'ws' AND biz_id IN ('only')",
+            scope.list_sql_in(None, &["only"])
+        );
     }
 }
 

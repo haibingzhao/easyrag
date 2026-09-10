@@ -429,6 +429,108 @@ async fn query_data_returns_entities_relations_chunks() {
 }
 
 // ---------------------------------------------------------------------
+// /api/query/data bizIds (multi-biz recall)
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn query_data_biz_ids_reach_the_resolver_and_the_response_shape_holds() {
+    let env = build_env(false, false).await;
+    let (status, body) = post_json(
+        &env,
+        "/api/query/data",
+        // Bypass keeps the recall plan vector-only, so this assertion isolates
+        // the bizIds signal from the keyword_search_unavailable marker the
+        // fused plans fire on a deployment without a keyword index.
+        json!({"query": "hello", "mode": "bypass", "bizIds": ["alpha", "beta"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["chunks"].is_array());
+    // The first element rides the normal biz_id normalization path.
+    assert_eq!(
+        env.resolver.normalized.lock().unwrap().last().unwrap(),
+        "alpha"
+    );
+    // Degradation signal hygiene: a valid multi-biz request without sections
+    // is not a degradation, no matter which storage shape answers.
+    assert_eq!(body["degraded"], false);
+    assert_eq!(body["degradeReasons"], json!([]));
+}
+
+#[tokio::test]
+async fn query_data_biz_ids_override_biz_id_after_trim_and_dedupe() {
+    let env = build_env(false, false).await;
+    let (status, _) = post_json(
+        &env,
+        "/api/query/data",
+        json!({
+            "query": "hello",
+            "bizId": "legacy",
+            "bizIds": [" alpha ", "beta", "alpha", ""]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Trimmed, deduped, blanks dropped; the first survivor replaces bizId.
+    assert_eq!(
+        env.resolver.normalized.lock().unwrap().last().unwrap(),
+        "alpha"
+    );
+}
+
+#[tokio::test]
+async fn query_data_empty_biz_ids_falls_back_to_biz_id() {
+    let env = build_env(false, false).await;
+    let (status, _) = post_json(
+        &env,
+        "/api/query/data",
+        json!({"query": "hello", "bizId": "legacy", "bizIds": []}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        env.resolver.normalized.lock().unwrap().last().unwrap(),
+        "legacy"
+    );
+}
+
+#[tokio::test]
+async fn query_data_invalid_biz_ids_element_is_a_400() {
+    let env = build_env(false, false).await;
+    // Space and quotes fail the scope-name charset rule: these values land in
+    // SQL/Cypher predicates, so the boundary rejects before any storage call.
+    let (status, _) = post_json(
+        &env,
+        "/api/query/data",
+        json!({"query": "hello", "bizIds": ["ok", "bad biz"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn query_data_biz_ids_with_sections_emit_the_structure_marker() {
+    // The structure branch is out of scope for the multi-biz rollout: the
+    // strategy still scopes by a single biz line, so the request must be told
+    // the tree search did not run instead of silently answering from one line.
+    let env = build_env_with_data_structure(false, true, true).await;
+    seed_guide_document(&env).await;
+    let (status, body) = post_json(
+        &env,
+        "/api/query/data",
+        json!({"query": "guide", "mode": "structure", "bizIds": ["a", "b"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["sections"], json!([]));
+    assert_eq!(body["degraded"], true);
+    assert!(body["degradeReasons"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("structure_multi_biz_unsupported")));
+}
+
+// ---------------------------------------------------------------------
 // /api/query/data structure retrieval (R8)
 //
 // The mode matrix and the degradation-marker enumeration these cases assert
@@ -676,8 +778,10 @@ async fn query_data_structure_disabled_by_default() {
         json!(["structure_disabled_by_config"])
     );
 
-    // Signal hygiene: a mode that never asked for structure is not degraded,
-    // even with the gate closed and a strategy present.
+    // Signal hygiene: a mode that never asked for structure reports no
+    // *structure* reason, even with the gate closed and a strategy present. It
+    // does report the recall gap — `naive` recalls by fusion and this fixture
+    // wires no keyword index — which is the marker doing its job, not noise.
     let (status, naive) = post_json(
         &env,
         "/api/query/data",
@@ -685,10 +789,13 @@ async fn query_data_structure_disabled_by_default() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(naive["degraded"], false);
-    assert_eq!(naive["degradeReasons"], json!([]));
     assert_eq!(naive["sections"], json!([]));
     assert_eq!(naive["reasoningChain"], json!([]));
+    assert_eq!(naive["degraded"], true);
+    assert_eq!(
+        naive["degradeReasons"],
+        json!(["keyword_search_unavailable"])
+    );
 }
 
 #[tokio::test]

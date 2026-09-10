@@ -9,14 +9,9 @@ use easyrag_server::{ServerConfig, DEFAULT_JWT_SECRET};
 /// Workspace name guard (P2.17, direct):
 /// prevents SQL injection through workspace-derived table names.
 pub fn validate_workspace(workspace: &str) -> anyhow::Result<()> {
-    let pattern = regex::Regex::new(r"^[a-zA-Z0-9_\-][a-zA-Z0-9_\-.]{0,63}$").unwrap();
-    if !pattern.is_match(workspace) {
-        bail!(
-            "Invalid workspace name '{workspace}': must be 1-64 chars, \
-             alphanumeric/underscore/hyphen/dot, starting with alphanumeric/underscore/hyphen"
-        );
-    }
-    Ok(())
+    // Single-source charset rule (core): the same rule gates biz_id at the
+    // resolver and bizIds elements at the REST boundary.
+    easyrag_core::model::validate_scope_name(workspace).map_err(|e| anyhow::anyhow!(e))
 }
 
 // ---------------------------------------------------------------------

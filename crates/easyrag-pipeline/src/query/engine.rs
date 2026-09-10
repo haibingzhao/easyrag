@@ -156,19 +156,19 @@ pub struct QueryEngine {
 /// Recall strategy for a chunk retrieval.
 ///
 /// The two variants are not interchangeable: `Hybrid` fuses keyword hits in via
-/// RRF, so it can return chunks `Vector` never would. Which paths use which is
-/// pre-existing and stays that way — with one R9 exception: the pure-data path
-/// no longer hardcodes `Vector` but takes it from [`data_plan`], so `hybrid` and
+/// RRF, so it can return chunks `Vector` never would, and it orders them by
+/// fusion rank rather than by similarity. Which paths use which is pre-existing
+/// and stays that way — with one R9 exception: the pure-data path no longer
+/// hardcodes `Vector` but takes it from [`data_plan`], so `naive`, `hybrid` and
 /// `mix` requests recall the same way the synchronous answer paths always did.
-/// `naive` deliberately stays on `Vector`: that is the compatibility promise the
-/// data endpoint's existing callers rely on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Recall {
     /// `vector_storage.query` alone — the reference list, both streaming-prompt
     /// paths, and whichever pure-data modes [`data_plan`] maps here.
     Vector,
-    /// `hybrid_chunk_query`: vector + keyword fused by RRF — the two synchronous
-    /// answer paths, plus the pure-data `hybrid`/`mix` modes.
+    /// `hybrid_chunk_query`: vector + keyword fused by RRF — the synchronous
+    /// naive answer path, the KG answer path, and the pure-data
+    /// `naive`/`hybrid`/`mix` modes.
     Hybrid,
 }
 
@@ -460,8 +460,14 @@ impl QueryEngine {
 
         // R9 signalling. `hybrid_chunk_query` has always fallen back to
         // vector-only when no keyword index is configured; only the reporting is
-        // new. It fires solely when *this* request asked for fusion — tagging
-        // every naive call would train clients to ignore the marker.
+        // new. It fires on the modes whose plan actually asks for fusion, so the
+        // vector-only ones (`structure`/`local`/`global`/`bypass`) stay clean.
+        //
+        // `naive` is a fused mode, so a deployment without a keyword index
+        // reports this on the endpoint's most common mode. That is the honest
+        // signal rather than a noisy one: the recall really is narrower than the
+        // plan asked for, and a client comparing `/api/query/data` against
+        // `/api/query` needs to know the two are not seeing the same corpus.
         if plan.recall == Recall::Hybrid && self.keyword_search.is_none() {
             degrade_reasons.push(super::degrade::KEYWORD_SEARCH_UNAVAILABLE.to_string());
         }
@@ -510,26 +516,35 @@ impl QueryEngine {
         }
 
         // R8: raw structure hits, opt-in per request and gated per deployment.
+        // A bizIds override opts out of the tree search entirely: the structure
+        // strategy still scopes by the single normalized `biz_id`, so running
+        // it would silently answer from one line of the requested set — say so
+        // with a machine-readable marker instead (signal hygiene: the marker
+        // only ever fires when sections were actually asked for).
         let mut sections: Vec<JsonMap> = Vec::new();
         let mut reasoning_chain: Vec<ReasoningStep> = Vec::new();
         if wants_sections(param) {
-            match &self.structure_strategy {
-                Some(strategy) if self.enable_data_structure => {
-                    let found = strategy.search_sections(query, param).await?;
-                    reasoning_chain = found.reasoning_chain;
-                    degrade_reasons.extend(found.degrade_reasons);
-                    sections = found
-                        .sections
-                        .iter()
-                        .enumerate()
-                        .map(|(rank, hit)| section_json(hit, rank))
-                        .collect();
-                }
-                Some(_) => {
-                    degrade_reasons.push(super::degrade::STRUCTURE_DISABLED.to_string());
-                }
-                None => {
-                    degrade_reasons.push(super::degrade::STRUCTURE_UNAVAILABLE.to_string());
+            if !param.biz_ids.is_empty() {
+                degrade_reasons.push(super::degrade::STRUCTURE_MULTI_BIZ_UNSUPPORTED.to_string());
+            } else {
+                match &self.structure_strategy {
+                    Some(strategy) if self.enable_data_structure => {
+                        let found = strategy.search_sections(query, param).await?;
+                        reasoning_chain = found.reasoning_chain;
+                        degrade_reasons.extend(found.degrade_reasons);
+                        sections = found
+                            .sections
+                            .iter()
+                            .enumerate()
+                            .map(|(rank, hit)| section_json(hit, rank))
+                            .collect();
+                    }
+                    Some(_) => {
+                        degrade_reasons.push(super::degrade::STRUCTURE_DISABLED.to_string());
+                    }
+                    None => {
+                        degrade_reasons.push(super::degrade::STRUCTURE_UNAVAILABLE.to_string());
+                    }
                 }
             }
         }
@@ -622,6 +637,21 @@ impl QueryEngine {
                         Some(ts) => m.insert("create_time".into(), JsonValue::from(ts)),
                         None => m.insert("create_time".into(), JsonValue::Null),
                     };
+                    // Per-chunk biz provenance: the multi-biz recall paths
+                    // echo the biz line each record was read from; the
+                    // single-biz path backfills the normalized `param.biz_id`
+                    // so the field is always present (additive, backward
+                    // compatible).
+                    m.insert(
+                        "biz_id".into(),
+                        JsonValue::String(
+                            chunk
+                                .get("biz_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&param.biz_id)
+                                .to_string(),
+                        ),
+                    );
                     m.insert(
                         "metadata".into(),
                         chunk
@@ -786,19 +816,41 @@ impl QueryEngine {
         let mut entities: Vec<JsonMap> = Vec::new();
         let mut relations: Vec<JsonMap> = Vec::new();
 
+        // bizIds override (data endpoint only): entity recall reads the same
+        // multi-biz corpus as the chunk recall, so the two cannot disagree
+        // about what exists.
+        let multi_biz_ids: Vec<String> = if param.biz_ids.is_empty() {
+            Vec::new()
+        } else {
+            param.effective_biz_ids()
+        };
+        let multi_biz_refs: Vec<&str> = multi_biz_ids.iter().map(String::as_str).collect();
+
         for term in search_terms.iter().take(5) {
             let per_term_top_k = param.top_k / search_terms.len().max(1);
-            let results = self
-                .vector_storage
-                .query(
-                    term,
-                    per_term_top_k,
-                    None,
-                    param.time_range_start,
-                    param.time_range_end,
-                    &param.biz_id,
-                )
-                .await?;
+            let results = if multi_biz_refs.is_empty() {
+                self.vector_storage
+                    .query(
+                        term,
+                        per_term_top_k,
+                        None,
+                        param.time_range_start,
+                        param.time_range_end,
+                        &param.biz_id,
+                    )
+                    .await?
+            } else {
+                self.vector_storage
+                    .query_multi_biz(
+                        term,
+                        per_term_top_k,
+                        None,
+                        param.time_range_start,
+                        param.time_range_end,
+                        &multi_biz_refs,
+                    )
+                    .await?
+            };
             // Ingest never writes `rel-` rows to the vector store, so every
             // hit here is an entity/chunk row; there is nothing to separate.
             entities.extend(results);
@@ -812,7 +864,15 @@ impl QueryEngine {
             .filter_map(|e| e.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
             .collect();
         if !entity_ids.is_empty() {
-            let batch_edges = self.graph_storage.get_nodes_edges_batch(&entity_ids, &param.biz_id).await?;
+            let batch_edges = if multi_biz_refs.is_empty() {
+                self.graph_storage
+                    .get_nodes_edges_batch(&entity_ids, &param.biz_id)
+                    .await?
+            } else {
+                self.graph_storage
+                    .get_nodes_edges_batch_multi_biz(&entity_ids, &multi_biz_refs)
+                    .await?
+            };
             // Deterministic order: iterate by entity id order
             // HashMap iteration order is unspecified).
             let mut edge_pairs: Vec<(String, String)> = Vec::new();
@@ -832,7 +892,15 @@ impl QueryEngine {
                 }
             }
             if !edge_pairs.is_empty() {
-                let edge_data = self.graph_storage.get_edges_batch(&edge_pairs, &param.biz_id).await?;
+                let edge_data = if multi_biz_refs.is_empty() {
+                    self.graph_storage
+                        .get_edges_batch(&edge_pairs, &param.biz_id)
+                        .await?
+                } else {
+                    self.graph_storage
+                        .get_edges_batch_multi_biz(&edge_pairs, &multi_biz_refs)
+                        .await?
+                };
                 for pair in &edge_pairs {
                     if let Some(data) = edge_data.get(pair) {
                         let mut m = data.clone();
@@ -932,6 +1000,51 @@ impl QueryEngine {
         Ok(rrf_fusion(vec_results, kw_results, self.rrf_k, 0.7, 0.3))
     }
 
+    /// Multi-biz twin of [`Self::hybrid_chunk_query`] (bizIds): both recall
+    /// legs run with the native set filter and fuse once, so the RRF ranking
+    /// sees one corpus instead of per-biz partitions.
+    async fn hybrid_chunk_query_multi_biz(
+        &self,
+        query: &str,
+        top_k: usize,
+        time_range_start: Option<i64>,
+        time_range_end: Option<i64>,
+        biz_ids: &[&str],
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        let Some(keyword_search) = &self.keyword_search else {
+            return self
+                .vector_storage
+                .query_multi_biz(
+                    query,
+                    top_k,
+                    None,
+                    time_range_start,
+                    time_range_end,
+                    biz_ids,
+                )
+                .await;
+        };
+
+        let (vec_results, kw_results) = futures::try_join!(
+            self.vector_storage.query_multi_biz(
+                query,
+                top_k,
+                None,
+                time_range_start,
+                time_range_end,
+                biz_ids
+            ),
+            keyword_search.keyword_query_multi_biz(
+                query,
+                top_k,
+                time_range_start,
+                time_range_end,
+                biz_ids
+            )
+        )?;
+        Ok(rrf_fusion(vec_results, kw_results, self.rrf_k, 0.7, 0.3))
+    }
+
     /// Recall + metadata filter — the first two steps of every chunk retrieval
     /// in the engine.
     ///
@@ -954,28 +1067,61 @@ impl QueryEngine {
         top_k_field: TopKField,
     ) -> easyrag_core::Result<Vec<JsonMap>> {
         let top_k = top_k_field.of(param);
+        // bizIds override (data endpoint only): the multi-biz set filter keeps
+        // the recall a single global top_k over the requested corpus. An empty
+        // `param.biz_ids` takes the legacy single-biz path unchanged.
+        let multi_biz_ids: Vec<String> = if param.biz_ids.is_empty() {
+            Vec::new()
+        } else {
+            param.effective_biz_ids()
+        };
+        let multi_biz_refs: Vec<&str> = multi_biz_ids.iter().map(String::as_str).collect();
         let recalled = match recall {
             Recall::Hybrid => {
-                self.hybrid_chunk_query(
-                    query,
-                    effective_top_k(param, top_k),
-                    param.time_range_start,
-                    param.time_range_end,
-                    &param.biz_id,
-                )
-                .await?
-            }
-            Recall::Vector => {
-                self.vector_storage
-                    .query(
+                if multi_biz_refs.is_empty() {
+                    self.hybrid_chunk_query(
                         query,
                         effective_top_k(param, top_k),
-                        None,
                         param.time_range_start,
                         param.time_range_end,
                         &param.biz_id,
                     )
                     .await?
+                } else {
+                    self.hybrid_chunk_query_multi_biz(
+                        query,
+                        effective_top_k(param, top_k),
+                        param.time_range_start,
+                        param.time_range_end,
+                        &multi_biz_refs,
+                    )
+                    .await?
+                }
+            }
+            Recall::Vector => {
+                if multi_biz_refs.is_empty() {
+                    self.vector_storage
+                        .query(
+                            query,
+                            effective_top_k(param, top_k),
+                            None,
+                            param.time_range_start,
+                            param.time_range_end,
+                            &param.biz_id,
+                        )
+                        .await?
+                } else {
+                    self.vector_storage
+                        .query_multi_biz(
+                            query,
+                            effective_top_k(param, top_k),
+                            None,
+                            param.time_range_start,
+                            param.time_range_end,
+                            &multi_biz_refs,
+                        )
+                        .await?
+                }
             }
         };
         Ok(apply_metadata_filters(recalled, param, top_k))
@@ -1255,8 +1401,23 @@ impl QueryEngine {
         }
 
         let ids: Vec<String> = entity_chunk_ids.into_iter().take(20).collect();
+        // bizIds override: the chunk ids come from entities already scoped by
+        // the multi-biz recall, so the KV backfill reads the same set.
+        let multi_biz_ids: Vec<String> = if param.biz_ids.is_empty() {
+            Vec::new()
+        } else {
+            param.effective_biz_ids()
+        };
+        let multi_biz_refs: Vec<&str> = multi_biz_ids.iter().map(String::as_str).collect();
+        let kv_hits = if multi_biz_refs.is_empty() {
+            self.kv_storage.get_by_ids(&ids, &param.biz_id).await?
+        } else {
+            self.kv_storage
+                .get_by_ids_multi_biz(&ids, &multi_biz_refs)
+                .await?
+        };
         let mut extra: Vec<JsonMap> = Vec::new();
-        for chunk_data in self.kv_storage.get_by_ids(&ids, &param.biz_id).await? {
+        for chunk_data in kv_hits {
             let Some(content) = chunk_data.get("content").and_then(|v| v.as_str()) else {
                 continue;
             };
@@ -1692,7 +1853,7 @@ fn compute_query_cache_key(query: &str, param: &QueryParam) -> String {
         _ => "null".to_string(),
     };
     let raw = format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         query,
         param.mode,
         param.top_k,
@@ -1711,6 +1872,12 @@ fn compute_query_cache_key(query: &str, param: &QueryParam) -> String {
         param.doc_id.as_deref().unwrap_or("null"),
         param.structure_scope.as_deref().unwrap_or("null"),
         param.biz_id,
+        // bizIds override: distinct biz sets must never share a cache entry.
+        if param.biz_ids.is_empty() {
+            "null".to_string()
+        } else {
+            param.biz_ids.join(",")
+        },
         param.enable_verification.map(|b| b.to_string()).as_deref().unwrap_or("null"),
         param.enable_citation_validation.map(|b| b.to_string()).as_deref().unwrap_or("null"),
         param.enable_evidence_scoring.map(|b| b.to_string()).as_deref().unwrap_or("null"),
@@ -1737,12 +1904,17 @@ struct DataPlan {
 
 /// Resolve a mode into the data path's behaviour (see [`DataPlan`]).
 ///
-/// Three of the seven rows are byte-for-byte what `query_data` did before R9:
-/// `naive` stays `Vector` (the compatibility promise its existing callers rely
-/// on), and `local`/`global`/`bypass` stay vector-recall + KG pass. The R9
-/// change is confined to `hybrid` and `mix`, which now recall the same way the
-/// synchronous answer paths always did; the R8 change is that `structure`
-/// skips the KG pass, which is the mode's whole point.
+/// `naive`, `hybrid` and `mix` all recall by fusion, the way the synchronous
+/// answer paths always have, so a caller asking for plain retrieval gets the
+/// same chunks here as it does from `/api/query` and the two endpoints cannot
+/// disagree about what the corpus holds. `local`/`global`/`bypass` stay
+/// vector-recall + KG pass, which is what `query_data` did before R9; the R8
+/// change is that `structure` skips the KG pass, which is the mode's whole
+/// point.
+///
+/// A fused plan needs a keyword index. A deployment without one still recalls
+/// by vector — `hybrid_chunk_query` falls back rather than failing — and says so
+/// via [`degrade::KEYWORD_SEARCH_UNAVAILABLE`].
 ///
 /// `bypass` keeping `run_kg: true` is a pre-existing oddity (it means "echo the
 /// query" on the answer path but still retrieves on the data path). It is left
@@ -1751,7 +1923,7 @@ struct DataPlan {
 fn data_plan(mode: QueryMode) -> DataPlan {
     match mode {
         QueryMode::Naive => DataPlan {
-            recall: Recall::Vector,
+            recall: Recall::Hybrid,
             run_kg: false,
             backfill_entity_chunks: false,
         },

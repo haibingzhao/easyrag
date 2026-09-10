@@ -117,6 +117,12 @@ pub struct QueryParam {
     /// boundary when omitted.
     #[serde(default = "default_biz_id")]
     pub biz_id: String,
+    /// Multi-biz filter override for the pure-data endpoint. Non-empty means
+    /// recall treats these biz lines as one corpus (single global top_k via
+    /// native set filtering) and `biz_id` is ignored; empty keeps the
+    /// single-biz contract byte-for-byte. Only `/api/query/data` reads this.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub biz_ids: Vec<String>,
 
     // Anti-hallucination guardrail overrides (per-request).
     // None = use config default.
@@ -160,6 +166,25 @@ fn default_biz_id() -> String {
     constants::DEFAULT_BIZ_ID.to_string()
 }
 
+impl QueryParam {
+    /// The biz-line set this query filters on: the multi-biz override when
+    /// non-empty (deduplicated, order-preserving), otherwise the single
+    /// normalized `biz_id`. Callers pass the result to the storage layer's
+    /// multi-biz read variants — a single-element result is the legacy
+    /// single-biz path.
+    pub fn effective_biz_ids(&self) -> Vec<String> {
+        if self.biz_ids.is_empty() {
+            return vec![self.biz_id.clone()];
+        }
+        let mut seen = std::collections::HashSet::new();
+        self.biz_ids
+            .iter()
+            .filter(|b| seen.insert(b.as_str()))
+            .cloned()
+            .collect()
+    }
+}
+
 impl Default for QueryParam {
     fn default() -> Self {
         Self {
@@ -186,10 +211,44 @@ impl Default for QueryParam {
             structure_scope: None,
             include_sections: None,
             biz_id: default_biz_id(),
+            biz_ids: Vec::new(),
             enable_verification: None,
             enable_citation_validation: None,
             enable_evidence_scoring: None,
             enable_query_routing: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod biz_ids_tests {
+    use super::*;
+
+    #[test]
+    fn empty_biz_ids_falls_back_to_the_single_biz_id() {
+        let param = QueryParam {
+            biz_id: "default".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(vec!["default".to_string()], param.effective_biz_ids());
+    }
+
+    #[test]
+    fn non_empty_biz_ids_override_and_deduplicate_in_order() {
+        let param = QueryParam {
+            biz_id: "ignored".to_string(),
+            biz_ids: vec![
+                "b2".to_string(),
+                "b1".to_string(),
+                "b2".to_string(),
+                "b1".to_string(),
+            ],
+            ..Default::default()
+        };
+        // First-seen order wins; `biz_id` is not mixed back in.
+        assert_eq!(
+            vec!["b2".to_string(), "b1".to_string()],
+            param.effective_biz_ids()
+        );
     }
 }

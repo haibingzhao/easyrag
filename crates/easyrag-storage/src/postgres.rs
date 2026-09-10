@@ -969,6 +969,62 @@ impl<D: PgDb> PgVectorStorage<D> {
         }
     }
 
+    /// Embed one query string, or pass through a pre-computed embedding —
+    /// the head shared by the single- and multi-biz vector recall paths.
+    async fn embed_for_query(
+        &self,
+        query: &str,
+        query_embedding: Option<&[f32]>,
+    ) -> easyrag_core::Result<Vec<f32>> {
+        match query_embedding {
+            Some(e) => Ok(e.to_vec()),
+            None => self
+                .embedding_func
+                .invoke(vec![query.to_string()], Some(EmbeddingContext::Query))
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    easyrag_core::CoreError::Internal("empty embedding result".to_string())
+                }),
+        }
+    }
+
+    /// Run a rendered vector-recall SQL statement and map rows to scored
+    /// records with the cosine threshold applied — the tail shared by the
+    /// single- and multi-biz paths, so the two cannot drift.
+    async fn collect_vector_hits(&self, sql: &str) -> easyrag_core::Result<Vec<JsonMap>> {
+        let rows = self.db.fetch_all(sql).await?;
+        let threshold = self.cosine_better_than_threshold();
+        let mut results = Vec::new();
+        for row in rows {
+            let mut content = read_content(&row).unwrap_or_default();
+            let similarity = row
+                .get("similarity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32;
+            if let Some(id) = row.get("id") {
+                content.insert("id".to_string(), id.clone());
+            }
+            // Row-level biz column: per-record biz provenance for the data
+            // endpoint's chunk projection (`biz_id`); exact even when the
+            // scope is a multi-biz `IN (...)`.
+            if let Some(biz) = row.get("biz_id") {
+                content.insert("biz_id".to_string(), biz.clone());
+            }
+            content.insert(
+                "score".to_string(),
+                serde_json::Number::from_f64(similarity as f64)
+                    .map(JsonValue::Number)
+                    .unwrap_or(JsonValue::Null),
+            );
+            if similarity >= threshold {
+                results.push(content);
+            }
+        }
+        Ok(results)
+    }
+
     /// SQL fragment for time-range filtering.
     /// R1: compare against the business create_time stored in the JSONB content
     /// (epoch seconds). Rows lacking create_time (e.g. entity vectors, pre-R1
@@ -1141,22 +1197,11 @@ impl<D: PgDb> VectorStorage for PgVectorStorage<D> {
         time_range_end: Option<i64>,
         biz_id: &str,
     ) -> easyrag_core::Result<Vec<JsonMap>> {
-        let embedding: Vec<f32> = match query_embedding {
-            Some(e) => e.to_vec(),
-            None => self
-                .embedding_func
-                .invoke(vec![query.to_string()], Some(EmbeddingContext::Query))
-                .await?
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    easyrag_core::CoreError::Internal("empty embedding result".to_string())
-                })?,
-        };
+        let embedding = self.embed_for_query(query, query_embedding).await?;
         let vector_str = vector_literal(&embedding);
         let time_filter = self.time_filter(time_range_start, time_range_end);
         let sql = format!(
-            "SELECT id, content, 1 - (embedding <=> '{vector_str}'::vector) as similarity
+            "SELECT id, biz_id, content, 1 - (embedding <=> '{vector_str}'::vector) as similarity
              FROM {t}
              WHERE {scope} AND embedding IS NOT NULL{time_filter}
              ORDER BY embedding <=> '{vector_str}'::vector
@@ -1166,29 +1211,42 @@ impl<D: PgDb> VectorStorage for PgVectorStorage<D> {
             // workspace (BC-12/A-5), matching `list_scope_clause` on doc status.
             scope = self.list_scope_clause(biz_id)
         );
-        let rows = self.db.fetch_all(&sql).await?;
-        let threshold = self.cosine_better_than_threshold();
-        let mut results = Vec::new();
-        for row in rows {
-            let mut content = read_content(&row).unwrap_or_default();
-            let similarity = row
-                .get("similarity")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0) as f32;
-            if let Some(id) = row.get("id") {
-                content.insert("id".to_string(), id.clone());
-            }
-            content.insert(
-                "score".to_string(),
-                serde_json::Number::from_f64(similarity as f64)
-                    .map(JsonValue::Number)
-                    .unwrap_or(JsonValue::Null),
-            );
-            if similarity >= threshold {
-                results.push(content);
-            }
+        self.collect_vector_hits(&sql).await
+    }
+
+    /// Native set-filter recall (bizIds): one SQL statement, one global top_k
+    /// ordered by cosine distance across every requested biz line. The row
+    /// mapping and threshold are the single-biz ones via
+    /// [`Self::collect_vector_hits`]; only the scope clause differs.
+    async fn query_multi_biz(
+        &self,
+        query: &str,
+        top_k: usize,
+        query_embedding: Option<&[f32]>,
+        time_range_start: Option<i64>,
+        time_range_end: Option<i64>,
+        biz_ids: &[&str],
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        if biz_ids.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(results)
+        let embedding = self.embed_for_query(query, query_embedding).await?;
+        let vector_str = vector_literal(&embedding);
+        let time_filter = self.time_filter(time_range_start, time_range_end);
+        let sql = format!(
+            "SELECT id, biz_id, content, 1 - (embedding <=> '{vector_str}'::vector) as similarity
+             FROM {t}
+             WHERE {scope} AND embedding IS NOT NULL{time_filter}
+             ORDER BY embedding <=> '{vector_str}'::vector
+             LIMIT {top_k}",
+            t = self.table_name,
+            // Multi-biz path: `biz_id IN (...)`, same workspace pin as the
+            // list path. The scope's own biz half is unused by this renderer.
+            scope = self
+                .tenant_scope(biz_ids.first().copied().unwrap_or_default())
+                .list_sql_in(None, biz_ids)
+        );
+        self.collect_vector_hits(&sql).await
     }
 
     async fn upsert(&self, data: HashMap<String, JsonMap>, biz_id: &str) -> easyrag_core::Result<()> {
@@ -1350,7 +1408,7 @@ impl<D: PgDb> KeywordSearchable for PgVectorStorage<D> {
         let fts = sql_escape(&self.config.fts_config);
         let time_filter = self.time_filter(time_range_start, time_range_end);
         let sql = format!(
-            "SELECT id, content, ts_rank_cd(content_tsv, to_tsquery('{fts}', '{tsq}')) as rank
+            "SELECT id, biz_id, content, ts_rank_cd(content_tsv, to_tsquery('{fts}', '{tsq}')) as rank
              FROM {t}
              WHERE {scope} AND content_tsv @@ to_tsquery('{fts}', '{tsq}'){time_filter}
              ORDER BY rank DESC
@@ -1366,6 +1424,82 @@ impl<D: PgDb> KeywordSearchable for PgVectorStorage<D> {
             let mut content = read_content(&row).unwrap_or_default();
             if let Some(id) = row.get("id") {
                 content.insert("id".to_string(), id.clone());
+            }
+            // Row-level biz column: per-record biz provenance, matching
+            // `collect_vector_hits`.
+            if let Some(biz) = row.get("biz_id") {
+                content.insert("biz_id".to_string(), biz.clone());
+            }
+            let rank = row.get("rank").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            content.insert(
+                "score".to_string(),
+                serde_json::Number::from_f64(rank)
+                    .map(JsonValue::Number)
+                    .unwrap_or(JsonValue::Null),
+            );
+            results.push(content);
+        }
+        Ok(results)
+    }
+
+    /// Native set-filter keyword recall (bizIds): same tsquery as the
+    /// single-biz path, one `biz_id IN (...)` scope, one global top_k ordered
+    /// by ts_rank_cd. Row mapping is shared verbatim.
+    async fn keyword_query_multi_biz(
+        &self,
+        query: &str,
+        top_k: usize,
+        time_range_start: Option<i64>,
+        time_range_end: Option<i64>,
+        biz_ids: &[&str],
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        if biz_ids.is_empty() || query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        // tsquery: prefix-match each term with OR semantics.
+        // Strip tsquery operator characters so user input cannot produce an
+        // invalid tsquery (which would fail at runtime instead of matching).
+        let ts_query = query
+            .split_whitespace()
+            .map(|term| {
+                let cleaned: String = term
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                    .collect();
+                format!("{cleaned}:*")
+            })
+            .filter(|t| t != ":*")
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if ts_query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let fts = sql_escape(&self.config.fts_config);
+        let time_filter = self.time_filter(time_range_start, time_range_end);
+        let sql = format!(
+            "SELECT id, biz_id, content, ts_rank_cd(content_tsv, to_tsquery('{fts}', '{tsq}')) as rank
+             FROM {t}
+             WHERE {scope} AND content_tsv @@ to_tsquery('{fts}', '{tsq}'){time_filter}
+             ORDER BY rank DESC
+             LIMIT {top_k}",
+            tsq = sql_escape(&ts_query),
+            t = self.table_name,
+            // Multi-biz path: `biz_id IN (...)`, see `query_multi_biz`.
+            scope = self
+                .tenant_scope(biz_ids.first().copied().unwrap_or_default())
+                .list_sql_in(None, biz_ids)
+        );
+        let rows = self.db.fetch_all(&sql).await?;
+        let mut results = Vec::new();
+        for row in rows {
+            let mut content = read_content(&row).unwrap_or_default();
+            if let Some(id) = row.get("id") {
+                content.insert("id".to_string(), id.clone());
+            }
+            // Row-level biz column: per-record biz provenance, matching
+            // `collect_vector_hits`.
+            if let Some(biz) = row.get("biz_id") {
+                content.insert("biz_id".to_string(), biz.clone());
             }
             let rank = row.get("rank").and_then(|v| v.as_f64()).unwrap_or(0.0);
             content.insert(

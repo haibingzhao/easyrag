@@ -21,7 +21,7 @@ pub use evaluation::{
 pub use query_param::{QueryParam, QueryMode};
 pub use query_result::{QueryContextResult, QueryResult, TextChunk};
 pub use scan_task::{ScanCycleStats, ScanPosition, ScanTaskKind, ScanTaskSpec};
-pub use scope::{AsTenantScope, TenantScope, TenantScopeRef};
+pub use scope::{validate_scope_name, AsTenantScope, TenantScope, TenantScopeRef};
 pub use source_id::{
     merge_source_ids, parse_source_ids, source_id_intersects, source_ids_intersect,
     source_ids_value,

@@ -207,6 +207,9 @@ async fn query_result_contains_expected_fields() {
     assert_eq!("hello world test", result["content"].as_str().unwrap());
     assert_eq!("test.txt", result["file_path"].as_str().unwrap());
     assert!(result["score"].as_f64().unwrap() > 0.0);
+    // The stored biz field rides every hit: per-record biz provenance for
+    // the data endpoint's chunk projection (`biz_id`).
+    assert_eq!(BIZ, result["biz_id"].as_str().unwrap());
     search.close().unwrap();
 }
 

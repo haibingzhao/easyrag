@@ -84,6 +84,59 @@ impl InMemoryVectorStorage {
             .await?;
         Ok(results.into_iter().next().unwrap_or_default())
     }
+
+    /// Scored scan shared by the single- and multi-biz recall paths: `biz`
+    /// membership is the only difference between the two, so it is injected as
+    /// a predicate and the ranking/truncation rules cannot drift.
+    fn scored_scan(
+        &self,
+        embedding: &[f32],
+        top_k: usize,
+        time_range_start: Option<i64>,
+        time_range_end: Option<i64>,
+        biz_allowed: &dyn Fn(&str) -> bool,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        let mut results: Vec<(f32, JsonMap)> = Vec::new();
+        let data = self.data.lock();
+        for (id, entry) in data.iter() {
+            if !biz_allowed(&entry.biz) {
+                continue;
+            }
+            // Time range filtering.
+            let create_time = entry
+                .metadata
+                .get("create_time")
+                .and_then(|v| v.as_i64());
+            if let (Some(start), Some(ct)) = (time_range_start, create_time) {
+                if ct < start {
+                    continue;
+                }
+            }
+            if let (Some(end), Some(ct)) = (time_range_end, create_time) {
+                if ct > end {
+                    continue;
+                }
+            }
+
+            let similarity = cosine_similarity(embedding, &entry.vector)?;
+            if similarity > self.cosine_better_than_threshold {
+                let mut result = entry.metadata.clone();
+                result.insert("id".to_string(), serde_json::Value::String(id.clone()));
+                // Per-record biz provenance for the data endpoint's chunk
+                // projection (`biz_id`); the entry's own biz line is exact.
+                result.insert(
+                    "biz_id".to_string(),
+                    serde_json::Value::String(entry.biz.clone()),
+                );
+                result.insert("distance".to_string(), serde_json::Value::from(similarity));
+                results.push((similarity, result));
+            }
+        }
+        drop(data);
+
+        results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(results.into_iter().take(top_k).map(|(_, m)| m).collect())
+    }
 }
 
 #[async_trait]
@@ -145,41 +198,38 @@ impl VectorStorage for InMemoryVectorStorage {
                 &owned_embedding
             }
         };
+        self.scored_scan(embedding, top_k, time_range_start, time_range_end, &|biz| {
+            biz == biz_id
+        })
+    }
 
-        let mut results: Vec<(f32, JsonMap)> = Vec::new();
-        let data = self.data.lock();
-        for (id, entry) in data.iter() {
-            if entry.biz != biz_id {
-                continue;
-            }
-            // Time range filtering.
-            let create_time = entry
-                .metadata
-                .get("create_time")
-                .and_then(|v| v.as_i64());
-            if let (Some(start), Some(ct)) = (time_range_start, create_time) {
-                if ct < start {
-                    continue;
-                }
-            }
-            if let (Some(end), Some(ct)) = (time_range_end, create_time) {
-                if ct > end {
-                    continue;
-                }
-            }
-
-            let similarity = cosine_similarity(embedding, &entry.vector)?;
-            if similarity > self.cosine_better_than_threshold {
-                let mut result = entry.metadata.clone();
-                result.insert("id".to_string(), serde_json::Value::String(id.clone()));
-                result.insert("distance".to_string(), serde_json::Value::from(similarity));
-                results.push((similarity, result));
-            }
+    /// Native set-membership recall (bizIds): one scan over the whole map with
+    /// the requested biz set, one global top_k — exact, since the scan is
+    /// brute-force anyway.
+    async fn query_multi_biz(
+        &self,
+        query: &str,
+        top_k: usize,
+        query_embedding: Option<&[f32]>,
+        time_range_start: Option<i64>,
+        time_range_end: Option<i64>,
+        biz_ids: &[&str],
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        if biz_ids.is_empty() {
+            return Ok(Vec::new());
         }
-        drop(data);
-
-        results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(results.into_iter().take(top_k).map(|(_, m)| m).collect())
+        let owned_embedding;
+        let embedding: &[f32] = match query_embedding {
+            Some(e) => e,
+            None => {
+                owned_embedding = self.compute_embedding(query).await?;
+                &owned_embedding
+            }
+        };
+        let wanted: HashSet<&str> = biz_ids.iter().copied().collect();
+        self.scored_scan(embedding, top_k, time_range_start, time_range_end, &|biz| {
+            wanted.contains(biz)
+        })
     }
 
     async fn upsert(&self, data: HashMap<String, JsonMap>, biz_id: &str) -> easyrag_core::Result<()> {

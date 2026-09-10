@@ -70,6 +70,22 @@ impl From<TenantScopeRef<'_>> for TenantScope {
     }
 }
 
+/// Charset rule for workspace and biz_id names, defined once because both land
+/// in SQL/Cypher/file paths: 1-64 chars, alphanumeric/underscore/hyphen/dot,
+/// starting with alphanumeric/underscore/hyphen. The app-level
+/// `validate_workspace` and the multi-biz REST boundary
+/// (`/api/query/data` bizIds elements) both delegate here.
+pub fn validate_scope_name(name: &str) -> Result<(), String> {
+    let pattern = regex::Regex::new(r"^[a-zA-Z0-9_\-][a-zA-Z0-9_\-.]{0,63}$").unwrap();
+    if !pattern.is_match(name) {
+        return Err(format!(
+            "Invalid scope name '{name}': must be 1-64 chars, \
+             alphanumeric/underscore/hyphen/dot, starting with alphanumeric/underscore/hyphen"
+        ));
+    }
+    Ok(())
+}
+
 /// Accessor shared by the owned and borrowed forms, so a single renderer
 /// definition serves both without `dyn` or extra allocation.
 pub trait AsTenantScope {

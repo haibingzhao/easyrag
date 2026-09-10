@@ -84,6 +84,12 @@ pub struct QueryRequest {
     // biz_id: request-level business line routing (optional, default "default")
     #[serde(default)]
     pub biz_id: Option<String>,
+    // bizIds: multi-biz recall override, honored ONLY by /api/query/data —
+    // the other handlers never read it. Non-empty (after trim/dedupe)
+    // replaces `biz_id` as the recall corpus with one global top_k; an empty
+    // array or a missing field keeps the single-biz contract byte-for-byte.
+    #[serde(default)]
+    pub biz_ids: Option<Vec<String>>,
     // Anti-hallucination guardrail per-request overrides
     #[serde(default)]
     pub enable_verification: Option<bool>,
@@ -201,16 +207,48 @@ async fn query(state: AppState, Json(request): Json<QueryRequest>) -> AppResult<
     }
 }
 
+/// Normalize a raw `bizIds` array into the request's recall set: trim, drop
+/// blanks, dedupe (order-preserving). Every surviving element must pass the
+/// shared scope-name charset rule — these values land in SQL/Cypher predicates.
+/// Returns `None` when nothing survives, which restores the single-biz path.
+fn normalize_biz_ids(raw: &[String]) -> AppResult<Option<Vec<String>>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for id in raw {
+        let id = id.trim();
+        if id.is_empty() || !seen.insert(id) {
+            continue;
+        }
+        easyrag_core::model::validate_scope_name(id).map_err(AppError::bad_request)?;
+        out.push(id.to_string());
+    }
+    Ok(if out.is_empty() { None } else { Some(out) })
+}
+
 async fn query_data(
     state: AppState,
     Json(request): Json<QueryRequest>,
 ) -> AppResult<Json<Value>> {
+    // bizIds override: resolve once — the workspace is unchanged — and let the
+    // first element ride the normal biz_id normalization path so a bad value
+    // fails the same way a bad biz_id would.
+    let biz_ids = match &request.biz_ids {
+        Some(raw) => normalize_biz_ids(raw)?,
+        None => None,
+    };
+    let resolve_biz = biz_ids
+        .as_ref()
+        .and_then(|ids| ids.first().map(String::as_str))
+        .or(request.biz_id.as_deref());
     let resolved = state
         .workspace_resolver
-        .resolve(request.workspace.as_deref(), request.biz_id.as_deref())
+        .resolve(request.workspace.as_deref(), resolve_biz)
         .await?;
     let engine = resolved.context.query_engine;
-    let param = build_query_param(&request, &resolved.biz_id);
+    let mut param = build_query_param(&request, &resolved.biz_id);
+    if let Some(ids) = biz_ids {
+        param.biz_ids = ids;
+    }
     let result = engine.query_data(&request.query, &param).await?;
     // The last four keys are the R8 additions; see
     // `.docs/easyrag-data-endpoint-mode-matrix.md` for the mode matrix and the

@@ -128,6 +128,9 @@ struct MockVectorStorage {
     /// honours `take(top_k)`, so recording it makes the budget each retrieval
     /// path reads directly assertable.
     requested_top_k: Mutex<Vec<usize>>,
+    /// Every biz set the multi-biz variant was called with, in order. Empty
+    /// means no retrieval path took the multi-biz branch.
+    requested_biz_sets: Mutex<Vec<Vec<String>>>,
 }
 
 impl MockVectorStorage {
@@ -137,11 +140,16 @@ impl MockVectorStorage {
             embedding_func: test_embedding_func(),
             global_config: JsonMap::new(),
             requested_top_k: Mutex::new(Vec::new()),
+            requested_biz_sets: Mutex::new(Vec::new()),
         }
     }
 
     fn top_k_requests(&self) -> Vec<usize> {
         self.requested_top_k.lock().unwrap().clone()
+    }
+
+    fn biz_set_requests(&self) -> Vec<Vec<String>> {
+        self.requested_biz_sets.lock().unwrap().clone()
     }
 }
 
@@ -161,6 +169,22 @@ impl VectorStorage for MockVectorStorage {
         _biz_id: &str,
     ) -> easyrag_core::Result<Vec<JsonMap>> {
         self.requested_top_k.lock().unwrap().push(top_k);
+        Ok(self.results.iter().take(top_k).cloned().collect())
+    }
+
+    async fn query_multi_biz(
+        &self,
+        _query: &str,
+        top_k: usize,
+        _query_embedding: Option<&[f32]>,
+        _time_range_start: Option<i64>,
+        _time_range_end: Option<i64>,
+        biz_ids: &[&str],
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        self.requested_biz_sets
+            .lock()
+            .unwrap()
+            .push(biz_ids.iter().map(|s| s.to_string()).collect());
         Ok(self.results.iter().take(top_k).cloned().collect())
     }
 
@@ -946,6 +970,192 @@ async fn query_data_naive_mode_returns_chunks_without_entities() {
 }
 
 #[tokio::test]
+async fn query_data_chunk_biz_id_backfills_the_single_biz_param() {
+    // The projection always carries `biz_id`; a backend that does not echo it
+    // (the mock below returns raw chunk maps) falls back to the normalized
+    // single-biz `param.biz_id`.
+    let llm = Arc::new(MockLlm::new("SHOULD_NOT_APPEAR"));
+    let engine = engine_with(Arc::clone(&llm), vec![chunk("data chunk", "doc1")]);
+    let param = QueryParam {
+        mode: QueryMode::Naive,
+        biz_id: "single".to_string(),
+        ..Default::default()
+    };
+
+    let data = engine.query_data("q", &param).await.unwrap();
+    assert_eq!(data.chunks.len(), 1);
+    assert_eq!(
+        data.chunks[0].get("biz_id").and_then(|v| v.as_str()),
+        Some("single")
+    );
+}
+
+#[tokio::test]
+async fn query_data_chunk_biz_id_prefers_the_storage_echoed_biz_line() {
+    // Multi-biz recall: a record's own `biz_id` from storage must reach the
+    // projection verbatim — never the first requested biz (`param.biz_id`).
+    let llm = Arc::new(MockLlm::new("SHOULD_NOT_APPEAR"));
+    let mut tagged = chunk("data chunk", "doc1");
+    tagged.insert("biz_id".into(), JsonValue::String("b2".into()));
+    let store = Arc::new(MockVectorStorage::new(vec![tagged]));
+    let engine = engine_with_shared_vector(Arc::clone(&llm), Arc::clone(&store));
+    let param = QueryParam {
+        mode: QueryMode::Naive,
+        biz_id: "single".to_string(),
+        biz_ids: vec!["b1".to_string(), "b2".to_string()],
+        ..Default::default()
+    };
+
+    let data = engine.query_data("q", &param).await.unwrap();
+    assert_eq!(data.chunks.len(), 1);
+    assert_eq!(
+        data.chunks[0].get("biz_id").and_then(|v| v.as_str()),
+        Some("b2")
+    );
+}
+
+// ---------------------------------------------------------------------
+// query_data bizIds (multi-biz recall)
+// ---------------------------------------------------------------------
+
+/// Engine wired to a shared MockVectorStorage handle so the biz-set recording
+/// survives the Arc into the engine.
+fn engine_with_shared_vector(llm: Arc<MockLlm>, store: Arc<MockVectorStorage>) -> QueryEngine {
+    QueryEngine::new(
+        llm,
+        store as Arc<dyn VectorStorage>,
+        Arc::new(InMemoryGraphStorage::new("test", "test")),
+        Arc::new(InMemoryKVStorage::new("test", "test")),
+    )
+}
+
+#[tokio::test]
+async fn query_data_biz_ids_recall_via_the_multi_biz_variant() {
+    let llm = Arc::new(MockLlm::new("SHOULD_NOT_APPEAR"));
+    let store = Arc::new(MockVectorStorage::new(vec![chunk("data chunk", "doc1")]));
+    let engine = engine_with_shared_vector(Arc::clone(&llm), Arc::clone(&store));
+    let param = QueryParam {
+        mode: QueryMode::Naive,
+        biz_id: "single".to_string(),
+        biz_ids: vec!["b1".to_string(), "b2".to_string()],
+        ..Default::default()
+    };
+
+    let data = engine.query_data("q", &param).await.unwrap();
+    assert_eq!(data.chunks.len(), 1);
+    // The exact requested set reaches the store; `biz_id` is ignored, so the
+    // single-biz variant is never consulted.
+    assert_eq!(
+        store.biz_set_requests(),
+        vec![vec!["b1".to_string(), "b2".to_string()]]
+    );
+    assert!(store.top_k_requests().is_empty());
+}
+
+#[tokio::test]
+async fn query_data_single_element_biz_ids_still_takes_the_multi_biz_path() {
+    // bizIds=["b1"] is a request to recall from b1 **instead of** the resolved
+    // `biz_id`, so it must ride the multi-biz filter (IN ('b1')), not fall
+    // back to whatever `biz_id` was normalized to.
+    let llm = Arc::new(MockLlm::new("SHOULD_NOT_APPEAR"));
+    let store = Arc::new(MockVectorStorage::new(vec![chunk("data chunk", "doc1")]));
+    let engine = engine_with_shared_vector(Arc::clone(&llm), Arc::clone(&store));
+    let param = QueryParam {
+        mode: QueryMode::Naive,
+        biz_id: "single".to_string(),
+        biz_ids: vec!["b1".to_string()],
+        ..Default::default()
+    };
+
+    engine.query_data("q", &param).await.unwrap();
+    assert_eq!(store.biz_set_requests(), vec![vec!["b1".to_string()]]);
+    assert!(store.top_k_requests().is_empty());
+}
+
+#[tokio::test]
+async fn query_data_without_biz_ids_keeps_the_single_biz_recall_path() {
+    let llm = Arc::new(MockLlm::new("SHOULD_NOT_APPEAR"));
+    let store = Arc::new(MockVectorStorage::new(vec![chunk("data chunk", "doc1")]));
+    let engine = engine_with_shared_vector(Arc::clone(&llm), Arc::clone(&store));
+    let param = QueryParam {
+        mode: QueryMode::Naive,
+        ..Default::default()
+    };
+
+    engine.query_data("q", &param).await.unwrap();
+    assert!(store.biz_set_requests().is_empty());
+    assert_eq!(store.top_k_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn query_data_biz_ids_with_sections_emit_the_structure_marker() {
+    // Signal hygiene: the marker fires only when sections were actually asked
+    // for, and then INSTEAD of running a tree search scoped to one biz line.
+    let llm = Arc::new(MockLlm::new("SHOULD_NOT_APPEAR"));
+    let engine = engine_with(Arc::clone(&llm), vec![chunk("data chunk", "doc1")]);
+    let param = QueryParam {
+        mode: QueryMode::Naive,
+        biz_ids: vec!["b1".to_string(), "b2".to_string()],
+        include_sections: Some(true),
+        ..Default::default()
+    };
+
+    let data = engine.query_data("q", &param).await.unwrap();
+    assert!(data.sections.is_empty());
+    assert!(data
+        .degrade_reasons
+        .contains(&"structure_multi_biz_unsupported".to_string()));
+}
+
+#[tokio::test]
+async fn query_data_biz_ids_without_sections_emit_no_structure_marker() {
+    // Bypass keeps the signal surface clean: the fused modes flag
+    // `keyword_search_unavailable` in this fixture (no keyword index), which
+    // would mask the structure marker's absence.
+    let llm = Arc::new(MockLlm::new("SHOULD_NOT_APPEAR"));
+    let engine = engine_with(Arc::clone(&llm), vec![chunk("data chunk", "doc1")]);
+    let param = QueryParam {
+        mode: QueryMode::Bypass,
+        biz_ids: vec!["b1".to_string(), "b2".to_string()],
+        ..Default::default()
+    };
+
+    let data = engine.query_data("q", &param).await.unwrap();
+    assert!(!data.degraded);
+    assert!(data.degrade_reasons.is_empty());
+}
+
+#[tokio::test]
+async fn cache_key_distinguishes_distinct_biz_id_sets() {
+    // The cache key carries the bizIds join, so two different biz sets over
+    // the same query must never share a cache entry — while a repeated call
+    // with the same set still hits it.
+    let llm = Arc::new(MockLlm::new("the answer"));
+    let engine = engine_with(Arc::clone(&llm), vec![chunk("some content", "doc1")]);
+
+    let a = QueryParam {
+        mode: QueryMode::Naive,
+        biz_ids: vec!["b1".to_string(), "b2".to_string()],
+        ..Default::default()
+    };
+    let b = QueryParam {
+        mode: QueryMode::Naive,
+        biz_ids: vec!["b1".to_string(), "b3".to_string()],
+        ..Default::default()
+    };
+
+    engine.query("q", &a).await.unwrap();
+    engine.query("q", &b).await.unwrap();
+    engine.query("q", &a).await.unwrap();
+    // Calls: set {b1,b2} miss, set {b1,b3} miss, repeat of {b1,b2} hit.
+    assert_eq!(
+        llm.call_count(),
+        2,
+        "distinct biz sets must not share a cache entry"
+    );
+}
+
+#[tokio::test]
 async fn query_with_references_maps_reference_ids() {
     let llm = Arc::new(MockLlm::new("the answer"));
     let chunks = vec![
@@ -1557,7 +1767,7 @@ fn fused_engine() -> (Arc<QueryEngine>, Arc<MockKeywordSearch>) {
 }
 
 #[tokio::test]
-async fn only_the_answer_paths_fuse_keyword_hits() {
+async fn keyword_fusion_follows_the_plan_not_the_endpoint() {
     let (engine, keyword) = fused_engine();
 
     // Graph answer path: RRF-fused, so the context carries both hits.
@@ -1568,7 +1778,9 @@ async fn only_the_answer_paths_fuse_keyword_hits() {
     assert!(context.contains("keyword-only hit"), "{context}");
     assert_eq!(keyword.call_count(), 1);
 
-    // Pure-data path: vector recall only.
+    // Pure-data path on a fused plan: same two hits as the answer path above.
+    // Whether a path touches the keyword store is decided by its `Recall`, not
+    // by which endpoint it serves.
     let data = engine
         .query_data("q", &budgeted_param(QueryMode::Naive))
         .await
@@ -1578,19 +1790,19 @@ async fn only_the_answer_paths_fuse_keyword_hits() {
         .iter()
         .filter_map(|c| c.get("content").and_then(|v| v.as_str()))
         .collect();
-    assert_eq!(contents, vec!["vector hit"]);
+    assert_eq!(contents, vec!["vector hit", "keyword-only hit"]);
     assert_eq!(
         keyword.call_count(),
-        1,
-        "the naive data path must not fuse keyword hits"
+        2,
+        "the naive data plan fuses, exactly like the naive answer path"
     );
 
-    // Streaming naive prompt: vector recall only, like the sync data path.
+    // Streaming naive prompt: still vector-only, the one answer path that is.
     let mut stream = engine.query_stream("q", &budgeted_param(QueryMode::Naive));
     while stream.next().await.is_some() {}
     assert_eq!(
         keyword.call_count(),
-        1,
+        2,
         "the streaming prompt path must not fuse keyword hits"
     );
 
@@ -1599,7 +1811,7 @@ async fn only_the_answer_paths_fuse_keyword_hits() {
         .query("q2", &budgeted_param(QueryMode::Naive))
         .await
         .unwrap();
-    assert_eq!(keyword.call_count(), 2);
+    assert_eq!(keyword.call_count(), 3);
 }
 
 /// Reranker that records `(document_count, top_n)` per call and reverses the
@@ -2034,8 +2246,9 @@ async fn data_plan_truth_table() {
     // a chunk recall reads 7 and a KG entity search reads 3 — a path reading the
     // wrong budget cannot pass by coincidence.
     let expectations: [(QueryMode, Vec<usize>, usize); 7] = [
-        // naive: vector-only recall, no KG pass. The compatibility promise.
-        (QueryMode::Naive, vec![7], 0),
+        // naive: fused recall — the same chunks the naive answer path sees —
+        // but no KG pass, which is what still separates it from `hybrid`.
+        (QueryMode::Naive, vec![7], 1),
         // hybrid: fused recall (one vector + one keyword call), KG pass, no
         // entity backfill.
         (QueryMode::Hybrid, vec![7, 3], 1),
@@ -2171,10 +2384,11 @@ async fn query_data_mix_mode_appends_entity_related_chunks() {
     assert_eq!(data.entities.len(), 1);
 }
 
-/// R9 compatibility promise, pinned explicitly: `naive` stays vector-only no
-/// matter what else changes on this endpoint.
+/// `naive` recalls exactly like `hybrid`, which is the point: the two endpoints
+/// must not disagree about what the corpus holds. What still separates it from
+/// `hybrid` is everything *after* recall — no KG pass, no entity backfill.
 #[tokio::test]
-async fn query_data_naive_mode_still_vector_only() {
+async fn query_data_naive_mode_fuses_but_skips_the_kg_pass() {
     let (engine, keyword) = fused_engine();
     let data = engine
         .query_data("q", &budgeted_param(QueryMode::Naive))
@@ -2185,13 +2399,9 @@ async fn query_data_naive_mode_still_vector_only() {
         .iter()
         .filter_map(|c| c.get("content").and_then(|v| v.as_str()))
         .collect();
-    assert_eq!(contents, vec!["vector hit"]);
-    assert_eq!(
-        keyword.call_count(),
-        0,
-        "naive must never touch the keyword store"
-    );
-    assert!(data.entities.is_empty());
+    assert_eq!(contents, vec!["vector hit", "keyword-only hit"]);
+    assert_eq!(keyword.call_count(), 1, "naive recalls by fusion");
+    assert!(data.entities.is_empty(), "but runs no KG pass");
     assert!(data.relations.is_empty());
     assert!(data.sections.is_empty());
     assert!(
@@ -2536,47 +2746,61 @@ async fn query_data_structure_degrades_explicitly() {
     assert!(data.degraded);
     assert_eq!(data.degrade_reasons, vec![degrade::NO_INDEX]);
 
-    // Signal hygiene: not asking for sections is not degradation.
+    // Signal hygiene: not asking for sections is not *structure* degradation.
+    // This engine wires no keyword index and `naive` now recalls by fusion, so
+    // the recall gap is legitimately reported — what must never happen is a
+    // structure reason appearing for a request that asked for no sections.
     let mut naive = QueryParam::default();
     naive.mode = QueryMode::Naive;
     let data = engine.query_data("q", &naive).await.unwrap();
     assert!(
-        !data.degraded,
+        !data
+            .degrade_reasons
+            .iter()
+            .any(|reason| reason.starts_with("structure_")),
         "a mode that never requested structure must not report structure reasons: {:?}",
         data.degrade_reasons
     );
 }
 
-/// R9/D3 signal hygiene: the missing-keyword-index marker fires only for a plan
-/// that actually asked for fusion. Tagging every naive request would train
-/// clients to ignore it.
+/// R9/D3 signal hygiene: the missing-keyword-index marker tracks the plan's
+/// recall strategy, not the mode's name. Every fused mode reports it — `naive`
+/// included, which is this endpoint's most common mode — and the vector-only
+/// ones stay clean, so the marker still means exactly "you asked for fusion and
+/// did not get it".
 #[tokio::test]
-async fn keyword_search_unavailable_flagged_only_for_hybrid_plan() {
+async fn keyword_search_unavailable_follows_the_recall_plan() {
     let llm = Arc::new(MockLlm::new("the answer"));
     // No `.with_keyword_search`, so hybrid recall silently degrades to vector.
     let engine = engine_with(llm, vec![chunk("only vector", "doc1")]);
 
-    let mut naive = QueryParam::default();
-    naive.mode = QueryMode::Naive;
-    let data = engine.query_data("q", &naive).await.unwrap();
+    for mode in [QueryMode::Naive, QueryMode::Hybrid] {
+        let mut param = QueryParam::default();
+        param.mode = mode;
+        param.hl_keywords = vec!["manual".to_string()];
+        let data = engine.query_data("q", &param).await.unwrap();
+        assert_eq!(
+            data.degrade_reasons,
+            vec![degrade::KEYWORD_SEARCH_UNAVAILABLE],
+            "mode {mode:?} recalls by fusion, so the missing index is reported"
+        );
+        // The recall still happened — degraded, not failed.
+        assert_eq!(data.chunks.len(), 1);
+    }
+
+    // A vector-only plan never asked for a keyword index, so it must not be
+    // told one is missing. (`structure` reports its own gap instead: this
+    // engine has no structure strategy wired.)
+    let mut structure = QueryParam::default();
+    structure.mode = QueryMode::Structure;
+    let data = engine.query_data("q", &structure).await.unwrap();
     assert!(
-        !data.degraded,
-        "naive never asked for a keyword index: {:?}",
+        !data
+            .degrade_reasons
+            .contains(&degrade::KEYWORD_SEARCH_UNAVAILABLE.to_string()),
+        "a vector-only plan must not report a missing keyword index: {:?}",
         data.degrade_reasons
     );
-
-    let mut hybrid = QueryParam::default();
-    hybrid.mode = QueryMode::Hybrid;
-    hybrid.hl_keywords = vec!["manual".to_string()];
-    let data = engine.query_data("q", &hybrid).await.unwrap();
-    assert!(data.degraded);
-    assert_eq!(
-        data.degrade_reasons,
-        vec![degrade::KEYWORD_SEARCH_UNAVAILABLE],
-        "hybrid without a keyword index must be reported"
-    );
-    // The recall still happened — degraded, not failed.
-    assert_eq!(data.chunks.len(), 1);
 }
 
 /// R11: the registry walk is no longer capped at one page. Only the 120th

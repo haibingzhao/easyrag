@@ -28,6 +28,35 @@ pub trait KeywordSearchable: Send + Sync {
         biz_id: &str,
     ) -> crate::Result<Vec<JsonMap>>;
 
+    /// Multi-biz variant for `/api/query/data` (bizIds): the biz lines are one
+    /// corpus, single global top_k. Backends with a native set filter
+    /// (tantivy terms query, PostgreSQL `biz_id = ANY(...)`) override for exact
+    /// ordering; the default merges per-biz results by the shared
+    /// score-descending rule.
+    async fn keyword_query_multi_biz(
+        &self,
+        query: &str,
+        top_k: usize,
+        time_range_start: Option<i64>,
+        time_range_end: Option<i64>,
+        biz_ids: &[&str],
+    ) -> crate::Result<Vec<JsonMap>> {
+        if biz_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut batches = Vec::with_capacity(biz_ids.len());
+        for biz in biz_ids {
+            batches.push(crate::storage::traits::tag_multi_biz_batch(
+                self.keyword_query(query, top_k, time_range_start, time_range_end, biz)
+                    .await?,
+                biz,
+            ));
+        }
+        Ok(crate::storage::traits::merge_multi_biz_scored(
+            batches, top_k,
+        ))
+    }
+
     /// Batch index documents (called during ingestion).
     /// `docs` maps docId -> document data (must contain "content" key).
     async fn index_documents(

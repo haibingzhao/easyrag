@@ -365,6 +365,119 @@ mod vector {
     }
 
     #[tokio::test]
+    async fn query_multi_biz_filters_by_set_membership() {
+        let storage = create_storage(4);
+        storage
+            .upsert(
+                HashMap::from([
+                    ("v1".to_string(), json_map(json!({"content": "aa"}))),
+                    ("v2".to_string(), json_map(json!({"content": "bbbb"}))),
+                    ("v3".to_string(), json_map(json!({"content": "cccccc"}))),
+                ]),
+                "b1",
+            )
+            .await
+            .unwrap();
+        storage
+            .upsert(
+                HashMap::from([("v2".to_string(), json_map(json!({"content": "bbbb"})))]),
+                "b2",
+            )
+            .await
+            .unwrap();
+        storage
+            .upsert(
+                HashMap::from([("v3".to_string(), json_map(json!({"content": "cccccc"})))]),
+                "b3",
+            )
+            .await
+            .unwrap();
+
+        // Only the requested set is scanned: b3 stays invisible, and the hits
+        // come back globally ranked (descending distance) as one top_k.
+        let hits = storage
+            .query_multi_biz("x", 10, None, None, None, &["b1", "b2"])
+            .await
+            .unwrap();
+        assert_eq!(2, hits.len());
+        let ids: std::collections::HashSet<&str> = hits
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(ids.contains("v1"));
+        assert!(ids.contains("v2"));
+        assert!(!ids.contains("v3"));
+        // Every hit echoes the biz line it was read from, so the data
+        // endpoint's chunk projection can report per-record provenance.
+        // (v2 was overwritten by the b2 upsert, so it now lives on b2.)
+        for hit in &hits {
+            let id = hit.get("id").and_then(|v| v.as_str()).unwrap();
+            let biz = hit.get("biz_id").and_then(|v| v.as_str()).unwrap();
+            let expected = match id {
+                "v1" => "b1",
+                "v2" => "b2",
+                other => panic!("unexpected hit {other}"),
+            };
+            assert_eq!(expected, biz);
+        }
+
+        // A single-biz query keeps its exact-scope behavior — the multi-biz
+        // predicate never leaks into it.
+        let only_b1 = storage
+            .query("x", 10, None, None, None, "b1")
+            .await
+            .unwrap();
+        assert_eq!(1, only_b1.len());
+        assert_eq!("v1", only_b1[0].get("id").and_then(|v| v.as_str()).unwrap());
+
+        // Empty set returns nothing (callers never route an empty set here,
+        // but the guard keeps it from widening into a whole-workspace scan).
+        assert!(storage
+            .query_multi_biz("x", 10, None, None, None, &[])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_multi_biz_truncates_to_a_global_top_k() {
+        let storage = create_storage(4);
+        storage
+            .upsert(
+                HashMap::from([
+                    ("a1".to_string(), json_map(json!({"content": "aa"}))),
+                    ("a2".to_string(), json_map(json!({"content": "aaaa"}))),
+                ]),
+                "b1",
+            )
+            .await
+            .unwrap();
+        storage
+            .upsert(
+                HashMap::from([
+                    ("z1".to_string(), json_map(json!({"content": "zz"}))),
+                    ("z2".to_string(), json_map(json!({"content": "zzzz"}))),
+                ]),
+                "b2",
+            )
+            .await
+            .unwrap();
+
+        let hits = storage
+            .query_multi_biz("x", 2, None, None, None, &["b1", "b2"])
+            .await
+            .unwrap();
+        assert_eq!(2, hits.len());
+        let distances: Vec<f64> = hits
+            .iter()
+            .filter_map(|r| r.get("distance").and_then(|v| v.as_f64()))
+            .collect();
+        assert_eq!(2, distances.len());
+        // One globally-ordered cut across both biz lines.
+        assert!(distances[0] >= distances[1]);
+    }
+
+    #[tokio::test]
     async fn drop_clears_all() {
         let storage = create_storage(4);
         storage
