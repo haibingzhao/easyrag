@@ -42,7 +42,9 @@ pub fn router() -> Router<Arc<AppServices>> {
         )
         .route(
             "/api/documents/{docId}",
-            get(get_document).delete(delete_document),
+            get(get_document)
+                .delete(delete_document)
+                .put(update_document),
         )
         .route("/api/documents/{docId}/index", post(index_document))
         .route("/api/documents/{docId}/reprocess", post(reprocess_document))
@@ -162,6 +164,24 @@ struct DeleteQuery {
     /// `cascadeDeleteDocument`, which never acts on it.
     #[serde(default)]
     delete_llm_cache: bool,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    biz_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateTextRequest {
+    text: String,
+    #[serde(default)]
+    file_path: Option<String>,
+    #[serde(default)]
+    create_time: Option<i64>,
+    #[serde(default)]
+    metadata: Option<HashMap<String, String>>,
+    #[serde(default)]
+    options: Option<ProcessingOptionsDto>,
     #[serde(default)]
     workspace: Option<String>,
     #[serde(default)]
@@ -572,6 +592,47 @@ async fn reprocess_document(
         .index_single_document(&doc_id, &ops, &biz_id)
         .await?;
     Ok(Json(result))
+}
+
+/// PUT /api/documents/{docId} — replace content of an existing document.
+async fn update_document(
+    state: AppState,
+    AxumPath(doc_id): AxumPath<String>,
+    Json(request): Json<UpdateTextRequest>,
+) -> AppResult<Json<Value>> {
+    let (ops, biz_id) =
+        ops_for(&state, request.workspace.as_deref(), request.biz_id.as_deref()).await?;
+    let options = request.options.map(|o| DocumentProcessingOptions {
+        chunk_method: o.chunk_method,
+        chunk_token_size: o.chunk_token_size,
+        chunk_overlap: o.chunk_overlap,
+        skip_kg: o.skip_kg.unwrap_or(false),
+        parser_engine: None,
+        build_structure: o.build_structure.unwrap_or(false),
+    });
+    let result = state
+        .lifecycle_service
+        .update_document_by_id(
+            &doc_id,
+            &request.text,
+            request.file_path.as_deref(),
+            request.create_time,
+            request.metadata.as_ref(),
+            options.as_ref(),
+            &ops,
+            &biz_id,
+        )
+        .await?;
+    let message = if result.idempotent_skip {
+        "Document unchanged, skipped reprocessing"
+    } else {
+        "Document updated"
+    };
+    Ok(Json(json!({
+        "status": "success",
+        "docId": result.doc_id,
+        "message": message,
+    })))
 }
 
 async fn delete_document(

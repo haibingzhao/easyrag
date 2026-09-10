@@ -627,6 +627,102 @@ impl DocumentLifecycleService {
             "final_status": "processing",
         }))
     }
+
+    // ------------------------------------------------------------------
+    // PUT semantics: update document content by docId
+    // ------------------------------------------------------------------
+
+    /// Replace the content of an existing document identified by `doc_id`.
+    ///
+    /// Returns 404 when the document does not exist. When content is identical
+    /// the operation short-circuits (zero embedding/LLM cost). Otherwise the old
+    /// derived data (chunks, graph, structure index) is cascade-deleted and the
+    /// document is re-inserted under the same `doc_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_document_by_id(
+        &self,
+        doc_id: &str,
+        text: &str,
+        file_path: Option<&str>,
+        create_time: Option<i64>,
+        metadata: Option<&HashMap<String, String>>,
+        options: Option<&DocumentProcessingOptions>,
+        ops: &LifecycleOps,
+        biz_id: &str,
+    ) -> AppResult<UpsertResult> {
+        // 1. Verify existence
+        let existing_status = ops
+            .bundle
+            .doc_status_storage
+            .get_by_id(doc_id, biz_id)
+            .await?;
+        if existing_status.is_none() {
+            return Err(AppError::not_found(format!(
+                "Document not found: {doc_id}"
+            )));
+        }
+
+        // 2. Content-hash idempotency
+        let content_hash = compute_args_hash([text]);
+        let existing = existing_status.unwrap();
+        if existing
+            .get("content_hash")
+            .and_then(JsonValue::as_str)
+            == Some(content_hash.as_str())
+        {
+            return Ok(UpsertResult {
+                doc_id: doc_id.to_string(),
+                created: false,
+                idempotent_skip: true,
+            });
+        }
+
+        // 3. Pipeline must not be mid-batch
+        check_pipeline_busy(&ops.pipeline)?;
+
+        // 4. Preserve existing external_id and file_path from KV
+        let doc_kv = ops.bundle.kv_storage.get_by_id(doc_id, biz_id).await?;
+        let external_id = doc_kv
+            .as_ref()
+            .and_then(|m| m.get("external_id"))
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        let resolved_file_path = file_path
+            .or_else(|| {
+                doc_kv
+                    .as_ref()
+                    .and_then(|m| m.get("file_path"))
+                    .and_then(JsonValue::as_str)
+            })
+            .unwrap_or("api_input")
+            .to_string();
+
+        // 5. Cascade-delete old derived data (chunks, graph, structure, status)
+        self.cascade_delete_document(doc_id, false, false, ops, biz_id)
+            .await?;
+
+        // 6. Re-insert with same docId
+        ops.pipeline
+            .insert_document(
+                text,
+                &resolved_file_path,
+                options,
+                Some(&InsertDocumentExtras {
+                    external_id,
+                    doc_id_override: Some(doc_id.to_string()),
+                    create_time,
+                    user_metadata: metadata.cloned(),
+                }),
+                biz_id,
+            )
+            .await?;
+
+        Ok(UpsertResult {
+            doc_id: doc_id.to_string(),
+            created: false,
+            idempotent_skip: false,
+        })
+    }
 }
 
 /// P2.16 pipeline concurrency guard: 409 while the pipeline is busy.
