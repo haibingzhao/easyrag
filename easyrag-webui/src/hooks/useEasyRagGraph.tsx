@@ -363,16 +363,14 @@ const useEasyRagGraph = () => {
       const currentMaxQueryDepth = maxQueryDepth
       const currentMaxNodes = maxNodes
 
-      let dataPromise: Promise<{
-        rawGraph: RawGraph | null
-        is_truncated: boolean | undefined
-      } | null>
-
       // Treat empty queryLabel the same as '*' — fetch the full graph.
       // This guards against a stale persisted empty queryLabel (which would
       // otherwise silently skip the fetch and leave the graph empty forever).
       const effectiveQueryLabel = currentQueryLabel || '*'
-      dataPromise = fetchGraph(effectiveQueryLabel, currentMaxQueryDepth, currentMaxNodes)
+      const dataPromise: Promise<{
+        rawGraph: RawGraph | null
+        is_truncated: boolean | undefined
+      } | null> = fetchGraph(effectiveQueryLabel, currentMaxQueryDepth, currentMaxNodes)
 
       dataPromise
         .then(async (result) => {
