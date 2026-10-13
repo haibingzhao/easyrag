@@ -38,6 +38,15 @@ pub fn build_router(services: Arc<AppServices>) -> Router {
         app = app.merge(routes::multimodal::router());
     }
 
+    // MCP Streamable HTTP endpoint (stateless). Compile-gated by the `mcp`
+    // feature and runtime-gated by `mcp_enabled`. Merged BEFORE the CORS +
+    // JWT layers so it is covered by exactly the same filter chain as REST;
+    // the mount path is under `/api/` for that reason.
+    #[cfg(feature = "mcp")]
+    if services.config.mcp_enabled {
+        app = app.merge(routes::mcp::router(std::sync::Arc::clone(&services)));
+    }
+
     app = app.layer(cors_layer(&services.config.cors_origins));
 
     // Security filter chain: JWT enforcement only when auth is enabled.

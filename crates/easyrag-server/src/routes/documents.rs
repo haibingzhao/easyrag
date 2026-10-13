@@ -210,7 +210,7 @@ struct ExternalIdQuery {
 /// R2: resolve lifecycle ops for a request-level workspace/biz_id
 /// (None = default for both). Returns the normalized biz_id that all
 /// storage calls must carry.
-async fn ops_for(
+pub(crate) async fn ops_for(
     state: &AppServices,
     workspace: Option<&str>,
     biz_id: Option<&str>,
@@ -230,11 +230,11 @@ async fn ops_for(
 /// string (camelCase wire names).
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct ScopeQuery {
+pub(crate) struct ScopeQuery {
     #[serde(default)]
-    workspace: Option<String>,
+    pub(crate) workspace: Option<String>,
     #[serde(default)]
-    biz_id: Option<String>,
+    pub(crate) biz_id: Option<String>,
 }
 
 /// Resolve with server defaults for both workspace and biz_id; used by
@@ -256,7 +256,7 @@ async fn query_scope(state: &AppServices, q: &ScopeQuery) -> AppResult<ResolvedS
 /// methods), so multi-biz workspaces keep their documents visible. Never
 /// route writes through this helper — status writes must carry the real
 /// per-document biz line.
-async fn read_scope(state: &AppServices, q: &ScopeQuery) -> AppResult<ResolvedScope> {
+pub(crate) async fn read_scope(state: &AppServices, q: &ScopeQuery) -> AppResult<ResolvedScope> {
     let mut scope = query_scope(state, q).await?;
     let explicit = q
         .biz_id

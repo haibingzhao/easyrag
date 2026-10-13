@@ -24,6 +24,19 @@ pub struct ServerConfig {
     // CORS
     pub cors_origins: Vec<String>,
 
+    // MCP (Model Context Protocol) stateless Streamable HTTP server.
+    // Runtime gate (feature `mcp` is the compile-time gate). Default-off keeps
+    // the endpoint entirely inert even in a binary compiled with `mcp`.
+    pub mcp_enabled: bool,
+    /// Mount path; MUST start with `/api/` so the JWT middleware filter chain
+    /// (auth.rs) covers it — renaming to a non-`/api/` prefix silently exposes
+    /// the write-capable tools unauthenticated.
+    pub mcp_mount_path: String,
+    /// Browser `Origin` allow-list for the MCP endpoint. Empty = allow requests
+    /// with no `Origin` (server-to-server, e.g. the Kotlin WebClient) — the
+    /// common case. Populate only if a browser client must be origin-pinned.
+    pub mcp_allowed_origins: Vec<String>,
+
     // Storage
     pub working_dir: String,
     pub workspace: String,
@@ -215,6 +228,10 @@ impl Default for ServerConfig {
 
             cors_origins: vec!["*".to_string()],
 
+            mcp_enabled: false,
+            mcp_mount_path: "/api/mcp".to_string(),
+            mcp_allowed_origins: Vec::new(),
+
             working_dir: "./rag_storage".to_string(),
             workspace: "default".to_string(),
             biz_id: easyrag_core::constants::DEFAULT_BIZ_ID.to_string(),
@@ -335,6 +352,11 @@ mod tests {
         assert_eq!(c.jwt_expiration_hours, 24);
         assert_eq!(c.login_rate_limit_per_minute, 5);
         assert_eq!(c.cors_origins, vec!["*".to_string()]);
+        // MCP defaults: compile-gated feature + runtime gate both default off;
+        // the mount path is pinned under /api/ so the auth filter chain applies.
+        assert!(!c.mcp_enabled);
+        assert_eq!(c.mcp_mount_path, "/api/mcp");
+        assert!(c.mcp_allowed_origins.is_empty());
         assert_eq!(c.working_dir, "./rag_storage");
         assert_eq!(c.workspace, "default");
         assert_eq!(c.biz_id, "default");

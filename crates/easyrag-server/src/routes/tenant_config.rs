@@ -43,28 +43,28 @@ struct WorkspaceQuery {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UpsertTenantConfigRequest {
-    workspace: String,
-    llm_model: Option<String>,
-    llm_api_key: Option<String>,
-    llm_base_url: Option<String>,
-    llm_temperature: Option<f32>,
-    llm_max_tokens: Option<u32>,
-    embedding_model: Option<String>,
-    embedding_api_key: Option<String>,
-    embedding_base_url: Option<String>,
-    embedding_dim: Option<usize>,
-    chunk_size: Option<usize>,
-    chunk_overlap_size: Option<usize>,
-    language: Option<String>,
-    default_top_k: Option<usize>,
-    rerank_enabled: Option<bool>,
+pub(crate) struct UpsertTenantConfigRequest {
+    pub(crate) workspace: String,
+    pub(crate) llm_model: Option<String>,
+    pub(crate) llm_api_key: Option<String>,
+    pub(crate) llm_base_url: Option<String>,
+    pub(crate) llm_temperature: Option<f32>,
+    pub(crate) llm_max_tokens: Option<u32>,
+    pub(crate) embedding_model: Option<String>,
+    pub(crate) embedding_api_key: Option<String>,
+    pub(crate) embedding_base_url: Option<String>,
+    pub(crate) embedding_dim: Option<usize>,
+    pub(crate) chunk_size: Option<usize>,
+    pub(crate) chunk_overlap_size: Option<usize>,
+    pub(crate) language: Option<String>,
+    pub(crate) default_top_k: Option<usize>,
+    pub(crate) rerank_enabled: Option<bool>,
 }
 
 /// Response DTO with API keys masked.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TenantConfigResponse {
+pub(crate) struct TenantConfigResponse {
     workspace: String,
     llm_model: Option<String>,
     llm_api_key: Option<String>,
@@ -103,7 +103,7 @@ fn mask_api_key(key: &Option<String>) -> Option<String> {
     })
 }
 
-fn config_to_response(config: &TenantConfig) -> TenantConfigResponse {
+pub(crate) fn config_to_response(config: &TenantConfig) -> TenantConfigResponse {
     TenantConfigResponse {
         workspace: config.workspace.clone(),
         llm_model: config.llm_model.clone(),
@@ -172,6 +172,18 @@ async fn upsert_tenant_config(
     state: AppState,
     Json(body): Json<UpsertTenantConfigRequest>,
 ) -> AppResult<Json<Value>> {
+    let config = apply_upsert(&state, &body).await?;
+    Ok(Json(json!(config_to_response(&config))))
+}
+
+/// Merge-and-persist a tenant config (shared by the REST handler and the MCP
+/// `rag_tenant_config_upsert` tool so the two cannot drift). Validates the
+/// workspace, merges with existing values (masked/empty API keys preserve the
+/// old secret), persists, and invalidates the cached workspace context.
+pub(crate) async fn apply_upsert(
+    state: &AppServices,
+    body: &UpsertTenantConfigRequest,
+) -> AppResult<TenantConfig> {
     let workspace = body.workspace.trim().to_string();
     if workspace.is_empty() {
         return Err(AppError::bad_request("workspace is required"));
@@ -199,26 +211,26 @@ async fn upsert_tenant_config(
             // Merge: request fields override, masked/empty API keys preserve old
             TenantConfig {
                 workspace: workspace.clone(),
-                llm_model: body.llm_model.or(old.llm_model),
+                llm_model: body.llm_model.clone().or(old.llm_model),
                 llm_api_key: if is_masked_or_empty(&body.llm_api_key) {
                     old.llm_api_key
                 } else {
-                    body.llm_api_key
+                    body.llm_api_key.clone()
                 },
-                llm_base_url: body.llm_base_url.or(old.llm_base_url),
+                llm_base_url: body.llm_base_url.clone().or(old.llm_base_url),
                 llm_temperature: body.llm_temperature.or(old.llm_temperature),
                 llm_max_tokens: body.llm_max_tokens.or(old.llm_max_tokens),
-                embedding_model: body.embedding_model.or(old.embedding_model),
+                embedding_model: body.embedding_model.clone().or(old.embedding_model),
                 embedding_api_key: if is_masked_or_empty(&body.embedding_api_key) {
                     old.embedding_api_key
                 } else {
-                    body.embedding_api_key
+                    body.embedding_api_key.clone()
                 },
-                embedding_base_url: body.embedding_base_url.or(old.embedding_base_url),
+                embedding_base_url: body.embedding_base_url.clone().or(old.embedding_base_url),
                 embedding_dim: body.embedding_dim.or(old.embedding_dim),
                 chunk_size: body.chunk_size.or(old.chunk_size),
                 chunk_overlap_size: body.chunk_overlap_size.or(old.chunk_overlap_size),
-                language: body.language.or(old.language),
+                language: body.language.clone().or(old.language),
                 default_top_k: body.default_top_k.or(old.default_top_k),
                 rerank_enabled: body.rerank_enabled.or(old.rerank_enabled),
                 created_at: old.created_at,
@@ -227,18 +239,24 @@ async fn upsert_tenant_config(
         }
         None => TenantConfig {
             workspace: workspace.clone(),
-            llm_model: body.llm_model,
-            llm_api_key: body.llm_api_key.filter(|k| !k.is_empty() && k != "****"),
-            llm_base_url: body.llm_base_url,
+            llm_model: body.llm_model.clone(),
+            llm_api_key: body
+                .llm_api_key
+                .clone()
+                .filter(|k| !k.is_empty() && k != "****"),
+            llm_base_url: body.llm_base_url.clone(),
             llm_temperature: body.llm_temperature,
             llm_max_tokens: body.llm_max_tokens,
-            embedding_model: body.embedding_model,
-            embedding_api_key: body.embedding_api_key.filter(|k| !k.is_empty() && k != "****"),
-            embedding_base_url: body.embedding_base_url,
+            embedding_model: body.embedding_model.clone(),
+            embedding_api_key: body
+                .embedding_api_key
+                .clone()
+                .filter(|k| !k.is_empty() && k != "****"),
+            embedding_base_url: body.embedding_base_url.clone(),
             embedding_dim: body.embedding_dim,
             chunk_size: body.chunk_size,
             chunk_overlap_size: body.chunk_overlap_size,
-            language: body.language,
+            language: body.language.clone(),
             default_top_k: body.default_top_k,
             rerank_enabled: body.rerank_enabled,
             created_at: now,
@@ -252,7 +270,7 @@ async fn upsert_tenant_config(
     state.workspace_resolver.invalidate_workspace(&workspace).await;
 
     tracing::info!("Tenant config upserted for workspace: {workspace}");
-    Ok(Json(json!(config_to_response(&config))))
+    Ok(config)
 }
 
 /// DELETE /api/admin/tenant-config?workspace=xxx

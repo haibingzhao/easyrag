@@ -105,7 +105,7 @@ pub struct QueryRequest {
 ///: missing topK -> 40,
 /// chunkTopK -> 5, responseType -> "Multiple Paragraphs",
 /// unknown/missing mode -> Hybrid.
-fn build_query_param(request: &QueryRequest, biz_id: &str) -> QueryParam {
+pub(crate) fn build_query_param(request: &QueryRequest, biz_id: &str) -> QueryParam {
     let mut param = QueryParam::default();
     param.mode = parse_query_mode(request.mode.as_deref());
     param.biz_id = biz_id.to_string();
@@ -138,7 +138,7 @@ fn build_query_param(request: &QueryRequest, biz_id: &str) -> QueryParam {
 }
 
 /// Unknown values fall back to Hybrid.
-fn parse_query_mode(mode: Option<&str>) -> QueryMode {
+pub(crate) fn parse_query_mode(mode: Option<&str>) -> QueryMode {
     match mode.map(|m| m.to_lowercase()) {
         Some(m) => match m.as_str() {
             "local" => QueryMode::Local,
@@ -211,7 +211,7 @@ async fn query(state: AppState, Json(request): Json<QueryRequest>) -> AppResult<
 /// blanks, dedupe (order-preserving). Every surviving element must pass the
 /// shared scope-name charset rule — these values land in SQL/Cypher predicates.
 /// Returns `None` when nothing survives, which restores the single-biz path.
-fn normalize_biz_ids(raw: &[String]) -> AppResult<Option<Vec<String>>> {
+pub(crate) fn normalize_biz_ids(raw: &[String]) -> AppResult<Option<Vec<String>>> {
     let mut out: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for id in raw {

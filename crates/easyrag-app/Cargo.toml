@@ -17,7 +17,9 @@ easyrag-core = { workspace = true }
 easyrag-storage = { workspace = true, features = ["postgres", "neo4j", "tantivy-backend"] }
 easyrag-llm = { workspace = true }
 easyrag-pipeline = { workspace = true }
-easyrag-server = { workspace = true }
+# The release binary ships the MCP endpoint; it stays runtime-gated by
+# MCP_ENABLED (default off), so enabling the feature only affects build time.
+easyrag-server = { workspace = true, features = ["mcp"] }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

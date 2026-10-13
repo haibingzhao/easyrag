@@ -129,6 +129,22 @@ pub fn build_config(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Serv
     config.jwt_expiration_hours = env_parse(get, "JWT_EXPIRATION_HOURS", 24)?;
     config.login_rate_limit_per_minute = env_parse(get, "LOGIN_RATE_LIMIT_PER_MINUTE", 5)?;
 
+    // MCP stateless Streamable HTTP endpoint. Compile-gated by the `mcp`
+    // feature (present in the release binary); this runtime gate decides
+    // whether the router is actually mounted. Default-off = zero behaviour
+    // change. `MCP_MOUNT_PATH` must stay under `/api/` to remain authenticated.
+    config.mcp_enabled = env_bool(get, "MCP_ENABLED", false)?;
+    config.mcp_mount_path = env_get(get, "MCP_MOUNT_PATH", "/api/mcp");
+    config.mcp_allowed_origins = get("MCP_ALLOWED_ORIGINS")
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
     config.rerank_enabled = env_bool(get, "RERANK_ENABLED", false)?;
     config.rerank_provider = env_get(get, "RERANK_PROVIDER", "jina");
     config.rerank_api_key = env_get(get, "RERANK_API_KEY", "");

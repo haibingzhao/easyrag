@@ -15,7 +15,10 @@ edition = "2021"
 license = "Apache-2.0"
 # Trait upcasting (supertrait dyn-object coercion, used to call
 # StorageNameSpace::drop through sub-trait objects) stabilized in 1.86.
-rust-version = "1.86"
+# rmcp 3.x (MCP server, behind the optional `mcp` feature) raises the floor
+# to 1.88; the default build does not compile rmcp, so this only bites when
+# `--features mcp` is requested.
+rust-version = "1.88"
 
 [workspace.dependencies]
 # Internal crates
@@ -70,6 +73,17 @@ mime_guess = "2"
 jsonwebtoken = "9"
 bcrypt = "0.17"
 dotenvy = "0.15"
+
+# MCP (Model Context Protocol) server — pulled in only by the optional
+# `mcp` feature on easyrag-server. `transport-streamable-http-server` gates
+# the Streamable HTTP tower service; the `-session` sub-feature gates the
+# session managers (NeverSessionManager for stateless operation).
+rmcp = { version = "3.0", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
+schemars = "1"
 
 # Cache
 moka = { version = "0.12", features = ["future"] }

@@ -30,6 +30,16 @@ moka = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 
+# Optional MCP server stack (enabled by the `mcp` feature only).
+rmcp = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
+
+[features]
+# Model Context Protocol server: a Streamable HTTP (stateless) endpoint that
+# mirrors the REST capabilities easyai consumes. Default-off so the base build
+# and CI never compile rmcp; the release binary opts in via easyrag-app.
+mcp = ["dep:rmcp", "dep:schemars"]
+
 [dev-dependencies]
 easyrag-storage = { workspace = true }
 tower = { workspace = true, features = ["util"] }
