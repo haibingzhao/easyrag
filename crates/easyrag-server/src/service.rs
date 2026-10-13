@@ -454,6 +454,11 @@ impl DocumentLifecycleService {
             "create_time": doc.get("create_time").cloned().unwrap_or(JsonValue::Null),
             "content": doc.get("content").cloned().unwrap_or(JsonValue::Null),
             "chunks_count": status.get("chunks_count").cloned().unwrap_or(JsonValue::Null),
+            // Surfaced so a polling caller can report *why* a document is
+            // failed instead of only that it is — the retry loop otherwise
+            // has no signal but the server log.
+            "error_msg": status.get("error_msg").cloned().unwrap_or(JsonValue::Null),
+            "metadata": doc.get("user_metadata").cloned().unwrap_or_else(|| json!({})),
         }))
     }
 
@@ -493,6 +498,8 @@ impl DocumentLifecycleService {
             "external_id": doc.get("external_id").cloned().unwrap_or(JsonValue::Null),
             "content_length": content_length,
             "chunks_count": status.as_ref().and_then(|s| s.get("chunks_count")).cloned().unwrap_or(JsonValue::Null),
+            "error_msg": status.as_ref().and_then(|s| s.get("error_msg")).cloned().unwrap_or(JsonValue::Null),
+            "metadata": doc.get("user_metadata").cloned().unwrap_or_else(|| json!({})),
         }))
     }
 

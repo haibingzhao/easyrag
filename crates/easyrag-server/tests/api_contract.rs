@@ -929,6 +929,53 @@ async fn documents_insert_list_status_counts_delete() {
     assert!(body["documents"].as_array().unwrap().is_empty());
 }
 
+/// The write path stores client metadata under `user_metadata`; a read-back must
+/// echo it, otherwise easyai's `inspect` sees no remote checksum and re-ingests
+/// every cycle.
+#[tokio::test]
+async fn documents_read_by_external_id_echoes_metadata() {
+    let env = build_env(false, false).await;
+
+    let (status, body) = post_json(
+        &env,
+        "/api/documents/text",
+        json!({
+            "text": "Skill body used to check the metadata round trip.",
+            "externalId": "ext-metadata-echo",
+            "metadata": {"name": "demo", "checksum": "abc123"},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = get_json(
+        &env,
+        "/api/documents/by-external-id?externalId=ext-metadata-echo",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["metadata"]["checksum"], "abc123");
+    assert_eq!(body["metadata"]["name"], "demo");
+
+    let (status, body) = post_json(
+        &env,
+        "/api/documents/text",
+        json!({
+            "text": "Legacy payload without metadata.",
+            "externalId": "ext-metadata-absent",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = get_json(
+        &env,
+        "/api/documents/by-external-id?externalId=ext-metadata-absent",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["metadata"], json!({}));
+}
+
 #[tokio::test]
 async fn pipeline_status_reports_idle_with_counts() {
     let env = build_env(false, false).await;
