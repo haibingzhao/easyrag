@@ -3,6 +3,7 @@
 //! OpenAI-compatible API.
 
 use easyrag_core::concurrency::resilience::CircuitBreaker;
+use easyrag_core::constants::DEFAULT_EMBEDDING_BATCH_NUM;
 use easyrag_core::llm::service::{
     ChatMessage, EmbeddingService, LlmRequest, LlmService, LlmToolResponse, MessageRole,
     ResponseFormat, ToolCall, ToolCallingLlmService, ToolDefinition,
@@ -35,6 +36,12 @@ pub struct OpenAiConfig {
     pub connect_timeout: Duration,
     /// Dimension of embeddings produced by the configured model.
     pub embedding_dimension: usize,
+    /// Maximum number of inputs per `/embeddings` request. Providers cap this
+    /// — DashScope-compatible endpoints (Aliyun Bailian) reject an `input`
+    /// array longer than 10 with a 400 `InvalidParameter` — so a larger call
+    /// is split into sequential requests and the vectors concatenated back in
+    /// input order. `0` disables the cap (single request, whatever the size).
+    pub embedding_max_batch: usize,
     /// DashScope-style thinking toggle for reasoning models (e.g. qwen3.8-max).
     /// None = send nothing (provider default); Some(false) disables the
     /// reasoning phase so long prompts don't blow past the request timeout.
@@ -55,6 +62,7 @@ impl OpenAiConfig {
             timeout: Duration::from_secs(120),
             connect_timeout: Duration::from_secs(30),
             embedding_dimension: 1536,
+            embedding_max_batch: DEFAULT_EMBEDDING_BATCH_NUM,
             enable_thinking: None,
             retry_delay_base_ms: 1000,
         }
@@ -501,6 +509,35 @@ impl EmbeddingService for OpenAiClient {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        let max_batch = self.config.embedding_max_batch;
+        // Fast path — no cap configured, or the call already fits: one request,
+        // exactly as before (this is what keeps the golden request body and the
+        // "one embed call per batch" property of the upsert path intact for
+        // providers without a cap, e.g. OpenAI itself).
+        if max_batch == 0 || texts.len() <= max_batch {
+            return self.embed_once(texts).await;
+        }
+        // Over the provider's cap: one request per slice, sequentially (not
+        // concurrently — the callers that exceed the cap are bulk ingestion
+        // paths that should not stampede the embedding endpoint). `Vec::extend`
+        // in slice order is what preserves the input↔vector alignment the
+        // callers rely on.
+        let mut all = Vec::with_capacity(texts.len());
+        for slice in texts.chunks(max_batch) {
+            all.extend(self.embed_once(slice.to_vec()).await?);
+        }
+        Ok(all)
+    }
+
+    fn embedding_dimension(&self) -> usize {
+        self.config.embedding_dimension
+    }
+}
+
+impl OpenAiClient {
+    /// One `/embeddings` round trip for a slice that already fits the provider
+    /// cap — the retry/breaker-wrapped request `embed` is built on.
+    async fn embed_once(&self, texts: Vec<String>) -> easyrag_core::Result<Vec<Vec<f32>>> {
         let body = json!({ "model": self.config.model, "input": texts });
         self.execute_resilient(
             &self.embedding_breaker,
@@ -510,9 +547,5 @@ impl EmbeddingService for OpenAiClient {
             parse_embedding_response,
         )
         .await
-    }
-
-    fn embedding_dimension(&self) -> usize {
-        self.config.embedding_dimension
     }
 }

@@ -10,7 +10,7 @@ use easyrag_llm::{OpenAiClient, OpenAiConfig};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 async fn start_client(server: &MockServer, mutate: impl FnOnce(&mut OpenAiConfig)) -> OpenAiClient {
     let mut config = OpenAiConfig::new("test-key");
@@ -360,6 +360,144 @@ async fn embed_non_200_is_error() {
 
     let result = client.embed(vec!["a".to_string()]).await;
     assert!(result.is_err());
+}
+
+// ===== provider batch cap =====
+//
+// DashScope-compatible endpoints reject an `input` array longer than 10 with a
+// 400 (`InternalError.Algo.InvalidParameter: batch size is invalid`). The vector
+// upsert path hands `embed` a whole 64-record batch, so the client — not the
+// caller — has to honour the cap. These tests pin that contract.
+
+/// One single-component vector per input, whose component is the index parsed
+/// out of that input's `t<N>` label.
+///
+/// Encoding the *text identity* rather than the position within the request is
+/// what makes the ordering assertions meaningful: a client that concatenated the
+/// per-request results in the wrong order would yield a permutation instead of
+/// `0..n`.
+fn echo_input_index(request: &Request) -> ResponseTemplate {
+    let body: Value = serde_json::from_slice(&request.body).expect("json body");
+    let data: Vec<Value> = body["input"]
+        .as_array()
+        .expect("input array")
+        .iter()
+        .map(|text| {
+            let index: f32 = text
+                .as_str()
+                .expect("text input")
+                .trim_start_matches('t')
+                .parse()
+                .expect("t<N> label");
+            json!({ "embedding": [index] })
+        })
+        .collect();
+    ResponseTemplate::new(200).set_body_json(json!({ "data": data }))
+}
+
+/// Sizes of the `input` arrays of every request received, in arrival order.
+async fn input_sizes(server: &MockServer) -> Vec<usize> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            serde_json::from_slice::<Value>(&r.body).unwrap()["input"]
+                .as_array()
+                .expect("input array")
+                .len()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn embed_splits_calls_over_the_default_batch_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(echo_input_index)
+        .mount(&server)
+        .await;
+    // No override: the default cap is what the production client runs with.
+    let client = start_client(&server, |_| {}).await;
+
+    let texts: Vec<String> = (0..25).map(|i| format!("t{i}")).collect();
+    let vectors = client.embed(texts).await.unwrap();
+
+    // 25 inputs at a cap of 10 → 10 + 10 + 5.
+    assert_eq!(vec![10, 10, 5], input_sizes(&server).await);
+
+    // Concatenated in input order: the upsert path zips vectors back onto its
+    // records positionally, so a mis-ordered concat would silently attach every
+    // vector to the wrong chunk.
+    assert_eq!(25, vectors.len());
+    for (i, vector) in vectors.iter().enumerate() {
+        assert_eq!(vec![i as f32], *vector, "vector {i} is out of order");
+    }
+}
+
+#[tokio::test]
+async fn embed_keeps_one_request_when_the_call_fits_the_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(echo_input_index)
+        .mount(&server)
+        .await;
+    let client = start_client(&server, |_| {}).await;
+
+    // Exactly at the cap is still a single request — the boundary that the
+    // previous "one embed call per batch" behaviour depends on.
+    let texts: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+    let vectors = client.embed(texts).await.unwrap();
+
+    assert_eq!(vec![10], input_sizes(&server).await);
+    assert_eq!(10, vectors.len());
+    assert_eq!(vec![9.0], vectors[9]);
+}
+
+#[tokio::test]
+async fn embed_max_batch_zero_disables_splitting() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(echo_input_index)
+        .mount(&server)
+        .await;
+    let client = start_client(&server, |c| c.embedding_max_batch = 0).await;
+
+    let texts: Vec<String> = (0..25).map(|i| format!("t{i}")).collect();
+    let vectors = client.embed(texts).await.unwrap();
+
+    assert_eq!(vec![25], input_sizes(&server).await);
+    assert_eq!(25, vectors.len());
+}
+
+#[tokio::test]
+async fn embed_propagates_a_failing_slice_instead_of_truncating() {
+    let server = MockServer::start().await;
+    // Every request fails: a partially embedded call must surface an error
+    // rather than hand back a truncated vector list that would misalign with
+    // the caller's records.
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("batch size is invalid"))
+        .mount(&server)
+        .await;
+    let client = start_client(&server, |c| {
+        c.max_retries = 1;
+        c.retry_delay_base_ms = 1;
+    })
+    .await;
+
+    let texts: Vec<String> = (0..25).map(|i| format!("t{i}")).collect();
+    let result = client.embed(texts).await;
+
+    assert!(result.is_err());
+    // Stops at the first failing slice — it must not keep hammering the
+    // remaining ones after the endpoint has already rejected the batch.
+    assert_eq!(vec![10], input_sizes(&server).await);
 }
 
 #[tokio::test]
