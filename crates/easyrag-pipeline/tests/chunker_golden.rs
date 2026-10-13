@@ -232,6 +232,11 @@ async fn token_size_overlap_larger_than_window_terminates() {
 }
 
 /// Chunk size 0 with overlap 0: the other degenerate the guard covers.
+///
+/// The property under test is *termination* — a zero-width window must not spin
+/// forever. Its output is no chunks at all: every window is empty, and an empty
+/// window carries no text, so it is dropped rather than indexed as one of the
+/// 27 empty-content chunks this used to produce.
 #[tokio::test]
 async fn token_size_zero_chunk_size_terminates() {
     snap_chunks(

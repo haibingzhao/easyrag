@@ -214,15 +214,15 @@ pub fn split_text_by_token_limit(
         }
         if unit_tokens > max_tokens {
             // Single unit exceeds limit: force-split by token window.
+            //
+            // The window can cut inside a multi-byte character, which strict
+            // `decode` rejects; `unwrap_or_default()` used to swallow that and
+            // emit a silently *empty* chunk, losing the whole window.
             let tokens = tokenizer.encode(&unit);
             let mut start = 0usize;
             while start < tokens.len() {
                 let end = (start + max_tokens).min(tokens.len());
-                chunks.push(
-                    tokenizer
-                        .decode(&tokens[start..end])
-                        .unwrap_or_default(),
-                );
+                chunks.push(tokenizer.decode_window(&tokens[start..end]));
                 start = end;
             }
         } else {

@@ -128,6 +128,51 @@ async fn token_size_token_count_positive() {
     }
 }
 
+/// Regression: a token window can end — and the next one begin — inside a
+/// multi-byte character, because byte-level BPE splits one CJK character across
+/// tokens. Decoding such a window raised
+/// `tokenizer decode failed: ... incomplete utf-8 byte sequence`, which aborted
+/// the whole document: `stage1-2026-09-28-gold-crash-verdict.md` (and every
+/// other document reaching this chunker with a CJK body) never finished
+/// indexing. Nothing is lost by trimming the partial character — the
+/// overlapping window still carries it.
+///
+/// The window sizes are swept because *whether* a boundary lands inside a
+/// character depends on where the boundary falls, not on the text alone: with
+/// this fixture the split characters start at token indices 3, 5, 12, 23, 25,
+/// 32, … so a single size could pass by luck.
+#[tokio::test]
+async fn token_size_chunking_cjk_does_not_fail_on_a_cut_character() {
+    // 慌 / 挤 / 兑 / 崩 are the characters cl100k_base splits across two
+    // tokens, i.e. the ones a window boundary can land inside.
+    let text = "市场恐慌挤兑风险与金价崩盘的分母冲击。".repeat(20);
+
+    for chunk_size in 2..=40 {
+        let chunker = TokenSizeChunker::new(chunk_size, 1);
+        let chunks = chunker.chunk(&text, "doc-cjk").await.unwrap_or_else(|e| {
+            panic!("chunk_size={chunk_size} failed the whole document: {e}")
+        });
+
+        assert!(chunks.len() > 1, "chunk_size={chunk_size} must span windows");
+        for chunk in &chunks {
+            assert!(
+                !chunk.content.is_empty(),
+                "chunk_size={chunk_size}: no window may decode to nothing"
+            );
+            assert!(
+                !chunk.content.contains('\u{FFFD}'),
+                "chunk_size={chunk_size}: partial characters are dropped, not replaced: {:?}",
+                chunk.content
+            );
+            // Everything kept still comes from the source text.
+            assert!(
+                text.contains(&chunk.content),
+                "chunk_size={chunk_size}: chunk text must come from the source"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // RecursiveCharacterChunker (7 cases)
 // ---------------------------------------------------------------------

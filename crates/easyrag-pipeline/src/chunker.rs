@@ -248,14 +248,28 @@ impl Chunker for TokenSizeChunker {
         while start < tokens.len() {
             let end = (start + self.base.chunk_size()).min(tokens.len());
             let chunk_tokens = &tokens[start..end];
-            let content = self.base.tokenizer().decode(chunk_tokens)?;
-            chunks.push(TextChunk::new(
-                content,
-                order_index,
-                doc_id,
-                chunk_tokens.len(),
-            ));
-            order_index += 1;
+            // `decode_window`, not `decode`: this window is cut at an arbitrary
+            // token boundary and may end (and the next one may begin) inside a
+            // multi-byte character — a CJK body splits one character across
+            // several tokens. Strict decode rejected that with
+            // `incomplete utf-8 byte sequence` and failed the entire document,
+            // so the partial character is dropped instead; the overlapping
+            // window still carries it.
+            let content = self.base.tokenizer().decode_window(chunk_tokens);
+            // A window made of nothing but one character's bytes carries no
+            // text. That needs the window to be smaller than the 4 bytes a
+            // character can occupy (chunk size ≤ 4), so no real configuration
+            // reaches it — but storing an empty chunk would be worse than
+            // dropping it.
+            if !content.is_empty() {
+                chunks.push(TextChunk::new(
+                    content,
+                    order_index,
+                    doc_id,
+                    chunk_tokens.len(),
+                ));
+                order_index += 1;
+            }
             if end >= tokens.len() {
                 break;
             }
