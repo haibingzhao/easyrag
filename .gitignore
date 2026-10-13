@@ -39,6 +39,7 @@ dist/
 # Logs
 # =========================
 *.log
+/logs/
 .docs
 
 .qoder
