@@ -94,6 +94,7 @@ impl InMemoryVectorStorage {
         top_k: usize,
         time_range_start: Option<i64>,
         time_range_end: Option<i64>,
+        exclude_archived: bool,
         biz_allowed: &dyn Fn(&str) -> bool,
     ) -> easyrag_core::Result<Vec<JsonMap>> {
         let mut results: Vec<(f32, JsonMap)> = Vec::new();
@@ -117,6 +118,17 @@ impl InMemoryVectorStorage {
                     continue;
                 }
             }
+            // R2: DB-level archive exclusion.
+            if exclude_archived {
+                let archived = entry
+                    .metadata
+                    .get("archived")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if archived {
+                    continue;
+                }
+            }
 
             let similarity = cosine_similarity(embedding, &entry.vector)?;
             if similarity > self.cosine_better_than_threshold {
@@ -128,6 +140,12 @@ impl InMemoryVectorStorage {
                     "biz_id".to_string(),
                     serde_json::Value::String(entry.biz.clone()),
                 );
+                // `score` is the canonical key the postgres backend emits and
+                // the only one the query engine reads; `distance` is the legacy
+                // spelling this backend used to emit on its own, kept because
+                // existing callers and tests still read it. Both hold the same
+                // cosine similarity (higher = more similar), not a distance.
+                result.insert("score".to_string(), serde_json::Value::from(similarity));
                 result.insert("distance".to_string(), serde_json::Value::from(similarity));
                 results.push((similarity, result));
             }
@@ -188,6 +206,7 @@ impl VectorStorage for InMemoryVectorStorage {
         query_embedding: Option<&[f32]>,
         time_range_start: Option<i64>,
         time_range_end: Option<i64>,
+        exclude_archived: bool,
         biz_id: &str,
     ) -> easyrag_core::Result<Vec<JsonMap>> {
         let owned_embedding;
@@ -198,7 +217,7 @@ impl VectorStorage for InMemoryVectorStorage {
                 &owned_embedding
             }
         };
-        self.scored_scan(embedding, top_k, time_range_start, time_range_end, &|biz| {
+        self.scored_scan(embedding, top_k, time_range_start, time_range_end, exclude_archived, &|biz| {
             biz == biz_id
         })
     }
@@ -213,6 +232,7 @@ impl VectorStorage for InMemoryVectorStorage {
         query_embedding: Option<&[f32]>,
         time_range_start: Option<i64>,
         time_range_end: Option<i64>,
+        exclude_archived: bool,
         biz_ids: &[&str],
     ) -> easyrag_core::Result<Vec<JsonMap>> {
         if biz_ids.is_empty() {
@@ -227,7 +247,7 @@ impl VectorStorage for InMemoryVectorStorage {
             }
         };
         let wanted: HashSet<&str> = biz_ids.iter().copied().collect();
-        self.scored_scan(embedding, top_k, time_range_start, time_range_end, &|biz| {
+        self.scored_scan(embedding, top_k, time_range_start, time_range_end, exclude_archived, &|biz| {
             wanted.contains(biz)
         })
     }
@@ -334,5 +354,32 @@ impl VectorStorage for InMemoryVectorStorage {
             }
         }
         Ok(out)
+    }
+
+    async fn update_doc_archive_fields(
+        &self,
+        doc_id: &str,
+        fields: &JsonMap,
+        biz_id: &str,
+    ) -> easyrag_core::Result<()> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+        // R4: mutate the archive flags on every chunk of this document.
+        let mut data = self.data.lock();
+        for entry in data.values_mut() {
+            if entry.biz != biz_id {
+                continue;
+            }
+            let full_doc_id = entry
+                .metadata
+                .get("full_doc_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if full_doc_id == doc_id {
+                entry.metadata.extend(fields.clone());
+            }
+        }
+        Ok(())
     }
 }

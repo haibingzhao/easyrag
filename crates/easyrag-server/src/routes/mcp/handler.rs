@@ -285,6 +285,7 @@ fn base_query_request(
         enable_citation_validation: None,
         enable_evidence_scoring: None,
         enable_query_routing: None,
+        exclude_archived: None,
     }
 }
 
@@ -397,6 +398,7 @@ impl EasyRagMcp {
                 req.create_time,
                 req.metadata.as_ref(),
                 options.as_ref(),
+                &crate::service::ArchiveFields::default(),
                 &ops,
                 &biz_id,
             )
@@ -510,6 +512,7 @@ impl EasyRagMcp {
                 "updated_at",
                 "desc",
                 req.file_path_prefix.as_deref(),
+                false, // MCP does not expose archive exclusion
                 &scope.biz_id,
             )
             .await

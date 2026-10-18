@@ -138,6 +138,7 @@ pub trait VectorStorage: StorageNameSpace {
     /// - `time_range_start`: Unix timestamp (seconds), create_time >= this
     /// - `time_range_end`: Unix timestamp (seconds), create_time <= this
     /// - `biz_id`: business-line filter
+    /// - `exclude_archived`: when true, filters out chunks from archived documents at DB level (R2)
     async fn query(
         &self,
         query: &str,
@@ -145,6 +146,7 @@ pub trait VectorStorage: StorageNameSpace {
         query_embedding: Option<&[f32]>,
         time_range_start: Option<i64>,
         time_range_end: Option<i64>,
+        exclude_archived: bool,
         biz_id: &str,
     ) -> crate::Result<Vec<JsonMap>>;
 
@@ -163,6 +165,7 @@ pub trait VectorStorage: StorageNameSpace {
         query_embedding: Option<&[f32]>,
         time_range_start: Option<i64>,
         time_range_end: Option<i64>,
+        exclude_archived: bool,
         biz_ids: &[&str],
     ) -> crate::Result<Vec<JsonMap>> {
         if biz_ids.is_empty() {
@@ -177,6 +180,7 @@ pub trait VectorStorage: StorageNameSpace {
                     query_embedding,
                     time_range_start,
                     time_range_end,
+                    exclude_archived,
                     biz,
                 )
                 .await?,
@@ -210,6 +214,22 @@ pub trait VectorStorage: StorageNameSpace {
         ids: &[String],
         biz_id: &str,
     ) -> crate::Result<HashMap<String, Vec<f32>>>;
+
+    /// R4 (archive layer): propagate document-level archive fields
+    /// (`archived`/`level`/`ref_ids`/`merged_into`) onto every chunk row of
+    /// that document, without touching embeddings or chunk content.
+    ///
+    /// Backends that support archive-aware recall override this; the default
+    /// is a no-op so a backend that never filters on the flag (or a mock) keeps
+    /// compiling unchanged.
+    async fn update_doc_archive_fields(
+        &self,
+        _doc_id: &str,
+        _fields: &crate::JsonMap,
+        _biz_id: &str,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
 
     /// Generate collection/table suffix from embedding_func model name:
     /// `{sanitized_model_name}_{dim}d`.
@@ -619,6 +639,7 @@ pub trait DocStatusStorage: KVStorage {
     /// Get documents with pagination support.
     /// Returns (list of (doc_id, DocProcessingStatus), total_count).
     /// `file_path_prefix`: optional server-side prefix filter on file_path (R5).
+    /// `exclude_archived`: when true, filters out archived documents at DB level (R2).
     async fn get_docs_paginated(
         &self,
         status_filter: Option<DocStatus>,
@@ -628,6 +649,7 @@ pub trait DocStatusStorage: KVStorage {
         sort_field: &str,
         sort_direction: &str,
         file_path_prefix: Option<&str>,
+        exclude_archived: bool,
         biz_id: &str,
     ) -> crate::Result<(Vec<(String, DocProcessingStatus)>, usize)>;
 

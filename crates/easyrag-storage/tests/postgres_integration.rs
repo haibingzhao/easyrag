@@ -192,7 +192,7 @@ async fn pg_vector_storage_round_trip() {
         .unwrap();
 
     // Vector query: identical text should return itself with high similarity.
-    let results = storage.query("aaaa bbbb cccc", 5, None, None, None, BIZ).await.unwrap();
+    let results = storage.query("aaaa bbbb cccc", 5, None, None, None, false, BIZ).await.unwrap();
     assert!(!results.is_empty());
     assert_eq!("chunk1", results[0]["id"].as_str().unwrap());
     assert!(results[0]["score"].as_f64().unwrap() > 0.99);
@@ -334,7 +334,7 @@ async fn pg_doc_status_storage_round_trip() {
     assert!(processed.contains_key("doc1"));
 
     let (page, total) = storage
-        .get_docs_paginated(None, None, 1, 10, "updated_at", "desc", None, BIZ)
+        .get_docs_paginated(None, None, 1, 10, "updated_at", "desc", None, false, BIZ)
         .await
         .unwrap();
     assert_eq!(2, total);
@@ -342,7 +342,7 @@ async fn pg_doc_status_storage_round_trip() {
 
     // R5: server-side file_path prefix filter.
     let (page, total) = storage
-        .get_docs_paginated(None, None, 1, 10, "updated_at", "desc", Some("/uploads/a"), BIZ)
+        .get_docs_paginated(None, None, 1, 10, "updated_at", "desc", Some("/uploads/a"), false, BIZ)
         .await
         .unwrap();
     assert_eq!(1, total);
@@ -438,7 +438,7 @@ async fn pg_biz_id_isolation() {
         .unwrap()
         .is_empty());
     assert!(vec
-        .query("aaaa bbbb cccc", 5, None, None, None, BIZ_B)
+        .query("aaaa bbbb cccc", 5, None, None, None, false, BIZ_B)
         .await
         .unwrap()
         .is_empty());
@@ -450,7 +450,7 @@ async fn pg_biz_id_isolation() {
     // biz_a still sees its own chunk.
     assert_eq!(
         1,
-        vec.query("aaaa bbbb cccc", 5, None, None, None, BIZ_A)
+        vec.query("aaaa bbbb cccc", 5, None, None, None, false, BIZ_A)
             .await
             .unwrap()
             .len()

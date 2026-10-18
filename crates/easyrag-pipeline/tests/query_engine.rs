@@ -122,6 +122,9 @@ impl LlmService for MockLlm {
 /// Vector storage returning scripted results for every query.
 struct MockVectorStorage {
     results: Vec<JsonMap>,
+    /// Rows served by `get_by_ids` (archive-aware keyword filtering reads
+    /// these). Empty by default, matching the pre-R2 behaviour.
+    by_ids: Vec<JsonMap>,
     embedding_func: EmbeddingFunc,
     global_config: JsonMap,
     /// Every `top_k` this store was queried with, in order. `query` already
@@ -137,11 +140,17 @@ impl MockVectorStorage {
     fn new(results: Vec<JsonMap>) -> Self {
         Self {
             results,
+            by_ids: Vec::new(),
             embedding_func: test_embedding_func(),
             global_config: JsonMap::new(),
             requested_top_k: Mutex::new(Vec::new()),
             requested_biz_sets: Mutex::new(Vec::new()),
         }
+    }
+
+    fn with_by_ids(mut self, rows: Vec<JsonMap>) -> Self {
+        self.by_ids = rows;
+        self
     }
 
     fn top_k_requests(&self) -> Vec<usize> {
@@ -166,6 +175,7 @@ impl VectorStorage for MockVectorStorage {
         _query_embedding: Option<&[f32]>,
         _time_range_start: Option<i64>,
         _time_range_end: Option<i64>,
+        _exclude_archived: bool,
         _biz_id: &str,
     ) -> easyrag_core::Result<Vec<JsonMap>> {
         self.requested_top_k.lock().unwrap().push(top_k);
@@ -179,6 +189,7 @@ impl VectorStorage for MockVectorStorage {
         _query_embedding: Option<&[f32]>,
         _time_range_start: Option<i64>,
         _time_range_end: Option<i64>,
+        _exclude_archived: bool,
         biz_ids: &[&str],
     ) -> easyrag_core::Result<Vec<JsonMap>> {
         self.requested_biz_sets
@@ -204,8 +215,18 @@ impl VectorStorage for MockVectorStorage {
         Ok(None)
     }
 
-    async fn get_by_ids(&self, _ids: &[String], _biz_id: &str) -> easyrag_core::Result<Vec<JsonMap>> {
-        Ok(Vec::new())
+    async fn get_by_ids(&self, ids: &[String], _biz_id: &str) -> easyrag_core::Result<Vec<JsonMap>> {
+        Ok(self
+            .by_ids
+            .iter()
+            .filter(|row| {
+                row.get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|id| ids.iter().any(|wanted| wanted == id))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect())
     }
 
     async fn delete(&self, _ids: &[String], _biz_id: &str) -> easyrag_core::Result<()> {
@@ -1014,6 +1035,40 @@ async fn query_data_chunk_biz_id_prefers_the_storage_echoed_biz_line() {
     );
 }
 
+/// The chunk projection addresses the document a hit came from: `doc_id` is the
+/// record's `full_doc_id`, i.e. the same id `/api/documents/list` returns as
+/// `id`. Without it a retrieval hit is only a body of text, and a caller that
+/// needs to reference the source entry has to list every document first.
+#[tokio::test]
+async fn query_data_chunk_doc_id_is_the_records_full_doc_id() {
+    let llm = Arc::new(MockLlm::new("SHOULD_NOT_APPEAR"));
+    let engine = engine_with(Arc::clone(&llm), vec![chunk("data chunk", "doc1")]);
+    let param = QueryParam {
+        mode: QueryMode::Naive,
+        ..Default::default()
+    };
+
+    let data = engine.query_data("q", &param).await.unwrap();
+    assert_eq!(data.chunks[0]["doc_id"], "doc1");
+}
+
+#[tokio::test]
+async fn query_data_chunk_doc_id_is_null_for_a_record_without_one() {
+    // Backward compatibility mirrors the archive fields: the key is always
+    // present, but a pre-`full_doc_id` record must not get a fabricated id.
+    let llm = Arc::new(MockLlm::new("SHOULD_NOT_APPEAR"));
+    let mut legacy = chunk("data chunk", "doc1");
+    legacy.remove("full_doc_id");
+    let engine = engine_with(Arc::clone(&llm), vec![legacy]);
+    let param = QueryParam {
+        mode: QueryMode::Naive,
+        ..Default::default()
+    };
+
+    let data = engine.query_data("q", &param).await.unwrap();
+    assert!(data.chunks[0]["doc_id"].is_null(), "{:?}", data.chunks[0]);
+}
+
 // ---------------------------------------------------------------------
 // query_data bizIds (multi-biz recall)
 // ---------------------------------------------------------------------
@@ -1812,6 +1867,114 @@ async fn keyword_fusion_follows_the_plan_not_the_endpoint() {
         .await
         .unwrap();
     assert_eq!(keyword.call_count(), 3);
+}
+
+/// R2 (archive layer): the keyword index has no `archived` column, so hybrid
+/// recall must consult the authoritative vector rows and drop archived
+/// keyword-only hits *before* fusion — otherwise the keyword leg would put
+/// back exactly what the storage-level vector filter removed.
+#[tokio::test]
+async fn hybrid_recall_drops_archived_keyword_hits_only_when_asked() {
+    let mut archived_hit = identified_chunk("archived keyword hit", "docA", "chunkA");
+    archived_hit.insert("archived".into(), JsonValue::Bool(true));
+    let keyword = Arc::new(MockKeywordSearch::new(vec![archived_hit.clone()]));
+    let vector = Arc::new(MockVectorStorage::new(vec![identified_chunk(
+        "vector hit", "docV", "chunkV",
+    )])
+    .with_by_ids(vec![archived_hit]));
+    let engine = Arc::new(
+        QueryEngine::new(
+            Arc::new(MockLlm::new("the answer")) as Arc<dyn LlmService>,
+            vector as Arc<dyn VectorStorage>,
+            Arc::new(InMemoryGraphStorage::new("test", "test")),
+            Arc::new(InMemoryKVStorage::new("test", "test")),
+        )
+        .with_keyword_search(keyword as Arc<dyn KeywordSearchable>),
+    );
+
+    // Default request keeps the pre-R2 hit set: the archived keyword hit is
+    // still echoable when the caller did not ask to exclude archived docs.
+    let all = engine
+        .query_data("q", &budgeted_param(QueryMode::Naive))
+        .await
+        .unwrap();
+    let contents: Vec<&str> = all
+        .chunks
+        .iter()
+        .filter_map(|c| c.get("content").and_then(|v| v.as_str()))
+        .collect();
+    assert!(contents.contains(&"archived keyword hit"), "{contents:?}");
+    let hydrated = all
+        .chunks
+        .iter()
+        .find(|c| c["content"] == "archived keyword hit")
+        .expect("keyword hit present");
+    assert_eq!(
+        hydrated["archived"], true,
+        "keyword hits echo the archive flags of their authoritative row"
+    );
+
+    let mut param = budgeted_param(QueryMode::Naive);
+    param.exclude_archived = true;
+    let filtered = engine.query_data("q", &param).await.unwrap();
+    let contents: Vec<&str> = filtered
+        .chunks
+        .iter()
+        .filter_map(|c| c.get("content").and_then(|v| v.as_str()))
+        .collect();
+    assert!(
+        !contents.contains(&"archived keyword hit"),
+        "archived keyword hit must not survive exclude_archived: {contents:?}"
+    );
+    assert!(contents.contains(&"vector hit"), "{contents:?}");
+}
+
+/// Keyword-only hits address the same document as the vector leg: the tantivy
+/// schema stores no `full_doc_id`, so the projection depends on the
+/// authoritative-row read `hydrate_keyword_hits` already performs.
+#[tokio::test]
+async fn keyword_hits_hydrate_full_doc_id_for_the_chunk_projection() {
+    let mut keyword_hit = identified_chunk("keyword-only hit", "docK", "chunkK");
+    keyword_hit.remove("full_doc_id");
+    let keyword = Arc::new(MockKeywordSearch::new(vec![keyword_hit]));
+    let vector = Arc::new(
+        MockVectorStorage::new(vec![identified_chunk("vector hit", "docV", "chunkV")])
+            .with_by_ids(vec![identified_chunk(
+                "keyword-only hit", "docK", "chunkK",
+            )]),
+    );
+    let engine = Arc::new(
+        QueryEngine::new(
+            Arc::new(MockLlm::new("the answer")) as Arc<dyn LlmService>,
+            vector as Arc<dyn VectorStorage>,
+            Arc::new(InMemoryGraphStorage::new("test", "test")),
+            Arc::new(InMemoryKVStorage::new("test", "test")),
+        )
+        .with_keyword_search(keyword as Arc<dyn KeywordSearchable>),
+    );
+
+    let data = engine
+        .query_data("q", &budgeted_param(QueryMode::Naive))
+        .await
+        .unwrap();
+    let doc_ids: Vec<(&str, Option<&str>)> = data
+        .chunks
+        .iter()
+        .map(|c| {
+            (
+                c["content"].as_str().unwrap_or_default(),
+                c["doc_id"].as_str(),
+            )
+        })
+        .collect();
+    assert!(
+        doc_ids.contains(&("vector hit", Some("docV"))),
+        "{doc_ids:?}"
+    );
+    assert!(
+        doc_ids.contains(&("keyword-only hit", Some("docK"))),
+        "{doc_ids:?}"
+    );
 }
 
 /// Reranker that records `(document_count, top_n)` per call and reverses the

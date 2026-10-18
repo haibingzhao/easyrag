@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::Deserialize;
@@ -20,11 +20,18 @@ use easyrag_pipeline::PipelineService;
 
 use crate::error::{AppError, AppResult};
 use crate::pagination::Paginated;
-use crate::service::{check_pipeline_busy, LifecycleOps, ResolvedScope};
+use crate::service::{
+    check_pipeline_busy, LifecycleOps, ResolvedScope, DEFAULT_SIMILAR_THRESHOLD,
+    DEFAULT_SIMILAR_TOP_K,
+};
 use crate::state::{AppServices, AppState};
 use crate::util::success_response;
 
 const MAX_UPLOAD_SIZE: usize = 100 * 1024 * 1024; // 100 MB
+
+/// Ceiling for `similarTopK`. Each returned document costs one KV read, so the
+/// knob is bounded well below what the recall budget would allow.
+const SIMILAR_TOP_K_MAX: usize = 50;
 
 pub fn router() -> Router<Arc<AppServices>> {
     Router::new()
@@ -40,6 +47,8 @@ pub fn router() -> Router<Arc<AppServices>> {
             "/api/documents/by-external-id",
             get(get_by_external_id),
         )
+        .route("/api/documents/by-ids", post(get_by_ids))
+        .route("/api/documents/archive", patch(archive_documents))
         .route(
             "/api/documents/{docId}",
             get(get_document)
@@ -84,6 +93,24 @@ struct InsertTextRequest {
     // biz_id: request-level business line routing (optional, default "default")
     #[serde(default)]
     biz_id: Option<String>,
+    // Similar-document probe: report already-indexed documents of this biz
+    // shard that resemble `text`. Absent/false leaves the response untouched.
+    #[serde(default)]
+    return_similar: Option<bool>,
+    #[serde(default)]
+    similar_top_k: Option<usize>,
+    #[serde(default)]
+    similar_threshold: Option<f32>,
+    // R1 (archive layer): consolidation fields, all optional. Absent values
+    // keep the legacy defaults (active, level 0, no refs).
+    #[serde(default)]
+    archived: Option<bool>,
+    #[serde(default)]
+    level: Option<i32>,
+    #[serde(default)]
+    ref_ids: Option<Vec<String>>,
+    #[serde(default)]
+    merged_into: Option<String>,
 }
 
 /// R6: per-request processing options mapped onto DocumentProcessingOptions.
@@ -153,6 +180,9 @@ struct ListQuery {
     workspace: Option<String>,
     #[serde(default)]
     biz_id: Option<String>,
+    /// R2: exclude archived documents from list results at DB level.
+    #[serde(default)]
+    exclude_archived: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,6 +236,40 @@ struct ExternalIdQuery {
     #[serde(default)]
     biz_id: Option<String>,
 }
+
+/// R3 (archive layer): batch read by docId. Includes archived documents.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ByIdsRequest {
+    doc_ids: Vec<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    biz_id: Option<String>,
+}
+
+/// R4 (archive layer): flag-only update, no re-index.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveRequest {
+    doc_ids: Vec<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    biz_id: Option<String>,
+    #[serde(default)]
+    archived: Option<bool>,
+    #[serde(default)]
+    level: Option<i32>,
+    #[serde(default)]
+    ref_ids: Option<Vec<String>>,
+    #[serde(default)]
+    merged_into: Option<String>,
+}
+
+/// Upper bound on one batch read/archive call. EasyAI batches on its side;
+/// an unbounded list would fan out into unbounded storage round-trips.
+const ARCHIVE_BATCH_MAX: usize = 200;
 
 /// R2: resolve lifecycle ops for a request-level workspace/biz_id
 /// (None = default for both). Returns the normalized biz_id that all
@@ -315,6 +379,12 @@ async fn insert_text(
             request.create_time,
             request.metadata.as_ref(),
             options.as_ref(),
+            &crate::service::ArchiveFields {
+                archived: request.archived,
+                level: request.level,
+                ref_ids: request.ref_ids.clone(),
+                merged_into: request.merged_into.clone(),
+            },
             &ops,
             &biz_id,
         )
@@ -326,11 +396,70 @@ async fn insert_text(
     } else {
         "Document inserted"
     };
-    Ok(Json(json!({
+    let doc_id = &result.doc_id;
+    let mut body = json!({
         "status": "success",
-        "docId": result.doc_id,
+        "docId": doc_id,
         "message": message,
-    })))
+    });
+    // `similar` is written only when it was asked for: an absent key keeps the
+    // legacy response byte-identical, and `[]` on an enabled request then means
+    // "nothing similar" rather than "not requested".
+    if request.return_similar.unwrap_or(false) {
+        let (top_k, threshold) =
+            resolve_similar_params(request.similar_top_k, request.similar_threshold);
+        match state
+            .lifecycle_service
+            .find_similar_documents(&request.text, doc_id, top_k, threshold, &ops, &biz_id)
+            .await
+        {
+            Ok(similar) => {
+                body["similar"] = json!(similar
+                    .iter()
+                    .map(|doc| json!({
+                        "docId": doc.doc_id,
+                        "externalId": doc.external_id,
+                        "filePath": doc.file_path,
+                        "score": doc.score,
+                        "contentSummary": doc.content_summary,
+                    }))
+                    .collect::<Vec<_>>());
+            }
+            Err(e) => {
+                // The document is already stored; a failed probe must not fail
+                // the ingest. The cause stays in the log — response bodies are
+                // sanitized, so only a fixed marker reaches the caller.
+                tracing::warn!("Similar-document probe failed for doc {doc_id}: {e:?}");
+                body["similar"] = json!([]);
+                body["message"] = json!(format!("{message}; similar search unavailable"));
+            }
+        }
+    }
+    Ok(Json(body))
+}
+
+/// Effective probe knobs: `similarTopK` converged into `1..=SIMILAR_TOP_K_MAX`
+/// and `similarThreshold` into `0.0..=1.0`. Out-of-range values are clamped with
+/// a warning instead of rejected — a probe returning slightly more or fewer
+/// documents is not worth failing an ingest that already succeeded.
+fn resolve_similar_params(top_k: Option<usize>, threshold: Option<f32>) -> (usize, f32) {
+    let effective_top_k = top_k
+        .unwrap_or(DEFAULT_SIMILAR_TOP_K)
+        .clamp(1, SIMILAR_TOP_K_MAX);
+    if top_k.is_some_and(|v| v != effective_top_k) {
+        tracing::warn!("similarTopK {top_k:?} out of range; using {effective_top_k}");
+    }
+    let requested = threshold.unwrap_or(DEFAULT_SIMILAR_THRESHOLD);
+    // NaN survives `clamp`, and a NaN threshold would reject every hit.
+    let effective_threshold = if requested.is_finite() {
+        requested.clamp(0.0, 1.0)
+    } else {
+        DEFAULT_SIMILAR_THRESHOLD
+    };
+    if effective_threshold != requested {
+        tracing::warn!("similarThreshold {requested} out of range; using {effective_threshold}");
+    }
+    (effective_top_k, effective_threshold)
 }
 
 /// Filename validation.
@@ -487,6 +616,7 @@ async fn list_documents(
     if explicit.is_none() {
         resolved.biz_id = String::new();
     }
+    let exclude_archived = query.exclude_archived.unwrap_or(false);
     let (docs, total) = resolved
         .context
         .bundle
@@ -499,6 +629,7 @@ async fn list_documents(
             "updated_at",
             "desc",
             query.file_path_prefix.as_deref(),
+            exclude_archived,
             &resolved.biz_id,
         )
         .await?;
@@ -517,6 +648,10 @@ async fn list_documents(
                 "externalId": doc.external_id,
                 "hasStructure": doc.has_structure,
                 "bizId": doc.biz_id,
+                "archived": doc.archived,
+                "level": doc.level,
+                "refIds": doc.ref_ids,
+                "mergedInto": doc.merged_into,
             })
         })
         .collect();
@@ -554,6 +689,52 @@ async fn get_by_external_id(
         .get_by_external_id(&query.external_id, &ops, &biz_id)
         .await?;
     Ok(Json(result))
+}
+
+/// R3 (archive layer): batch-read full documents by docId.
+/// Archived documents are included by design (history drill-down).
+async fn get_by_ids(
+    state: AppState,
+    Json(request): Json<ByIdsRequest>,
+) -> AppResult<Json<Value>> {
+    if request.doc_ids.len() > ARCHIVE_BATCH_MAX {
+        return Err(AppError::bad_request(format!(
+            "docIds exceeds the maximum of {ARCHIVE_BATCH_MAX} per request"
+        )));
+    }
+    let (ops, biz_id) =
+        ops_for(&state, request.workspace.as_deref(), request.biz_id.as_deref()).await?;
+    let documents = state
+        .lifecycle_service
+        .get_documents_by_ids(&request.doc_ids, &ops, &biz_id)
+        .await?;
+    Ok(Json(json!({ "documents": documents })))
+}
+
+/// R4 (archive layer): update archived/level/ref_ids/merged_into only.
+/// Content and vectors are untouched, so no re-index happens.
+async fn archive_documents(
+    state: AppState,
+    Json(request): Json<ArchiveRequest>,
+) -> AppResult<Json<Value>> {
+    if request.doc_ids.len() > ARCHIVE_BATCH_MAX {
+        return Err(AppError::bad_request(format!(
+            "docIds exceeds the maximum of {ARCHIVE_BATCH_MAX} per request"
+        )));
+    }
+    let (ops, biz_id) =
+        ops_for(&state, request.workspace.as_deref(), request.biz_id.as_deref()).await?;
+    let fields = crate::service::ArchiveFields {
+        archived: request.archived,
+        level: request.level,
+        ref_ids: request.ref_ids,
+        merged_into: request.merged_into,
+    };
+    let results = state
+        .lifecycle_service
+        .archive_documents(&request.doc_ids, &fields, &ops, &biz_id)
+        .await?;
+    Ok(Json(json!({ "results": results })))
 }
 
 /// R6: index a single document asynchronously, bypassing the global
@@ -950,4 +1131,52 @@ async fn clear_cache(state: AppState) -> AppResult<Json<Value>> {
     StorageNameSpace::drop(&*state.graph_storage as &dyn StorageNameSpace, biz_id).await?;
     StorageNameSpace::drop(&*state.doc_status_storage as &dyn StorageNameSpace, biz_id).await?;
     Ok(Json(success_response("All data cleared successfully", None)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::DEFAULT_SIMILAR_THRESHOLD;
+
+    #[test]
+    fn absent_probe_params_take_the_server_defaults() {
+        assert_eq!(
+            resolve_similar_params(None, None),
+            (DEFAULT_SIMILAR_TOP_K, DEFAULT_SIMILAR_THRESHOLD)
+        );
+    }
+
+    #[test]
+    fn in_range_probe_params_pass_through() {
+        assert_eq!(resolve_similar_params(Some(3), Some(0.55)), (3, 0.55));
+        // Both bounds of each range are valid inputs, not off-by-ones.
+        assert_eq!(resolve_similar_params(Some(1), Some(0.0)), (1, 0.0));
+        assert_eq!(
+            resolve_similar_params(Some(SIMILAR_TOP_K_MAX), Some(1.0)),
+            (SIMILAR_TOP_K_MAX, 1.0)
+        );
+    }
+
+    #[test]
+    fn out_of_range_probe_params_are_clamped_not_rejected() {
+        assert_eq!(resolve_similar_params(Some(0), Some(-0.2)), (1, 0.0));
+        assert_eq!(
+            resolve_similar_params(Some(9999), Some(1.5)),
+            (SIMILAR_TOP_K_MAX, 1.0)
+        );
+    }
+
+    #[test]
+    fn a_non_finite_threshold_falls_back_to_the_default() {
+        // `f32::clamp` hands NaN straight back, and every `score >= NaN`
+        // comparison is false — an unguarded NaN would silently match nothing.
+        assert_eq!(
+            resolve_similar_params(None, Some(f32::NAN)).1,
+            DEFAULT_SIMILAR_THRESHOLD
+        );
+        assert_eq!(
+            resolve_similar_params(None, Some(f32::INFINITY)).1,
+            DEFAULT_SIMILAR_THRESHOLD
+        );
+    }
 }

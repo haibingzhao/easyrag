@@ -15,7 +15,7 @@ use easyrag_core::model::document_structure::{DocumentStructureIndex, SectionNod
 use easyrag_core::storage::traits::{
     DocStatusStorage, GraphStorage, KVStorage, StorageBundle, VectorStorage,
 };
-use easyrag_core::util::hash::compute_mdhash_id;
+use easyrag_core::util::hash::{compute_args_hash, compute_mdhash_id};
 use easyrag_core::{JsonMap, JsonValue};
 use easyrag_pipeline::{
     EasyRAG, EasyRAGConfigBuilder, IngestionPipeline, TextParserRegistry, QueryEngine,
@@ -44,6 +44,10 @@ use tower::ServiceExt;
 
 struct ConstFunc;
 
+/// Texts starting with this fail to embed, so a case can drive a degradation
+/// path without a second mock embedding type.
+const EMBED_FAIL_PREFIX: &str = "EMBED-FAIL";
+
 #[async_trait]
 impl EmbeddingFunction for ConstFunc {
     async fn embed(
@@ -51,6 +55,11 @@ impl EmbeddingFunction for ConstFunc {
         texts: Vec<String>,
         _context: Option<EmbeddingContext>,
     ) -> easyrag_core::Result<Vec<Vec<f32>>> {
+        if texts.iter().any(|t| t.starts_with(EMBED_FAIL_PREFIX)) {
+            return Err(easyrag_core::CoreError::Internal(
+                "embedding provider unavailable".to_string(),
+            ));
+        }
         Ok(texts.iter().map(|_| vec![1f32, 0f32, 0f32, 0f32]).collect())
     }
 }
@@ -120,6 +129,7 @@ struct Env {
     /// knowledge-base state (structure index, registry row, chunks) before
     /// issuing its request instead of reaching into `resolver.context`.
     kv: Arc<dyn KVStorage>,
+    vector: Arc<dyn VectorStorage>,
     doc_status: Arc<dyn DocStatusStorage>,
     _temp_dir: tempfile::TempDir,
 }
@@ -203,6 +213,7 @@ async fn build_env_with_data_structure(
     let query_engine = Arc::new(query_engine);
     // Handles for `Env`, cloned before the originals are moved into `AppServices`.
     let kv_handle: Arc<dyn KVStorage> = kv.clone();
+    let vector_handle: Arc<dyn VectorStorage> = vector.clone();
     let doc_status_handle: Arc<dyn DocStatusStorage> = doc_status.clone();
     let pipeline = Arc::new(IngestionPipeline::new(
         llm.clone(),
@@ -278,6 +289,7 @@ async fn build_env_with_data_structure(
         router: build_router(services),
         resolver,
         kv: kv_handle,
+        vector: vector_handle,
         doc_status: doc_status_handle,
         _temp_dir: temp_dir,
     }
@@ -426,6 +438,70 @@ async fn query_data_returns_entities_relations_chunks() {
     assert!(body["entities"].is_array());
     assert!(body["relations"].is_array());
     assert!(body["chunks"].is_array());
+}
+
+/// Acceptance for the chunk `doc_id`: a document written through the ingest API
+/// is addressable from a retrieval hit — the projected id is the same one the
+/// registry lists, so citing what was retrieved costs no extra round trip.
+#[tokio::test]
+async fn query_data_chunk_doc_id_matches_the_registry_id() {
+    let env = build_env(false, false).await;
+    let (status, body) = post_json(
+        &env,
+        "/api/documents/text",
+        json!({
+            "text": "Deploy windows are frozen on Fridays and reopen on Mondays.",
+            "filePath": "easyai/memory/deploy-windows.md",
+            "externalId": "memory/deploy-windows.md",
+            "options": {"skipKg": true},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc_id = body["docId"].as_str().unwrap_or_default().to_string();
+    assert!(!doc_id.is_empty(), "{body}");
+
+    // Inserting only registers the document; chunking and embedding run in the
+    // R6 background task, so recall has to wait for it.
+    let (status, body) =
+        post_json(&env, &format!("/api/documents/{doc_id}/index"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut processed = false;
+    for _ in 0..200 {
+        let (status, body) = get_json(&env, &format!("/api/documents/status?docId={doc_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_ne!(body["status"], "failed", "{body}");
+        if body["status"] == "processed" {
+            processed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(processed, "document {doc_id} never reached a terminal status");
+
+    let (status, body) = post_json(
+        &env,
+        "/api/query/data",
+        json!({"query": "frozen on Fridays", "mode": "naive", "chunkTopK": 5}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let chunks = body["chunks"].as_array().unwrap();
+    assert!(!chunks.is_empty(), "{body}");
+    for chunk in chunks {
+        assert_eq!(chunk["doc_id"], doc_id, "{body}");
+    }
+
+    let (status, list) = get_json(&env, "/api/documents/list?page=1&pageSize=10").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert!(
+        list["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|doc| doc["id"] == doc_id),
+        "{list}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -623,6 +699,85 @@ async fn seed_registry_doc(env: &Env, doc_id: &str, file_path: &str, chunks_list
     let mut batch = HashMap::new();
     batch.insert(doc_id.to_string(), row);
     env.doc_status.upsert(batch, DEFAULT_BIZ_ID).await.unwrap();
+}
+
+/// A document that already went through the pipeline, as the similarity probe
+/// sees one: the KV record it summarizes, the registry row it falls back to and
+/// the chunk vector it recalls. `content_hash` matters — without it a re-write of
+/// the same text takes the overwrite path (cascade delete) instead of the
+/// idempotent skip, which would delete the very neighbour a case seeded.
+/// Returns the docId the externalId derives to.
+async fn seed_indexed_doc(
+    env: &Env,
+    external_id: &str,
+    file_path: &str,
+    content: &str,
+    biz_id: &str,
+) -> String {
+    let doc_id = DocumentLifecycleService::derive_external_doc_id(external_id);
+    let chunk_id = compute_mdhash_id(content, "chunk-");
+
+    let mut doc = JsonMap::new();
+    doc.insert("content".into(), JsonValue::String(content.to_string()));
+    doc.insert("file_path".into(), JsonValue::String(file_path.to_string()));
+    doc.insert(
+        "external_id".into(),
+        JsonValue::String(external_id.to_string()),
+    );
+    let mut kv_batch = HashMap::new();
+    kv_batch.insert(doc_id.clone(), doc);
+    env.kv.upsert(kv_batch, biz_id).await.unwrap();
+
+    let mut chunk = JsonMap::new();
+    chunk.insert("content".into(), JsonValue::String(content.to_string()));
+    chunk.insert(
+        "full_doc_id".into(),
+        JsonValue::String(doc_id.clone()),
+    );
+    chunk.insert("file_path".into(), JsonValue::String(file_path.to_string()));
+    let mut vector_batch = HashMap::new();
+    vector_batch.insert(chunk_id.clone(), chunk);
+    env.vector.upsert(vector_batch, biz_id).await.unwrap();
+
+    let mut row = JsonMap::new();
+    row.insert(
+        "content_summary".into(),
+        JsonValue::String(content.chars().take(100).collect()),
+    );
+    row.insert(
+        "content_length".into(),
+        JsonValue::from(content.chars().count() as u64),
+    );
+    row.insert("file_path".into(), JsonValue::String(file_path.to_string()));
+    row.insert(
+        "status".into(),
+        JsonValue::String(DocStatus::Processed.value().to_string()),
+    );
+    row.insert(
+        "created_at".into(),
+        JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+    );
+    row.insert(
+        "updated_at".into(),
+        JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+    );
+    row.insert(
+        "external_id".into(),
+        JsonValue::String(external_id.to_string()),
+    );
+    row.insert(
+        "content_hash".into(),
+        JsonValue::String(compute_args_hash([content])),
+    );
+    row.insert(
+        "chunks_list".into(),
+        JsonValue::Array(vec![JsonValue::String(chunk_id)]),
+    );
+    let mut status_batch = HashMap::new();
+    status_batch.insert(doc_id.clone(), row);
+    env.doc_status.upsert(status_batch, biz_id).await.unwrap();
+
+    doc_id
 }
 
 async fn seed_structure_index(env: &Env, doc_id: &str, index: &DocumentStructureIndex) {
@@ -1591,4 +1746,857 @@ async fn tenant_config_rejects_default_workspace() {
         delete_json(&env, "/api/admin/tenant-config?workspace=default").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["status"], 400);
+}
+
+// ---------------------------------------------------------------------
+// Similar-document probe (returnSimilar on /api/documents/text)
+// ---------------------------------------------------------------------
+
+/// A similar neighbour of the same shard is reported with everything the caller
+/// needs to merge or delete it: identity, provenance, score and the body's head.
+#[tokio::test]
+async fn insert_text_similar_reports_an_indexed_neighbour() {
+    let env = build_env(false, false).await;
+    let neighbour = "User prefers terse answers and no trailing summaries during code review.";
+    let doc_id = seed_indexed_doc(
+        &env,
+        "memory/feedback/terse-answers.md",
+        "easyai/memory/feedback/terse-answers.md",
+        neighbour,
+        DEFAULT_BIZ_ID,
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &env,
+        "/api/documents/text",
+        json!({
+            "text": "User wants terse answers, without summaries at the end of a review.",
+            "filePath": "easyai/memory/feedback/terse.md",
+            "externalId": "memory/feedback/terse.md",
+            "returnSimilar": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "success");
+    // The ingest itself is unchanged by the probe.
+    assert_eq!(body["message"], "Document inserted");
+
+    let similar = body["similar"]
+        .as_array()
+        .expect("similar is an array whenever it was requested");
+    assert_eq!(similar.len(), 1, "{similar:?}");
+    assert_eq!(similar[0]["docId"], doc_id);
+    assert_eq!(similar[0]["externalId"], "memory/feedback/terse-answers.md");
+    assert_eq!(
+        similar[0]["filePath"],
+        "easyai/memory/feedback/terse-answers.md"
+    );
+    // ConstFunc embeds every text to the same vector, so the cosine score is 1.
+    assert!(similar[0]["score"].as_f64().unwrap() >= 0.999, "{similar:?}");
+    assert_eq!(similar[0]["contentSummary"], neighbour);
+}
+
+/// Regression: the probe is opt-in, and an unrequested response carries no
+/// `similar` key at all — not an empty one — so legacy callers see the exact
+/// body they saw before.
+#[tokio::test]
+async fn insert_text_similar_absent_unless_requested() {
+    let env = build_env(false, false).await;
+    seed_indexed_doc(
+        &env,
+        "ext-neighbour",
+        "neighbour.md",
+        "An already indexed memory about deploy windows and freeze dates.",
+        DEFAULT_BIZ_ID,
+    )
+    .await;
+
+    for payload in [
+        json!({"text": "A new memory about deploy windows and freeze dates."}),
+        json!({
+            "text": "Another memory about deploy windows and freeze dates.",
+            "returnSimilar": false,
+        }),
+    ] {
+        let (status, body) = post_json(&env, "/api/documents/text", payload).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "success");
+        assert!(body.get("similar").is_none(), "{body}");
+        assert_eq!(body["message"], "Document inserted");
+        assert!(body["docId"].as_str().unwrap().starts_with("doc-"));
+    }
+}
+
+/// Shard isolation: an identical text stored under another bizId must not
+/// surface — the probe carries the resolved shard into the vector query.
+#[tokio::test]
+async fn insert_text_similar_stays_inside_the_biz_shard() {
+    let env = build_env(false, false).await;
+    let content = "A memory that lives in a completely different biz shard.";
+    seed_indexed_doc(
+        &env,
+        "ext-other-shard",
+        "other.md",
+        content,
+        "u_other_project",
+    )
+    .await;
+
+    // Pin the reason an empty `similar` is the right answer: the chunk is
+    // recallable, just not from this shard.
+    assert_eq!(
+        env.vector
+            .query(content, 10, None, None, None, false, "u_other_project")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(env
+        .vector
+        .query(content, 10, None, None, None, false, "u_my_project")
+        .await
+        .unwrap()
+        .is_empty());
+
+    let (status, body) = post_json(
+        &env,
+        "/api/documents/text",
+        json!({
+            // Byte-identical to the seeded neighbour: only the shard keeps it out.
+            "text": content,
+            "externalId": "ext-mine",
+            "bizId": "u_my_project",
+            "returnSimilar": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["similar"], json!([]));
+}
+
+/// Self-exclusion on the idempotent-skip path, where the document's own chunks
+/// are already indexed and would otherwise top its own list at 1.0.
+#[tokio::test]
+async fn insert_text_similar_excludes_the_document_itself() {
+    let env = build_env(false, false).await;
+    let content = "The staging deploy window is Tuesday 02:00 UTC, frozen before releases.";
+    let doc_id = seed_indexed_doc(
+        &env,
+        "memory/project/deploy-window.md",
+        "easyai/memory/project/deploy-window.md",
+        content,
+        DEFAULT_BIZ_ID,
+    )
+    .await;
+
+    // The document's own chunk is in the store and recallable, so the empty
+    // result below can only come from the self-exclusion.
+    let recalled = env
+        .vector
+        .query(content, 10, None, None, None, false, DEFAULT_BIZ_ID)
+        .await
+        .unwrap();
+    assert_eq!(recalled.len(), 1, "{recalled:?}");
+    assert_eq!(
+        recalled[0].get("full_doc_id").and_then(|v| v.as_str()),
+        Some(doc_id.as_str())
+    );
+
+    let (status, body) = post_json(
+        &env,
+        "/api/documents/text",
+        json!({
+            "text": content,
+            "externalId": "memory/project/deploy-window.md",
+            "returnSimilar": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["docId"], doc_id);
+    assert_eq!(body["message"], "Document unchanged, skipped reprocessing");
+    assert_eq!(body["similar"], json!([]));
+}
+
+/// Degradation: a failing probe never fails the ingest, and the provider-side
+/// cause stays out of the response body.
+#[tokio::test]
+async fn insert_text_similar_failure_degrades_to_an_empty_list() {
+    let env = build_env(false, false).await;
+    seed_indexed_doc(
+        &env,
+        "ext-neighbour",
+        "neighbour.md",
+        "An already indexed memory about deploy windows and freeze dates.",
+        DEFAULT_BIZ_ID,
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &env,
+        "/api/documents/text",
+        json!({
+            // Ingestion never embeds, so the sentinel only breaks the probe.
+            "text": "EMBED-FAIL a memory whose probe cannot be embedded at all.",
+            "externalId": "ext-broken-probe",
+            "returnSimilar": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "success");
+    assert!(body["docId"].as_str().unwrap().starts_with("doc-"));
+    assert_eq!(body["similar"], json!([]));
+    assert_eq!(body["message"], "Document inserted; similar search unavailable");
+    assert!(!body.to_string().contains("embedding provider unavailable"), "{body}");
+}
+
+/// `similarTopK` bounds the result, and an out-of-range `similarThreshold` is
+/// clamped instead of silently matching nothing.
+#[tokio::test]
+async fn insert_text_similar_honours_top_k_and_clamps_the_threshold() {
+    let env = build_env(false, false).await;
+    for (external_id, content) in [
+        ("ext-1", "First indexed memory about the release checklist."),
+        ("ext-2", "Second indexed memory about the release checklist."),
+    ] {
+        seed_indexed_doc(&env, external_id, "checklist.md", content, DEFAULT_BIZ_ID).await;
+    }
+
+    let (status, body) = post_json(
+        &env,
+        "/api/documents/text",
+        json!({
+            "text": "A third memory about the release checklist for this project.",
+            "externalId": "ext-3",
+            "returnSimilar": true,
+            "similarTopK": 1,
+            // Above every possible cosine score: clamped to 1.0, not honored.
+            "similarThreshold": 1.5,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let similar = body["similar"].as_array().unwrap();
+    assert_eq!(similar.len(), 1, "{similar:?}");
+    assert!(similar[0]["score"].as_f64().unwrap() >= 0.999, "{similar:?}");
+}
+
+/// A chunk whose document is gone must not become a `similar` entry with empty
+/// identity — the caller cannot act on it.
+#[tokio::test]
+async fn insert_text_similar_drops_a_dangling_chunk() {
+    let env = build_env(false, false).await;
+    let mut chunk = JsonMap::new();
+    chunk.insert(
+        "content".into(),
+        JsonValue::String("An orphaned chunk whose document was deleted.".to_string()),
+    );
+    chunk.insert(
+        "full_doc_id".into(),
+        JsonValue::String("doc-doesnotexist".to_string()),
+    );
+    let mut batch = HashMap::new();
+    batch.insert(compute_mdhash_id("An orphaned chunk whose document was deleted.", "chunk-"), chunk);
+    env.vector.upsert(batch, DEFAULT_BIZ_ID).await.unwrap();
+
+    // Recall does find the chunk; what drops it is the missing document behind
+    // it, not an empty result set.
+    assert_eq!(
+        env.vector
+            .query(
+                "An orphaned chunk whose document was deleted.",
+                10,
+                None,
+                None,
+                None,
+                false,
+                DEFAULT_BIZ_ID
+            )
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let (status, body) = post_json(
+        &env,
+        "/api/documents/text",
+        json!({
+            "text": "A memory about an orphaned chunk whose document was deleted.",
+            "externalId": "ext-probe",
+            "returnSimilar": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["similar"], json!([]));
+}
+
+// ---------------------------------------------------------------------
+// Memory archive layer (R1-R5)
+// ---------------------------------------------------------------------
+
+/// Insert the four archive fields in their canonical shape. Status rows always
+/// carry all four; chunk rows mirror them so `query/data` can echo them.
+fn put_archive_fields(
+    map: &mut JsonMap,
+    archived: bool,
+    level: i64,
+    ref_ids: &[&str],
+    merged_into: Option<&str>,
+) {
+    map.insert("archived".into(), JsonValue::Bool(archived));
+    map.insert("level".into(), JsonValue::from(level));
+    map.insert(
+        "ref_ids".into(),
+        JsonValue::Array(
+            ref_ids
+                .iter()
+                .map(|id| JsonValue::String((*id).to_string()))
+                .collect(),
+        ),
+    );
+    map.insert(
+        "merged_into".into(),
+        merged_into
+            .map(|m| JsonValue::String(m.to_string()))
+            .unwrap_or(JsonValue::Null),
+    );
+}
+
+/// Seed one fully-indexed document carrying archive fields: KV doc, status row
+/// and one chunk vector. Mirrors what the pipeline writes, without the async
+/// queue. Returns the derived docId.
+async fn seed_archive_doc(
+    env: &Env,
+    external_id: &str,
+    content: &str,
+    archived: bool,
+    level: i64,
+    ref_ids: &[&str],
+    merged_into: Option<&str>,
+) -> String {
+    let doc_id = DocumentLifecycleService::derive_external_doc_id(external_id);
+    let chunk_id = compute_mdhash_id(content, "chunk-");
+    let file_path = format!("easyai/{external_id}.md");
+    let create_time = 1_700_000_000i64;
+
+    let mut doc = JsonMap::new();
+    doc.insert("content".into(), JsonValue::String(content.to_string()));
+    doc.insert("file_path".into(), JsonValue::String(file_path.clone()));
+    doc.insert(
+        "external_id".into(),
+        JsonValue::String(external_id.to_string()),
+    );
+    doc.insert("create_time_epoch".into(), JsonValue::from(create_time));
+    put_archive_fields(&mut doc, archived, level, ref_ids, merged_into);
+    let mut kv_batch = HashMap::new();
+    kv_batch.insert(doc_id.clone(), doc);
+    env.kv.upsert(kv_batch, DEFAULT_BIZ_ID).await.unwrap();
+
+    let mut chunk = JsonMap::new();
+    chunk.insert("content".into(), JsonValue::String(content.to_string()));
+    chunk.insert(
+        "full_doc_id".into(),
+        JsonValue::String(doc_id.clone()),
+    );
+    chunk.insert("file_path".into(), JsonValue::String(file_path.clone()));
+    chunk.insert("create_time".into(), JsonValue::from(create_time));
+    put_archive_fields(&mut chunk, archived, level, ref_ids, merged_into);
+    let mut vector_batch = HashMap::new();
+    vector_batch.insert(chunk_id.clone(), chunk);
+    env.vector.upsert(vector_batch, DEFAULT_BIZ_ID).await.unwrap();
+
+    let mut row = JsonMap::new();
+    row.insert(
+        "content_summary".into(),
+        JsonValue::String(content.chars().take(100).collect()),
+    );
+    row.insert(
+        "content_length".into(),
+        JsonValue::from(content.chars().count() as u64),
+    );
+    row.insert("file_path".into(), JsonValue::String(file_path));
+    row.insert(
+        "status".into(),
+        JsonValue::String(DocStatus::Processed.value().to_string()),
+    );
+    row.insert(
+        "created_at".into(),
+        JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+    );
+    row.insert(
+        "updated_at".into(),
+        JsonValue::String("2026-01-01T00:00:00Z".to_string()),
+    );
+    row.insert(
+        "external_id".into(),
+        JsonValue::String(external_id.to_string()),
+    );
+    row.insert(
+        "content_hash".into(),
+        JsonValue::String(compute_args_hash([content])),
+    );
+    row.insert("chunks_count".into(), JsonValue::from(1u64));
+    row.insert(
+        "chunks_list".into(),
+        JsonValue::Array(vec![JsonValue::String(chunk_id)]),
+    );
+    put_archive_fields(&mut row, archived, level, ref_ids, merged_into);
+    let mut status_batch = HashMap::new();
+    status_batch.insert(doc_id.clone(), row);
+    env.doc_status.upsert(status_batch, DEFAULT_BIZ_ID).await.unwrap();
+
+    doc_id
+}
+
+async fn patch_json(env: &Env, uri: &str, body: Value) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = env.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// R1: ingest accepts the four fields and every read path echoes them back.
+#[tokio::test]
+async fn ingest_accepts_archive_fields_and_echoes_them() {
+    let env = build_env(false, false).await;
+    let (status, body) = post_json(
+        &env,
+        "/api/documents/text",
+        json!({
+            "text": "Merged memory body.",
+            "externalId": "ext-archive-fields",
+            "archived": true,
+            "level": 2,
+            "refIds": ["doc-a", "doc-b"],
+            "mergedInto": "doc-parent",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc_id = body["docId"].as_str().unwrap().to_string();
+
+    let (status, body) = get_json(
+        &env,
+        "/api/documents/by-external-id?externalId=ext-archive-fields",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["doc_id"], doc_id);
+    assert_eq!(body["archived"], true);
+    assert_eq!(body["level"], 2);
+    assert_eq!(body["ref_ids"], json!(["doc-a", "doc-b"]));
+    assert_eq!(body["merged_into"], "doc-parent");
+
+    let (status, body) = get_json(&env, "/api/documents/list?page=1&pageSize=10").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 1);
+    let listed = &body["documents"][0];
+    assert_eq!(listed["archived"], true);
+    assert_eq!(listed["level"], 2);
+    assert_eq!(listed["refIds"], json!(["doc-a", "doc-b"]));
+    assert_eq!(listed["mergedInto"], "doc-parent");
+}
+
+/// R2: `excludeArchived` is a storage-level filter on both recall and listing,
+/// and the default (absent) keeps the pre-R2 result set byte-for-byte.
+#[tokio::test]
+async fn query_and_list_exclude_archived_at_storage_level() {
+    let env = build_env(false, false).await;
+    let _active_1 = seed_archive_doc(
+        &env,
+        "ext-active-1",
+        "alpha memory about deploys",
+        false,
+        0,
+        &[],
+        None,
+    )
+    .await;
+    let _active_2 = seed_archive_doc(
+        &env,
+        "ext-active-2",
+        "beta memory about releases",
+        false,
+        0,
+        &[],
+        None,
+    )
+    .await;
+    let archived = seed_archive_doc(
+        &env,
+        "ext-archived-1",
+        "gamma memory about deploys",
+        true,
+        0,
+        &[],
+        Some("doc-parent"),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &env,
+        "/api/query/data",
+        json!({"query": "memory about deploys", "mode": "naive", "chunkTopK": 10}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let all_chunks = body["chunks"].as_array().unwrap();
+    assert_eq!(all_chunks.len(), 3, "{body}");
+    // R1: every hit echoes the four archive fields; the legacy defaults are
+    // materialized rather than absent.
+    let archived_hit = all_chunks
+        .iter()
+        .find(|c| c["content"] == "gamma memory about deploys")
+        .expect("archived chunk should be recallable without the flag");
+    assert_eq!(archived_hit["archived"], true);
+    assert_eq!(archived_hit["merged_into"], "doc-parent");
+    for c in all_chunks.iter().filter(|c| c["archived"] != true) {
+        assert_eq!(c["level"], 0);
+        assert_eq!(c["ref_ids"], json!([]));
+        assert!(c["merged_into"].is_null());
+    }
+
+    let (status, body) = post_json(
+        &env,
+        "/api/query/data",
+        json!({
+            "query": "memory about deploys",
+            "mode": "naive",
+            "chunkTopK": 10,
+            "excludeArchived": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let chunks = body["chunks"].as_array().unwrap();
+    assert_eq!(chunks.len(), 2, "{body}");
+    let hit_contents: Vec<&str> = chunks
+        .iter()
+        .filter_map(|c| c["content"].as_str())
+        .collect();
+    assert!(hit_contents.contains(&"alpha memory about deploys"));
+    assert!(hit_contents.contains(&"beta memory about releases"));
+    assert!(!hit_contents.contains(&"gamma memory about deploys"));
+
+    let (status, body) =
+        get_json(&env, "/api/documents/list?page=1&pageSize=10&excludeArchived=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 2, "{body}");
+    assert_eq!(body["documents"].as_array().unwrap().len(), 2, "{body}");
+    let listed_ids: Vec<&str> = body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["id"].as_str())
+        .collect();
+    assert!(!listed_ids.contains(&archived.as_str()));
+
+    // Default: no exclusion, same as before the flag existed.
+    let (status, body) = get_json(&env, "/api/documents/list?page=1&pageSize=10").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 3, "{body}");
+}
+
+/// R3: by-ids reads archived documents too, and a missing id is omitted rather
+/// than failing the batch.
+#[tokio::test]
+async fn by_ids_reads_archived_docs_and_omits_missing_ids() {
+    let env = build_env(false, false).await;
+    let archived = seed_archive_doc(
+        &env,
+        "ext-byids-archived",
+        "The archived source memory body.",
+        true,
+        1,
+        &["doc-ref-1", "doc-ref-2"],
+        Some("doc-merged"),
+    )
+    .await;
+
+    let (status, body) = post_json(
+        &env,
+        "/api/documents/by-ids",
+        json!({"docIds": [archived, "doc-does-not-exist"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let docs = body["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 1, "{body}");
+    let doc = &docs[0];
+    assert_eq!(doc["doc_id"], archived);
+    assert_eq!(doc["external_id"], "ext-byids-archived");
+    assert_eq!(doc["content"], "The archived source memory body.");
+    assert_eq!(doc["status"], "processed");
+    assert_eq!(doc["chunks_count"], 1);
+    assert_eq!(doc["archived"], true);
+    assert_eq!(doc["level"], 1);
+    assert_eq!(doc["ref_ids"], json!(["doc-ref-1", "doc-ref-2"]));
+    assert_eq!(doc["merged_into"], "doc-merged");
+    assert!(doc["error_msg"].is_null());
+    assert_eq!(doc["has_structure"], false);
+
+    // Oversized batches fail fast instead of fanning out.
+    let too_many: Vec<String> = (0..201).map(|i| format!("doc-{i}")).collect();
+    let (status, _) = post_json(
+        &env,
+        "/api/documents/by-ids",
+        json!({"docIds": too_many}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// R4: archive flips the flags only — no re-chunk/re-embedding — and the change
+/// is visible to by-ids, recall and listing immediately.
+#[tokio::test]
+async fn archive_updates_flags_without_reindexing() {
+    let env = build_env(false, false).await;
+    let doc_id = seed_archive_doc(
+        &env,
+        "ext-archive-source",
+        "A source memory absorbed by the merged one.",
+        false,
+        0,
+        &[],
+        None,
+    )
+    .await;
+
+    // One chunk row before the archive call; the same row must survive it.
+    assert_eq!(
+        env.vector
+            .query(
+                "source memory",
+                100,
+                Some(&[1f32, 0f32, 0f32, 0f32]),
+                None,
+                None,
+                false,
+                DEFAULT_BIZ_ID,
+            )
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let (status, body) = patch_json(
+        &env,
+        "/api/documents/archive",
+        json!({
+            "docIds": [doc_id, "doc-missing"],
+            "archived": true,
+            "mergedInto": "doc-merged",
+            "level": 1,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "{body}");
+    assert_eq!(results[0]["docId"], doc_id);
+    assert_eq!(results[0]["status"], "success");
+    assert_eq!(results[0]["updated"], true);
+    assert_eq!(results[1]["status"], "not_found");
+
+    // The doc KV row is the source of truth for reprocessing; it must mirror
+    // the archive update too.
+    let kv_doc = env
+        .kv
+        .get_by_id(&doc_id, DEFAULT_BIZ_ID)
+        .await
+        .unwrap()
+        .expect("kv doc exists");
+    assert_eq!(kv_doc.get("archived").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        kv_doc.get("merged_into").and_then(|v| v.as_str()),
+        Some("doc-merged")
+    );
+
+    // Oversized archive batches fail fast.
+    let too_many: Vec<String> = (0..201).map(|i| format!("doc-{i}")).collect();
+    let (status, _) = patch_json(
+        &env,
+        "/api/documents/archive",
+        json!({"docIds": too_many, "archived": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Flags changed; content and chunk count did not.
+    let (status, body) = post_json(
+        &env,
+        "/api/documents/by-ids",
+        json!({"docIds": [doc_id]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc = &body["documents"][0];
+    assert_eq!(doc["archived"], true);
+    assert_eq!(doc["level"], 1);
+    assert_eq!(doc["merged_into"], "doc-merged");
+    assert_eq!(doc["chunks_count"], 1);
+    assert_eq!(doc["content"], "A source memory absorbed by the merged one.");
+
+    // Vector row still exists (nothing re-embedded or deleted), but recall now
+    // skips it when asked.
+    assert_eq!(
+        env.vector
+            .query(
+                "source memory",
+                100,
+                Some(&[1f32, 0f32, 0f32, 0f32]),
+                None,
+                None,
+                false,
+                DEFAULT_BIZ_ID,
+            )
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(env
+        .vector
+        .query(
+            "source memory",
+            100,
+            Some(&[1f32, 0f32, 0f32, 0f32]),
+            None,
+            None,
+            true,
+            DEFAULT_BIZ_ID,
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    let (status, body) =
+        get_json(&env, "/api/documents/list?page=1&pageSize=10&excludeArchived=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 0, "{body}");
+
+    // Unarchiving restores recall; still no reindex.
+    let (status, body) = patch_json(
+        &env,
+        "/api/documents/archive",
+        json!({"docIds": [doc_id], "archived": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["results"][0]["status"], "success");
+    assert_eq!(
+        env.vector
+            .query(
+                "source memory",
+                100,
+                Some(&[1f32, 0f32, 0f32, 0f32]),
+                None,
+                None,
+                true,
+                DEFAULT_BIZ_ID,
+            )
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// R5: the docId derived from an externalId survives content changes and
+/// archiving (it is a pure function of the key, never of the content).
+#[tokio::test]
+async fn external_id_doc_id_is_stable_across_upserts_and_archive() {
+    let env = build_env(false, false).await;
+    let first = post_json(
+        &env,
+        "/api/documents/text",
+        json!({"text": "version one", "externalId": "ext-stable"}),
+    )
+    .await;
+    assert_eq!(first.0, StatusCode::OK, "{}", first.1);
+    let doc_id = first.1["docId"].as_str().unwrap().to_string();
+
+    let second = post_json(
+        &env,
+        "/api/documents/text",
+        json!({"text": "version two with different content", "externalId": "ext-stable"}),
+    )
+    .await;
+    assert_eq!(second.0, StatusCode::OK, "{}", second.1);
+    assert_eq!(second.1["docId"], doc_id);
+
+    let archive = patch_json(
+        &env,
+        "/api/documents/archive",
+        json!({"docIds": [doc_id], "archived": true}),
+    )
+    .await;
+    assert_eq!(archive.0, StatusCode::OK, "{}", archive.1);
+
+    let (status, body) = get_json(
+        &env,
+        "/api/documents/by-external-id?externalId=ext-stable",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["doc_id"], doc_id);
+    assert_eq!(body["archived"], true);
+}
+
+/// Regression: an external-id content overwrite must inherit existing archive
+/// flags when the caller does not resupply them.
+#[tokio::test]
+async fn external_id_content_update_preserves_archive_fields() {
+    let env = build_env(false, false).await;
+    let first = post_json(
+        &env,
+        "/api/documents/text",
+        json!({
+            "text": "version one",
+            "externalId": "ext-stable-archive",
+            "archived": true,
+            "level": 2,
+            "refIds": ["doc-a"],
+            "mergedInto": "doc-parent",
+        }),
+    )
+    .await;
+    assert_eq!(first.0, StatusCode::OK, "{}", first.1);
+    let doc_id = first.1["docId"].as_str().unwrap().to_string();
+
+    let second = post_json(
+        &env,
+        "/api/documents/text",
+        json!({
+            "text": "version two with completely different content",
+            "externalId": "ext-stable-archive",
+        }),
+    )
+    .await;
+    assert_eq!(second.0, StatusCode::OK, "{}", second.1);
+    assert_eq!(second.1["docId"], doc_id);
+
+    let (status, body) = get_json(
+        &env,
+        "/api/documents/by-external-id?externalId=ext-stable-archive",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["doc_id"], doc_id);
+    assert_eq!(body["archived"], true);
+    assert_eq!(body["level"], 2);
+    assert_eq!(body["ref_ids"], json!(["doc-a"]));
+    assert_eq!(body["merged_into"], "doc-parent");
 }

@@ -484,6 +484,21 @@ impl EasyRAG {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
             biz_id: biz_id.to_string(),
+            archived: doc.get("archived").and_then(|v| v.as_bool()).unwrap_or(false),
+            level: doc.get("level").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            ref_ids: doc
+                .get("ref_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            merged_into: doc
+                .get("merged_into")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
         }))
     }
 

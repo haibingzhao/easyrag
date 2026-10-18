@@ -298,6 +298,7 @@ impl StructureAgentStrategy {
                     "updated_at",
                     "desc",
                     None,
+                    false, // agent queries include archived documents
                     biz_id,
                 )
                 .await?;
@@ -328,7 +329,7 @@ impl StructureAgentStrategy {
         // Legacy fallback: query vector storage for available documents.
         let results = self
             .vector_storage
-            .query("document", 10, None, None, None, biz_id)
+            .query("document", 10, None, None, None, false, biz_id)
             .await?;
         let mut doc_ids: Vec<String> = Vec::new();
         for r in &results {
@@ -382,7 +383,7 @@ impl StructureAgentStrategy {
         // Search for chunks matching this section path.
         let chunks = self
             .vector_storage
-            .query(section_path, 10, None, None, None, biz_id)
+            .query(section_path, 10, None, None, None, false, biz_id)
             .await?;
         let chunks: Vec<&JsonMap> = chunks
             .iter()

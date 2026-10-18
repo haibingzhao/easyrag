@@ -659,6 +659,46 @@ impl QueryEngine {
                             .cloned()
                             .unwrap_or(JsonValue::Null),
                     );
+                    // R1 (archive layer): echo the four consolidation fields on
+                    // every hit. Chunks written before R1 carry none of them,
+                    // so the defaults here are also the backward-compatible
+                    // contract (active, level 0, no refs, not merged).
+                    m.insert(
+                        "archived".into(),
+                        JsonValue::Bool(
+                            chunk
+                                .get("archived")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
+                        ),
+                    );
+                    m.insert(
+                        "level".into(),
+                        JsonValue::from(
+                            chunk.get("level").and_then(|v| v.as_i64()).unwrap_or(0),
+                        ),
+                    );
+                    m.insert(
+                        "ref_ids".into(),
+                        chunk
+                            .get("ref_ids")
+                            .cloned()
+                            .unwrap_or_else(|| JsonValue::Array(Vec::new())),
+                    );
+                    m.insert(
+                        "merged_into".into(),
+                        chunk.get("merged_into").cloned().unwrap_or(JsonValue::Null),
+                    );
+                    // Addressable provenance: the record's `full_doc_id`, i.e. the
+                    // same id `/api/documents/list` returns. A missing id projects
+                    // `null`, never an empty string that could pass for an id.
+                    m.insert(
+                        "doc_id".into(),
+                        match chunk.get("full_doc_id").and_then(|v| v.as_str()) {
+                            Some(id) => JsonValue::String(id.to_string()),
+                            None => JsonValue::Null,
+                        },
+                    );
                     m
                 })
                 .collect(),
@@ -836,6 +876,7 @@ impl QueryEngine {
                         None,
                         param.time_range_start,
                         param.time_range_end,
+                        param.exclude_archived,
                         &param.biz_id,
                     )
                     .await?
@@ -847,6 +888,7 @@ impl QueryEngine {
                         None,
                         param.time_range_start,
                         param.time_range_end,
+                        param.exclude_archived,
                         &multi_biz_refs,
                     )
                     .await?
@@ -983,21 +1025,125 @@ impl QueryEngine {
         top_k: usize,
         time_range_start: Option<i64>,
         time_range_end: Option<i64>,
+        exclude_archived: bool,
         biz_id: &str,
     ) -> easyrag_core::Result<Vec<JsonMap>> {
         let Some(keyword_search) = &self.keyword_search else {
             return self
                 .vector_storage
-                .query(query, top_k, None, time_range_start, time_range_end, biz_id)
+                .query(
+                    query,
+                    top_k,
+                    None,
+                    time_range_start,
+                    time_range_end,
+                    exclude_archived,
+                    biz_id,
+                )
                 .await;
         };
 
         let (vec_results, kw_results) = futures::try_join!(
-            self.vector_storage
-                .query(query, top_k, None, time_range_start, time_range_end, biz_id),
+            self.vector_storage.query(
+                query,
+                top_k,
+                None,
+                time_range_start,
+                time_range_end,
+                exclude_archived,
+                biz_id
+            ),
             keyword_search.keyword_query(query, top_k, time_range_start, time_range_end, biz_id)
         )?;
+        let kw_results = self
+            .hydrate_keyword_hits(kw_results, &[biz_id], exclude_archived)
+            .await?;
         Ok(rrf_fusion(vec_results, kw_results, self.rrf_k, 0.7, 0.3))
+    }
+
+    /// R1/R2 (archive layer): the keyword index schema is fixed and carries no
+    /// archive fields. Batch-read the authoritative vector rows *before*
+    /// fusion so every keyword hit (a) echoes the same four fields as vector
+    /// hits and (b) is dropped when `exclude_archived` is set. The vector leg
+    /// itself stays filtered in SQL; a hit whose row is gone keeps the pre-R2
+    /// behaviour (it is not known to be archived).
+    async fn hydrate_keyword_hits(
+        &self,
+        hits: Vec<JsonMap>,
+        biz_ids: &[&str],
+        exclude_archived: bool,
+    ) -> easyrag_core::Result<Vec<JsonMap>> {
+        if hits.is_empty() {
+            return Ok(hits);
+        }
+        // Group by the biz each hit came from so every read stays inside one
+        // shard; a hit with no provenance is left unhydrated rather than
+        // guessing a shard, and single-biz callers fall back to their only shard.
+        let mut by_biz: HashMap<String, Vec<String>> = HashMap::new();
+        for hit in &hits {
+            let Some(id) = hit.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(biz) = hit
+                .get("biz_id")
+                .and_then(|v| v.as_str())
+                .filter(|b| !b.is_empty())
+                .or_else(|| if biz_ids.len() == 1 { biz_ids.first().copied() } else { None })
+            else {
+                continue;
+            };
+            by_biz.entry(biz.to_string()).or_default().push(id.to_string());
+        }
+        let mut rows_by_id: HashMap<String, JsonMap> = HashMap::new();
+        for (biz, ids) in by_biz {
+            for row in self.vector_storage.get_by_ids(&ids, &biz).await? {
+                if let Some(id) = row.get("id").and_then(|v| v.as_str()) {
+                    rows_by_id.insert(id.to_string(), row);
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(hits.len());
+        for mut hit in hits {
+            let Some(id) = hit
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            else {
+                out.push(hit);
+                continue;
+            };
+            let Some(row) = rows_by_id.get(&id) else {
+                out.push(hit);
+                continue;
+            };
+            let archived = row.get("archived").and_then(|v| v.as_bool()).unwrap_or(false);
+            if exclude_archived && archived {
+                continue;
+            }
+            hit.insert("archived".into(), JsonValue::Bool(archived));
+            // Tantivy's schema stores no `full_doc_id`, so a keyword-only hit
+            // would project a null `doc_id` where the pg leg (whole content
+            // column) does not. The authoritative row is already in hand.
+            if let Some(full_doc_id) = row.get("full_doc_id") {
+                hit.insert("full_doc_id".into(), full_doc_id.clone());
+            }
+            hit.insert(
+                "level".into(),
+                JsonValue::from(row.get("level").and_then(|v| v.as_i64()).unwrap_or(0)),
+            );
+            hit.insert(
+                "ref_ids".into(),
+                row.get("ref_ids")
+                    .cloned()
+                    .unwrap_or_else(|| JsonValue::Array(Vec::new())),
+            );
+            hit.insert(
+                "merged_into".into(),
+                row.get("merged_into").cloned().unwrap_or(JsonValue::Null),
+            );
+            out.push(hit);
+        }
+        Ok(out)
     }
 
     /// Multi-biz twin of [`Self::hybrid_chunk_query`] (bizIds): both recall
@@ -1009,6 +1155,7 @@ impl QueryEngine {
         top_k: usize,
         time_range_start: Option<i64>,
         time_range_end: Option<i64>,
+        exclude_archived: bool,
         biz_ids: &[&str],
     ) -> easyrag_core::Result<Vec<JsonMap>> {
         let Some(keyword_search) = &self.keyword_search else {
@@ -1020,6 +1167,7 @@ impl QueryEngine {
                     None,
                     time_range_start,
                     time_range_end,
+                    exclude_archived,
                     biz_ids,
                 )
                 .await;
@@ -1032,6 +1180,7 @@ impl QueryEngine {
                 None,
                 time_range_start,
                 time_range_end,
+                exclude_archived,
                 biz_ids
             ),
             keyword_search.keyword_query_multi_biz(
@@ -1042,6 +1191,9 @@ impl QueryEngine {
                 biz_ids
             )
         )?;
+        let kw_results = self
+            .hydrate_keyword_hits(kw_results, biz_ids, exclude_archived)
+            .await?;
         Ok(rrf_fusion(vec_results, kw_results, self.rrf_k, 0.7, 0.3))
     }
 
@@ -1084,6 +1236,7 @@ impl QueryEngine {
                         effective_top_k(param, top_k),
                         param.time_range_start,
                         param.time_range_end,
+                        param.exclude_archived,
                         &param.biz_id,
                     )
                     .await?
@@ -1093,6 +1246,7 @@ impl QueryEngine {
                         effective_top_k(param, top_k),
                         param.time_range_start,
                         param.time_range_end,
+                        param.exclude_archived,
                         &multi_biz_refs,
                     )
                     .await?
@@ -1107,6 +1261,7 @@ impl QueryEngine {
                             None,
                             param.time_range_start,
                             param.time_range_end,
+                            param.exclude_archived,
                             &param.biz_id,
                         )
                         .await?
@@ -1118,6 +1273,7 @@ impl QueryEngine {
                             None,
                             param.time_range_start,
                             param.time_range_end,
+                            param.exclude_archived,
                             &multi_biz_refs,
                         )
                         .await?

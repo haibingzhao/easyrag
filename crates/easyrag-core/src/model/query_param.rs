@@ -139,6 +139,9 @@ pub struct QueryParam {
     /// Enable query routing and decomposition for this query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_query_routing: Option<bool>,
+    /// R2: exclude archived documents from retrieval at DB level.
+    #[serde(default)]
+    pub exclude_archived: bool,
 }
 
 fn default_response_type() -> String {
@@ -216,6 +219,7 @@ impl Default for QueryParam {
             enable_citation_validation: None,
             enable_evidence_scoring: None,
             enable_query_routing: None,
+            exclude_archived: false,
         }
     }
 }

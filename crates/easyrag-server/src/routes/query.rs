@@ -99,6 +99,9 @@ pub struct QueryRequest {
     pub enable_evidence_scoring: Option<bool>,
     #[serde(default)]
     pub enable_query_routing: Option<bool>,
+    /// R2: exclude archived documents from retrieval at DB level.
+    #[serde(default)]
+    pub exclude_archived: Option<bool>,
 }
 
 /// REST boundary defaults differ from the domain `QueryParam::default`
@@ -134,6 +137,7 @@ pub(crate) fn build_query_param(request: &QueryRequest, biz_id: &str) -> QueryPa
     param.enable_citation_validation = request.enable_citation_validation;
     param.enable_evidence_scoring = request.enable_evidence_scoring;
     param.enable_query_routing = request.enable_query_routing;
+    param.exclude_archived = request.exclude_archived.unwrap_or(false);
     param
 }
 

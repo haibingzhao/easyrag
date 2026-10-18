@@ -36,6 +36,19 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
+/// R1: archive-related fields carried into the status row at ingest time.
+///
+/// Defined here (rather than reusing `InsertDocumentExtras`) so the repository
+/// stays independent of the ingestion module — `ingest` already depends on
+/// `repository`, not the other way round.
+#[derive(Clone, Debug, Default)]
+pub struct ArchiveMeta {
+    pub archived: bool,
+    pub level: i32,
+    pub ref_ids: Vec<String>,
+    pub merged_into: Option<String>,
+}
+
 /// Writes document processing status.
 ///
 /// Replaces the three bare `doc_status_storage.upsert(map)` calls that each
@@ -61,6 +74,9 @@ impl DocStatusRepository {
     ///
     /// `created_at` is supplied by the caller (client business time takes
     /// precedence over ingestion time); `updated_at` is stamped now.
+    /// `archive_meta` carries the R1 consolidation fields (archived/level/
+    /// ref_ids/merged_into); `None` keeps the legacy defaults.
+    #[allow(clippy::too_many_arguments)]
     pub async fn mark_pending(
         &self,
         doc_id: &str,
@@ -68,6 +84,7 @@ impl DocStatusRepository {
         file_path: &str,
         created_at_iso: &str,
         external_id: Option<&str>,
+        archive_meta: Option<&ArchiveMeta>,
         biz_id: &str,
     ) -> easyrag_core::Result<()> {
         let mut status_data = JsonMap::new();
@@ -95,6 +112,27 @@ impl DocStatusRepository {
         );
         if let Some(ext) = external_id {
             status_data.insert("external_id".into(), JsonValue::String(ext.to_string()));
+        }
+        // R1: archive-related fields on the status row (DB columns are
+        // extracted from this payload by the postgres backend).
+        if let Some(meta) = archive_meta {
+            status_data.insert("archived".into(), JsonValue::Bool(meta.archived));
+            status_data.insert("level".into(), JsonValue::from(meta.level));
+            status_data.insert(
+                "ref_ids".into(),
+                JsonValue::Array(
+                    meta.ref_ids
+                        .iter()
+                        .map(|id| JsonValue::String(id.clone()))
+                        .collect(),
+                ),
+            );
+            if let Some(merged_into) = &meta.merged_into {
+                status_data.insert(
+                    "merged_into".into(),
+                    JsonValue::String(merged_into.clone()),
+                );
+            }
         }
         let mut batch = HashMap::new();
         batch.insert(doc_id.to_string(), status_data);

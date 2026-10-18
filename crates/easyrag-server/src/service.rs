@@ -14,10 +14,14 @@ use serde_json::{json, Value as JsonValue};
 use tokio::sync::Mutex as AsyncMutex;
 
 use easyrag_core::constants::STRUCTURE_INDEX_KEY_PREFIX;
+use easyrag_core::llm::embedding_func::EmbeddingContext;
 use easyrag_core::model::DocStatus;
 use easyrag_core::storage::traits::StorageBundle;
 use easyrag_core::storage::user::{UserRecord, UserStorage};
 use easyrag_core::util::hash::{compute_args_hash, compute_mdhash_id};
+use easyrag_core::util::text::clean_text_for_extraction;
+use easyrag_core::util::tokenizer::TokenizerProvider;
+use easyrag_core::JsonMap;
 use easyrag_pipeline::ingest::InsertDocumentExtras;
 use easyrag_pipeline::parser::DocumentProcessingOptions;
 use easyrag_pipeline::{
@@ -26,6 +30,7 @@ use easyrag_pipeline::{
 
 use crate::auth::JwtAuthProvider;
 use crate::error::{AppError, AppResult};
+use crate::util::truncate_string;
 
 // ---------------------------------------------------------------------
 // WorkspaceResolver (R2)
@@ -158,6 +163,118 @@ pub struct UpsertResult {
     pub idempotent_skip: bool,
 }
 
+/// R1: archive-related fields accepted by ingest (`POST /api/documents/text`).
+/// All optional; absent fields keep the existing/inherited value.
+#[derive(Clone, Debug, Default)]
+pub struct ArchiveFields {
+    pub archived: Option<bool>,
+    pub level: Option<i32>,
+    pub ref_ids: Option<Vec<String>>,
+    pub merged_into: Option<String>,
+}
+
+impl ArchiveFields {
+    /// Whether the caller supplied any archive field at all.
+    pub fn is_empty(&self) -> bool {
+        self.archived.is_none()
+            && self.level.is_none()
+            && self.ref_ids.is_none()
+            && self.merged_into.is_none()
+    }
+
+    /// Build the partial-update map for a doc_status row.
+    pub fn to_status_patch(&self) -> JsonMap {
+        let mut patch = JsonMap::new();
+        if let Some(archived) = self.archived {
+            patch.insert("archived".into(), JsonValue::Bool(archived));
+        }
+        if let Some(level) = self.level {
+            patch.insert("level".into(), JsonValue::from(level));
+        }
+        if let Some(ref_ids) = &self.ref_ids {
+            patch.insert(
+                "ref_ids".into(),
+                JsonValue::Array(
+                    ref_ids
+                        .iter()
+                        .map(|id| JsonValue::String(id.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(merged_into) = &self.merged_into {
+            patch.insert(
+                "merged_into".into(),
+                JsonValue::String(merged_into.clone()),
+            );
+        }
+        patch
+    }
+
+    /// Read archive fields from a status/KV JSON map (legacy rows return None).
+    pub fn from_map(map: &JsonMap) -> Self {
+        Self {
+            archived: map.get("archived").and_then(JsonValue::as_bool),
+            level: map
+                .get("level")
+                .and_then(|v| v.as_i64().map(|n| n as i32)),
+            ref_ids: map.get("ref_ids").and_then(|v| {
+                v.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+            }),
+            merged_into: map
+                .get("merged_into")
+                .and_then(|v| match v {
+                    JsonValue::String(s) => Some(s.clone()),
+                    _ => None,
+                }),
+        }
+    }
+
+    /// Fill in any None fields from an existing status/KV row so that a
+    /// content overwrite does not silently reset archive flags.
+    pub fn inherit_from(self, base: &JsonMap) -> Self {
+        let base = Self::from_map(base);
+        Self {
+            archived: self.archived.or(base.archived),
+            level: self.level.or(base.level),
+            ref_ids: self.ref_ids.or_else(|| base.ref_ids.clone()),
+            merged_into: self.merged_into.or_else(|| base.merged_into.clone()),
+        }
+    }
+}
+
+/// Wire defaults of the ingest-time similarity probe (`returnSimilar` on
+/// `POST /api/documents/text`). Constants rather than config: a caller that
+/// wants other values passes them per request.
+pub const DEFAULT_SIMILAR_TOP_K: usize = 5;
+pub const DEFAULT_SIMILAR_THRESHOLD: f32 = 0.8;
+/// `contentSummary` budget, counted in characters and never in bytes.
+pub const SIMILAR_SUMMARY_CHARS: usize = 500;
+
+/// Chunk-recall budget: returning K *documents* needs more than K chunks, since
+/// one document can hold several of the top chunk hits.
+const SIMILAR_CHUNK_BUDGET_FACTOR: usize = 4;
+const SIMILAR_CHUNK_BUDGET_MIN: usize = 20;
+const SIMILAR_CHUNK_BUDGET_MAX: usize = 200;
+/// Token ceiling for the probe text handed to the embedding provider. An
+/// ingested document can be arbitrarily long while the provider's window is
+/// not; for a duplicate check the leading window carries the topic.
+const SIMILAR_EMBED_TOKEN_CAP: usize = 1024;
+
+/// One already-stored document similar to the content being ingested.
+pub struct SimilarDocument {
+    pub doc_id: String,
+    pub external_id: Option<String>,
+    pub file_path: String,
+    /// Cosine similarity against the ingested text, higher = more similar.
+    pub score: f32,
+    pub content_summary: String,
+}
+
 /// Document lifecycle orchestration: cascade deletion, idempotent upsert (R3),
 /// full-text retrieval (R5) and single-document synchronous indexing (R6).
 ///
@@ -196,6 +313,11 @@ impl DocumentLifecycleService {
 
     /// R3: deterministic docId derivation from the client business key.
     /// The "extid:" salt keeps this namespace disjoint from content-hash docIds.
+    ///
+    /// R5 stability contract: this is a pure function of `external_id` alone, so
+    /// repeated upserts of the same key (identical or changed content, re-index,
+    /// archive, unarchive) always resolve to the same docId. The docId is never
+    /// re-derived from content on the external-id path.
     pub fn derive_external_doc_id(external_id: &str) -> String {
         compute_mdhash_id(&format!("extid:{external_id}"), "doc-")
     }
@@ -349,6 +471,7 @@ impl DocumentLifecycleService {
         create_time: Option<i64>,
         metadata: Option<&HashMap<String, String>>,
         options: Option<&DocumentProcessingOptions>,
+        archive: &ArchiveFields,
         ops: &LifecycleOps,
         biz_id: &str,
     ) -> AppResult<UpsertResult> {
@@ -363,6 +486,10 @@ impl DocumentLifecycleService {
                     Some(&InsertDocumentExtras {
                         create_time,
                         user_metadata: metadata.cloned(),
+                        archived: archive.archived,
+                        level: archive.level,
+                        ref_ids: archive.ref_ids.clone(),
+                        merged_into: archive.merged_into.clone(),
                         ..Default::default()
                     }),
                     biz_id,
@@ -388,16 +515,47 @@ impl DocumentLifecycleService {
         let existing = ops.bundle.doc_status_storage.get_by_id(&doc_id, biz_id).await?;
         let content_hash = compute_args_hash([text]);
 
-        if existing.as_ref().map_or(false, |e| {
+        if existing.as_ref().is_some_and(|e| {
             e.get("content_hash").and_then(JsonValue::as_str) == Some(content_hash.as_str())
         }) {
-            // Idempotent short-circuit: identical content, nothing to do
+            // Idempotent short-circuit: identical content, nothing to re-index.
+            // R1: archive fields can still change without touching chunks.
+            if !archive.is_empty() {
+                let patch = archive.to_status_patch();
+                // R4: chunk rows carry the flags set at the last real ingest,
+                // so a flag-only change must be mirrored here too.
+                ops.bundle
+                    .vector_storage
+                    .update_doc_archive_fields(&doc_id, &patch, biz_id)
+                    .await?;
+                // The doc KV row is the source of truth for reprocessing, so
+                // keep it in sync with the status/chunk changes.
+                if let Some(mut doc) = ops.bundle.kv_storage.get_by_id(&doc_id, biz_id).await? {
+                    doc.extend(patch.clone());
+                    let mut kv_batch = HashMap::new();
+                    kv_batch.insert(doc_id.clone(), doc);
+                    ops.bundle.kv_storage.upsert(kv_batch, biz_id).await?;
+                }
+                let mut batch = HashMap::new();
+                batch.insert(doc_id.clone(), patch);
+                ops.bundle
+                    .doc_status_storage
+                    .upsert(batch, biz_id)
+                    .await?;
+            }
             return Ok(UpsertResult {
                 doc_id,
                 created: false,
                 idempotent_skip: true,
             });
         }
+        // Content is changing: preserve existing archive fields that the caller
+        // did not explicitly supply, so a content rewrite does not unarchive or
+        // reset consolidation metadata.
+        let effective_archive = existing
+            .as_ref()
+            .map(|e| archive.clone().inherit_from(e))
+            .unwrap_or_else(|| archive.clone());
         if existing.is_some() {
             check_pipeline_busy(&ops.pipeline)?;
             self.cascade_delete_document(&doc_id, false, false, ops, biz_id).await?;
@@ -412,6 +570,10 @@ impl DocumentLifecycleService {
                     doc_id_override: Some(doc_id.clone()),
                     create_time,
                     user_metadata: metadata.cloned(),
+                    archived: effective_archive.archived,
+                    level: effective_archive.level,
+                    ref_ids: effective_archive.ref_ids.clone(),
+                    merged_into: effective_archive.merged_into.clone(),
                 }),
                 biz_id,
             )
@@ -459,6 +621,11 @@ impl DocumentLifecycleService {
             // has no signal but the server log.
             "error_msg": status.get("error_msg").cloned().unwrap_or(JsonValue::Null),
             "metadata": doc.get("user_metadata").cloned().unwrap_or_else(|| json!({})),
+            // R1 (archive layer): consolidation fields, defaults for legacy rows.
+            "archived": status.get("archived").and_then(JsonValue::as_bool).unwrap_or(false),
+            "level": status.get("level").and_then(JsonValue::as_i64).unwrap_or(0),
+            "ref_ids": status.get("ref_ids").cloned().unwrap_or_else(|| json!([])),
+            "merged_into": status.get("merged_into").cloned().unwrap_or(JsonValue::Null),
         }))
     }
 
@@ -500,7 +667,211 @@ impl DocumentLifecycleService {
             "chunks_count": status.as_ref().and_then(|s| s.get("chunks_count")).cloned().unwrap_or(JsonValue::Null),
             "error_msg": status.as_ref().and_then(|s| s.get("error_msg")).cloned().unwrap_or(JsonValue::Null),
             "metadata": doc.get("user_metadata").cloned().unwrap_or_else(|| json!({})),
+            // R1 (archive layer): consolidation fields, defaults for legacy rows.
+            "archived": status.as_ref()
+                .and_then(|s| s.get("archived"))
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false),
+            "level": status.as_ref()
+                .and_then(|s| s.get("level"))
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(0),
+            "ref_ids": status.as_ref()
+                .and_then(|s| s.get("ref_ids"))
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            "merged_into": status.as_ref()
+                .and_then(|s| s.get("merged_into"))
+                .cloned()
+                .unwrap_or(JsonValue::Null),
         }))
+    }
+
+    // ------------------------------------------------------------------
+    // R3 (archive layer): batch read by docId
+    // ------------------------------------------------------------------
+
+    /// Batch-read full documents by docId, **including archived ones**.
+    ///
+    /// Missing/unauthorised ids are simply absent from the result instead of
+    /// failing the whole request; the caller inspects the response to detect
+    /// them. Callers bound the input size at the REST boundary.
+    pub async fn get_documents_by_ids(
+        &self,
+        doc_ids: &[String],
+        ops: &LifecycleOps,
+        biz_id: &str,
+    ) -> AppResult<JsonValue> {
+        let mut documents = Vec::with_capacity(doc_ids.len());
+        for doc_id in doc_ids {
+            let doc = ops.bundle.kv_storage.get_by_id(doc_id, biz_id).await?;
+            let status = ops
+                .bundle
+                .doc_status_storage
+                .get_by_id(doc_id, biz_id)
+                .await?;
+            // A doc that exists in either store is reported; missing in both
+            // means "not found here" and is omitted by contract.
+            if doc.is_none() && status.is_none() {
+                continue;
+            }
+            documents.push(json!({
+                "doc_id": doc_id,
+                "external_id": doc.as_ref()
+                    .and_then(|d| d.get("external_id"))
+                    .or_else(|| status.as_ref().and_then(|s| s.get("external_id")))
+                    .cloned()
+                    .unwrap_or(JsonValue::Null),
+                "file_path": doc.as_ref()
+                    .and_then(|d| d.get("file_path"))
+                    .or_else(|| status.as_ref().and_then(|s| s.get("file_path")))
+                    .cloned()
+                    .unwrap_or(JsonValue::Null),
+                "content": doc.as_ref()
+                    .and_then(|d| d.get("content"))
+                    .cloned()
+                    .unwrap_or(JsonValue::Null),
+                "status": status.as_ref()
+                    .and_then(|s| s.get("status"))
+                    .cloned()
+                    .unwrap_or(JsonValue::Null),
+                "create_time": doc.as_ref()
+                    .and_then(|d| d.get("create_time"))
+                    .cloned()
+                    .unwrap_or(JsonValue::Null),
+                "chunks_count": status.as_ref()
+                    .and_then(|s| s.get("chunks_count"))
+                    .cloned()
+                    .unwrap_or(JsonValue::Null),
+                "error_msg": status.as_ref()
+                    .and_then(|s| s.get("error_msg"))
+                    .cloned()
+                    .unwrap_or(JsonValue::Null),
+                "has_structure": status.as_ref()
+                    .and_then(|s| s.get("has_structure"))
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+                "metadata": doc.as_ref()
+                    .and_then(|d| d.get("user_metadata"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+                // R1: archive fields, always present (defaults when a legacy
+                // row predates them).
+                "archived": status.as_ref()
+                    .and_then(|s| s.get("archived"))
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+                "level": status.as_ref()
+                    .and_then(|s| s.get("level"))
+                    .and_then(JsonValue::as_i64)
+                    .unwrap_or(0),
+                "ref_ids": status.as_ref()
+                    .and_then(|s| s.get("ref_ids"))
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+                "merged_into": status.as_ref()
+                    .and_then(|s| s.get("merged_into"))
+                    .cloned()
+                    .unwrap_or(JsonValue::Null),
+            }));
+        }
+        Ok(JsonValue::Array(documents))
+    }
+
+    // ------------------------------------------------------------------
+    // R4 (archive layer): flag-only update, no re-index
+    // ------------------------------------------------------------------
+
+    /// Apply archive-related flags to existing documents without touching
+    /// chunks or embeddings.
+    ///
+    /// Returns one entry per requested id: `status` is `success`,
+    /// `not_found`, or `error` (with a message). A bad id never fails the
+    /// batch. Only fields actually supplied are written (partial update).
+    pub async fn archive_documents(
+        &self,
+        doc_ids: &[String],
+        fields: &ArchiveFields,
+        ops: &LifecycleOps,
+        biz_id: &str,
+    ) -> AppResult<JsonValue> {
+        let patch = fields.to_status_patch();
+        let mut results = Vec::with_capacity(doc_ids.len());
+        for doc_id in doc_ids {
+            // Scope check: the status row is the authoritative existence
+            // signal (it carries biz_id and is what retrieval filters on).
+            let existing = ops
+                .bundle
+                .doc_status_storage
+                .get_by_id(doc_id, biz_id)
+                .await?;
+            if existing.is_none() {
+                results.push(json!({
+                    "docId": doc_id,
+                    "status": "not_found",
+                }));
+                continue;
+            }
+            if patch.is_empty() {
+                results.push(json!({
+                    "docId": doc_id,
+                    "status": "success",
+                    "updated": false,
+                }));
+                continue;
+            }
+            // R4: propagate the archive fields to the chunk rows first. The
+            // JSONB merge is idempotent, so a failure here leaves both stores
+            // untouched and the caller can simply retry.
+            if let Err(e) = ops
+                .bundle
+                .vector_storage
+                .update_doc_archive_fields(doc_id, &patch, biz_id)
+                .await
+            {
+                tracing::warn!("Archive vector sync failed for doc {doc_id}: {e:?}");
+                results.push(json!({
+                    "docId": doc_id,
+                    "status": "error",
+                    "message": format!("vector store update failed: {e}"),
+                }));
+                continue;
+            }
+            // The doc KV row is the source of truth for reprocessing; keep it
+            // in sync so a later re-index does not silently revert the flags.
+            if let Some(mut doc) = ops.bundle.kv_storage.get_by_id(doc_id, biz_id).await? {
+                doc.extend(patch.clone());
+                let mut kv_batch = HashMap::new();
+                kv_batch.insert(doc_id.clone(), doc);
+                if let Err(e) = ops.bundle.kv_storage.upsert(kv_batch, biz_id).await {
+                    tracing::warn!("Archive KV sync failed for doc {doc_id}: {e:?}");
+                    results.push(json!({
+                        "docId": doc_id,
+                        "status": "error",
+                        "message": format!("kv store update failed: {e}"),
+                    }));
+                    continue;
+                }
+            }
+            let mut batch = HashMap::new();
+            batch.insert(doc_id.clone(), patch.clone());
+            match ops.bundle.doc_status_storage.upsert(batch, biz_id).await {
+                Ok(()) => results.push(json!({
+                    "docId": doc_id,
+                    "status": "success",
+                    "updated": true,
+                })),
+                Err(e) => {
+                    tracing::warn!("Archive update failed for doc {doc_id}: {e:?}");
+                    results.push(json!({
+                        "docId": doc_id,
+                        "status": "error",
+                        "message": e.to_string(),
+                    }));
+                }
+            }
+        }
+        Ok(JsonValue::Array(results))
     }
 
     // ------------------------------------------------------------------
@@ -684,6 +1055,10 @@ impl DocumentLifecycleService {
             });
         }
 
+        // Archive flags are not part of the PUT payload; preserve them across
+        // a content rewrite so the document stays archived/merged.
+        let archive = ArchiveFields::from_map(&existing);
+
         // 3. Pipeline must not be mid-batch
         check_pipeline_busy(&ops.pipeline)?;
 
@@ -719,6 +1094,10 @@ impl DocumentLifecycleService {
                     doc_id_override: Some(doc_id.to_string()),
                     create_time,
                     user_metadata: metadata.cloned(),
+                    archived: archive.archived,
+                    level: archive.level,
+                    ref_ids: archive.ref_ids.clone(),
+                    merged_into: archive.merged_into.clone(),
                 }),
                 biz_id,
             )
@@ -729,6 +1108,171 @@ impl DocumentLifecycleService {
             created: false,
             idempotent_skip: false,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // Ingest-time similarity probe (returnSimilar)
+    // ------------------------------------------------------------------
+
+    /// Rank chunk-level vector hits into document-level matches.
+    ///
+    /// The vector store holds more than document chunks — extracted and
+    /// hand-made entity vectors live in the same table — and only chunk records
+    /// carry `full_doc_id`, so its absence is what marks a hit as not a
+    /// document at all. Several chunks of one document collapse into a single
+    /// entry scored by the best of them.
+    fn rank_similar_hits(
+        hits: &[JsonMap],
+        exclude_doc_id: &str,
+        top_k: usize,
+        threshold: f32,
+    ) -> Vec<(String, f32)> {
+        let mut best: HashMap<String, f32> = HashMap::new();
+        for hit in hits {
+            let Some(doc_id) = hit
+                .get("full_doc_id")
+                .and_then(JsonValue::as_str)
+                .filter(|id| !id.is_empty() && *id != exclude_doc_id)
+            else {
+                continue;
+            };
+            let score = hit
+                .get("score")
+                .and_then(JsonValue::as_f64)
+                .unwrap_or(0.0) as f32;
+            best.entry(doc_id.to_string())
+                .and_modify(|kept| *kept = kept.max(score))
+                .or_insert(score);
+        }
+        let mut ranked: Vec<(String, f32)> = best
+            .into_iter()
+            .filter(|(_, score)| *score >= threshold)
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(top_k);
+        ranked
+    }
+
+    /// Already-indexed documents of the same biz shard similar to `text`,
+    /// excluding `exclude_doc_id` — the document this text is being written as.
+    ///
+    /// Pure vector recall on purpose: the hybrid path fuses with RRF, which
+    /// overwrites `score` with a rank-derived value around 0.01 and would turn
+    /// the caller's `threshold` into noise. The probe text is embedded with
+    /// [`EmbeddingContext::Document`] because this compares a document against
+    /// documents — indistinguishable from `Query` while no asymmetric embedding
+    /// prefix is configured, and the correct side of the prefix once one is.
+    ///
+    /// Only documents whose chunks already reached the vector store can match:
+    /// ingestion is fire-and-forget, so a pending neighbour is invisible here.
+    pub async fn find_similar_documents(
+        &self,
+        text: &str,
+        exclude_doc_id: &str,
+        top_k: usize,
+        threshold: f32,
+        ops: &LifecycleOps,
+        biz_id: &str,
+    ) -> AppResult<Vec<SimilarDocument>> {
+        // The same cleaning the pipeline applies before chunking, so the probe
+        // is compared against what actually got indexed. `None` means the text
+        // is too short to have been indexed at all.
+        let Some(cleaned) = clean_text_for_extraction(text, None) else {
+            return Ok(Vec::new());
+        };
+        let tokenizer = TokenizerProvider::get_tokenizer();
+        let tokens = tokenizer.encode(&cleaned);
+        let probe = if tokens.len() > SIMILAR_EMBED_TOKEN_CAP {
+            // `decode_window`, not `decode`: the cap lands mid-character on a
+            // CJK body, where one character spans several tokens.
+            tokenizer.decode_window(&tokens[..SIMILAR_EMBED_TOKEN_CAP])
+        } else {
+            cleaned
+        };
+
+        let vector_storage = &ops.bundle.vector_storage;
+        let embeddings = vector_storage
+            .embedding_func()
+            .invoke(vec![probe.clone()], Some(EmbeddingContext::Document))
+            .await?;
+        let Some(embedding) = embeddings.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+
+        let budget = (top_k * SIMILAR_CHUNK_BUDGET_FACTOR)
+            .clamp(SIMILAR_CHUNK_BUDGET_MIN, SIMILAR_CHUNK_BUDGET_MAX);
+        let hits = vector_storage
+            .query(&probe, budget, Some(&embedding), None, None, false, biz_id)
+            .await?;
+        let ranked = Self::rank_similar_hits(&hits, exclude_doc_id, top_k, threshold);
+
+        let mut similar = Vec::with_capacity(ranked.len());
+        for (doc_id, score) in ranked {
+            match self
+                .describe_similar_document(&doc_id, score, ops, biz_id)
+                .await?
+            {
+                Some(document) => similar.push(document),
+                None => tracing::warn!(
+                    "Similar-document hit {doc_id} has neither a KV nor a registry record; \
+                     dropped as a dangling chunk"
+                ),
+            }
+        }
+        Ok(similar)
+    }
+
+    /// Resolve one ranked hit into its payload. The document body's head is the
+    /// summary; the registry's own 100-character `content_summary` is the
+    /// fallback for a KV record that is missing or stored without a body.
+    /// `None` when neither store knows the document, i.e. the hit was a chunk
+    /// outliving its document.
+    async fn describe_similar_document(
+        &self,
+        doc_id: &str,
+        score: f32,
+        ops: &LifecycleOps,
+        biz_id: &str,
+    ) -> AppResult<Option<SimilarDocument>> {
+        let bundle = &ops.bundle;
+        let doc = bundle.kv_storage.get_by_id(doc_id, biz_id).await?;
+        let content = doc
+            .as_ref()
+            .and_then(|d| d.get("content"))
+            .and_then(JsonValue::as_str);
+        let status = if content.is_some() {
+            None
+        } else {
+            bundle.doc_status_storage.get_by_id(doc_id, biz_id).await?
+        };
+        if doc.is_none() && status.is_none() {
+            return Ok(None);
+        }
+        // The document record wins per field: it is written at insert time, the
+        // registry row only carries what a later status transition knew.
+        let field = |key: &str| -> Option<String> {
+            doc.as_ref()
+                .and_then(|d| d.get(key))
+                .and_then(JsonValue::as_str)
+                .or_else(|| {
+                    status
+                        .as_ref()
+                        .and_then(|s| s.get(key))
+                        .and_then(JsonValue::as_str)
+                })
+                .map(str::to_string)
+        };
+        let content_summary = match content {
+            Some(body) => truncate_string(Some(body), SIMILAR_SUMMARY_CHARS),
+            None => field("content_summary").unwrap_or_default(),
+        };
+        Ok(Some(SimilarDocument {
+            doc_id: doc_id.to_string(),
+            external_id: field("external_id"),
+            file_path: field("file_path").unwrap_or_default(),
+            score,
+            content_summary,
+        }))
     }
 }
 
@@ -796,5 +1340,110 @@ mod auth_tests {
         let auth = AuthService::new(store, Arc::clone(&jwt));
         let token = auth.generate_token("admin").unwrap();
         assert_eq!(jwt.validate_token(&token).as_deref(), Some("admin"));
+    }
+}
+
+#[cfg(test)]
+mod similar_ranking_tests {
+    use super::*;
+
+    /// A chunk hit as the vector backends return it. `doc_id: None` reproduces
+    /// an entity vector, which shares the table but is not a document.
+    fn hit(doc_id: Option<&str>, score: Option<f64>) -> JsonMap {
+        let mut record = JsonMap::new();
+        if let Some(doc_id) = doc_id {
+            record.insert(
+                "full_doc_id".into(),
+                JsonValue::String(doc_id.to_string()),
+            );
+        } else {
+            record.insert("entity_name".into(), JsonValue::String("Alice".into()));
+        }
+        if let Some(score) = score {
+            record.insert("score".into(), JsonValue::from(score));
+        }
+        record
+    }
+
+    fn rank(hits: &[JsonMap], exclude: &str, top_k: usize, threshold: f32) -> Vec<(String, f32)> {
+        DocumentLifecycleService::rank_similar_hits(hits, exclude, top_k, threshold)
+    }
+
+    #[test]
+    fn threshold_drops_weak_matches_and_keeps_the_boundary() {
+        let hits = vec![
+            hit(Some("doc-strong"), Some(0.95)),
+            hit(Some("doc-exact"), Some(0.8)),
+            hit(Some("doc-weak"), Some(0.75)),
+        ];
+        let ranked = rank(&hits, "doc-self", 5, 0.8);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].0, "doc-strong");
+        assert_eq!(ranked[1].0, "doc-exact");
+    }
+
+    #[test]
+    fn the_ingested_document_never_matches_itself() {
+        // The idempotent-skip path writes content whose chunks are already
+        // indexed, so without this exclusion a document tops its own list at 1.0.
+        let hits = vec![
+            hit(Some("doc-self"), Some(1.0)),
+            hit(Some("doc-other"), Some(0.9)),
+        ];
+        let ranked = rank(&hits, "doc-self", 5, 0.8);
+        assert_eq!(ranked, vec![("doc-other".to_string(), 0.9)]);
+    }
+
+    #[test]
+    fn entity_vectors_and_blank_doc_ids_are_not_documents() {
+        let hits = vec![
+            hit(None, Some(0.99)),
+            hit(Some(""), Some(0.99)),
+            hit(Some("doc-real"), Some(0.85)),
+        ];
+        let ranked = rank(&hits, "doc-self", 5, 0.8);
+        assert_eq!(ranked, vec![("doc-real".to_string(), 0.85)]);
+    }
+
+    #[test]
+    fn chunks_of_one_document_collapse_to_its_best_score() {
+        let hits = vec![
+            hit(Some("doc-a"), Some(0.82)),
+            hit(Some("doc-b"), Some(0.9)),
+            hit(Some("doc-a"), Some(0.97)),
+        ];
+        let ranked = rank(&hits, "doc-self", 5, 0.8);
+        assert_eq!(
+            ranked,
+            vec![("doc-a".to_string(), 0.97), ("doc-b".to_string(), 0.9)]
+        );
+    }
+
+    #[test]
+    fn results_are_score_descending_and_truncated_to_top_k() {
+        let hits = vec![
+            hit(Some("doc-1"), Some(0.81)),
+            hit(Some("doc-2"), Some(0.99)),
+            hit(Some("doc-3"), Some(0.9)),
+        ];
+        let ranked = rank(&hits, "doc-self", 2, 0.8);
+        assert_eq!(
+            ranked,
+            vec![("doc-2".to_string(), 0.99), ("doc-3".to_string(), 0.9)]
+        );
+    }
+
+    #[test]
+    fn a_hit_without_a_score_ranks_as_zero() {
+        // A backend that stops emitting `score` must yield no matches rather
+        // than silently pass every document through the threshold.
+        let hits = vec![hit(Some("doc-a"), None)];
+        assert!(rank(&hits, "doc-self", 5, 0.8).is_empty());
+        assert_eq!(rank(&hits, "doc-self", 5, 0.0), vec![("doc-a".to_string(), 0.0)]);
+    }
+
+    #[test]
+    fn no_hits_means_no_similar_documents() {
+        assert!(rank(&[], "doc-self", 5, 0.8).is_empty());
     }
 }

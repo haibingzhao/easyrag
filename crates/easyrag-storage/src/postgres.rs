@@ -648,6 +648,40 @@ fn read_content(row: &JsonMap) -> Option<JsonMap> {
     }
 }
 
+/// Merge the doc_status archive columns (R1) over the JSONB `content` payload.
+/// Columns are authoritative: they may have been set by a partial update that
+/// did not rewrite `content`, or by a legacy row created before the columns
+/// existed (where the defaults apply).
+fn content_with_archive_columns(row: &JsonMap) -> Option<JsonMap> {
+    let mut content = read_content(row)?;
+    content.insert(
+        "archived".to_string(),
+        JsonValue::Bool(
+            row.get("archived")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        ),
+    );
+    content.insert(
+        "level".to_string(),
+        JsonValue::from(row.get("level").and_then(|v| v.as_i64()).unwrap_or(0)),
+    );
+    let ref_ids = match row.get("ref_ids") {
+        Some(JsonValue::Array(arr)) => arr.clone(),
+        Some(JsonValue::String(s)) => serde_json::from_str(s).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    content.insert("ref_ids".to_string(), JsonValue::Array(ref_ids));
+    content.insert(
+        "merged_into".to_string(),
+        row.get("merged_into")
+            .and_then(|v| v.as_str())
+            .map(|s| JsonValue::String(s.to_string()))
+            .unwrap_or(JsonValue::Null),
+    );
+    Some(content)
+}
+
 /// Read a timestamp column that lives on the row itself rather than inside the
 /// `content` payload. The driver normally renders these as JSON strings, but a
 /// non-string value is stringified instead of being dropped, so the pre-existing
@@ -1195,15 +1229,21 @@ impl<D: PgDb> VectorStorage for PgVectorStorage<D> {
         query_embedding: Option<&[f32]>,
         time_range_start: Option<i64>,
         time_range_end: Option<i64>,
+        exclude_archived: bool,
         biz_id: &str,
     ) -> easyrag_core::Result<Vec<JsonMap>> {
         let embedding = self.embed_for_query(query, query_embedding).await?;
         let vector_str = vector_literal(&embedding);
         let time_filter = self.time_filter(time_range_start, time_range_end);
+        let archive_filter = if exclude_archived {
+            " AND content->>'archived' IS DISTINCT FROM 'true'"
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT id, biz_id, content, 1 - (embedding <=> '{vector_str}'::vector) as similarity
              FROM {t}
-             WHERE {scope} AND embedding IS NOT NULL{time_filter}
+             WHERE {scope} AND embedding IS NOT NULL{time_filter}{archive_filter}
              ORDER BY embedding <=> '{vector_str}'::vector
              LIMIT {top_k}",
             t = self.table_name,
@@ -1225,6 +1265,7 @@ impl<D: PgDb> VectorStorage for PgVectorStorage<D> {
         query_embedding: Option<&[f32]>,
         time_range_start: Option<i64>,
         time_range_end: Option<i64>,
+        exclude_archived: bool,
         biz_ids: &[&str],
     ) -> easyrag_core::Result<Vec<JsonMap>> {
         if biz_ids.is_empty() {
@@ -1233,10 +1274,15 @@ impl<D: PgDb> VectorStorage for PgVectorStorage<D> {
         let embedding = self.embed_for_query(query, query_embedding).await?;
         let vector_str = vector_literal(&embedding);
         let time_filter = self.time_filter(time_range_start, time_range_end);
+        let archive_filter = if exclude_archived {
+            " AND content->>'archived' IS DISTINCT FROM 'true'"
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT id, biz_id, content, 1 - (embedding <=> '{vector_str}'::vector) as similarity
              FROM {t}
-             WHERE {scope} AND embedding IS NOT NULL{time_filter}
+             WHERE {scope} AND embedding IS NOT NULL{time_filter}{archive_filter}
              ORDER BY embedding <=> '{vector_str}'::vector
              LIMIT {top_k}",
             t = self.table_name,
@@ -1304,7 +1350,30 @@ impl<D: PgDb> VectorStorage for PgVectorStorage<D> {
     }
 
     async fn get_by_ids(&self, ids: &[String], biz_id: &str) -> easyrag_core::Result<Vec<JsonMap>> {
-        self.ops(biz_id).fetch_contents_by_ids(ids).await
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The content JSONB does not carry the row id, but callers that filter
+        // on archive flags (hybrid keyword recall) need to map a row back to
+        // the keyword hit it came from. Mirror the in-memory backend, whose
+        // `get_by_id` injects `id`.
+        let in_list = sql_in_list(ids.iter().map(String::as_str));
+        let sql = format!(
+            "SELECT id, content FROM {} WHERE {} AND id IN ({in_list})",
+            self.table_name,
+            self.scope_clause(biz_id)
+        );
+        let rows = self.db.fetch_all(&sql).await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let mut content = read_content(row)?;
+                if let Some(id) = row.get("id") {
+                    content.insert("id".to_string(), id.clone());
+                }
+                Some(content)
+            })
+            .collect())
     }
 
     async fn delete(&self, ids: &[String], biz_id: &str) -> easyrag_core::Result<()> {
@@ -1338,6 +1407,28 @@ impl<D: PgDb> VectorStorage for PgVectorStorage<D> {
             result.insert(id.to_string(), parse_vector_string(emb_str));
         }
         Ok(result)
+    }
+
+    async fn update_doc_archive_fields(
+        &self,
+        doc_id: &str,
+        fields: &JsonMap,
+        biz_id: &str,
+    ) -> easyrag_core::Result<()> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+        // R4: flip the JSONB flags only. No chunk re-write, no re-embedding.
+        self.db
+            .execute(&format!(
+                "UPDATE {table} SET content = content || {fields}::jsonb, \
+                 updated_at = NOW() WHERE {scope} AND (content->>'full_doc_id') = '{doc_id}'",
+                table = self.table_name,
+                fields = json_literal(fields),
+                scope = self.scope_clause(biz_id),
+                doc_id = sql_escape(doc_id)
+            ))
+            .await
     }
 }
 
@@ -2524,6 +2615,28 @@ impl<D: PgDb> PgDocStatusStorage<D> {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        // Archive-related columns (R1): authoritative over `content`.
+        status.archived = row
+            .get("archived")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        status.level = row
+            .get("level")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        status.ref_ids = row
+            .get("ref_ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        status.merged_into = row
+            .get("merged_into")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         status
     }
 
@@ -2533,7 +2646,7 @@ impl<D: PgDb> PgDocStatusStorage<D> {
         biz_id: &str,
     ) -> easyrag_core::Result<HashMap<String, DocProcessingStatus>> {
         let sql = format!(
-            "SELECT id, biz_id, content, status, created_at, updated_at FROM {} WHERE {}{}",
+            "SELECT id, biz_id, content, status, created_at, updated_at, archived, level, ref_ids, merged_into FROM {} WHERE {}{}",
             self.table_name,
             self.list_scope_clause(biz_id),
             condition
@@ -2579,8 +2692,24 @@ impl<D: PgDb> StorageNameSpace for PgDocStatusStorage<D> {
                     content_hash VARCHAR(64),
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    archived BOOLEAN NOT NULL DEFAULT false,
+                    level INTEGER NOT NULL DEFAULT 0,
+                    ref_ids JSONB NOT NULL DEFAULT '[]',
+                    merged_into VARCHAR(255),
                     PRIMARY KEY (id, workspace, biz_id)
                 )",
+                t = self.table_name
+            ))
+            .await?;
+        // R1 migration: CREATE TABLE IF NOT EXISTS leaves pre-existing tables
+        // untouched, so add the archive columns explicitly. Idempotent.
+        self.db
+            .execute(&format!(
+                "ALTER TABLE {t}
+                     ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT false,
+                     ADD COLUMN IF NOT EXISTS level INTEGER NOT NULL DEFAULT 0,
+                     ADD COLUMN IF NOT EXISTS ref_ids JSONB NOT NULL DEFAULT '[]',
+                     ADD COLUMN IF NOT EXISTS merged_into VARCHAR(255)",
                 t = self.table_name
             ))
             .await?;
@@ -2593,6 +2722,21 @@ impl<D: PgDb> StorageNameSpace for PgDocStatusStorage<D> {
         self.db
             .execute(&format!(
                 "CREATE INDEX IF NOT EXISTS idx_{t}_track ON {t}(workspace, biz_id, track_id)",
+                t = self.table_name
+            ))
+            .await?;
+        self.db
+            .execute(&format!(
+                "CREATE INDEX IF NOT EXISTS idx_{t}_archived ON {t}(workspace, biz_id, archived)",
+                t = self.table_name
+            ))
+            .await?;
+        // `file_path LIKE 'prefix%'` needs the pattern opclass: the default
+        // text_ops cannot serve a prefix scan.
+        self.db
+            .execute(&format!(
+                "CREATE INDEX IF NOT EXISTS idx_{t}_filepath ON \
+                 {t}(workspace, biz_id, file_path text_pattern_ops)",
                 t = self.table_name
             ))
             .await?;
@@ -2631,11 +2775,33 @@ impl<D: PgDb> KVStorage for PgDocStatusStorage<D> {
     }
 
     async fn get_by_id(&self, id: &str, biz_id: &str) -> easyrag_core::Result<Option<JsonMap>> {
-        self.ops(biz_id).fetch_content_by_id(id).await
+        // Doc status rows keep archive flags in real columns; layer them over
+        // the JSONB content so cursor-by-id reads match list/status reads.
+        let sql = format!(
+            "SELECT content, archived, level, ref_ids, merged_into FROM {} WHERE id = '{}' AND {}",
+            self.table_name,
+            sql_escape(id),
+            self.scope_clause(biz_id)
+        );
+        let row = self.db.fetch_one(&sql).await?;
+        Ok(row.as_ref().and_then(content_with_archive_columns))
     }
 
     async fn get_by_ids(&self, ids: &[String], biz_id: &str) -> easyrag_core::Result<Vec<JsonMap>> {
-        self.ops(biz_id).fetch_contents_by_ids(ids).await
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let in_list = sql_in_list(ids.iter().map(String::as_str));
+        let sql = format!(
+            "SELECT content, archived, level, ref_ids, merged_into FROM {} WHERE {} AND id IN ({in_list})",
+            self.table_name,
+            self.scope_clause(biz_id)
+        );
+        let rows = self.db.fetch_all(&sql).await?;
+        Ok(rows
+            .iter()
+            .filter_map(content_with_archive_columns)
+            .collect())
     }
 
     async fn filter_keys(
@@ -2663,16 +2829,34 @@ impl<D: PgDb> KVStorage for PgDocStatusStorage<D> {
             let track_id = content.get("track_id").and_then(|v| v.as_str());
             let file_path = content.get("file_path").and_then(|v| v.as_str());
             let content_hash = content.get("content_hash").and_then(|v| v.as_str());
+            let archived = content.get("archived").and_then(|v| v.as_bool());
+            let level = content.get("level").and_then(|v| v.as_i64());
+            let ref_ids = content.get("ref_ids").and_then(|v| v.as_array());
+            let merged_into = content.get("merged_into").and_then(|v| v.as_str());
+            // Absent archive fields must stay absent in the ON CONFLICT branch so
+            // COALESCE keeps the stored value (status transitions are partial
+            // updates). The INSERT branch fills the NOT NULL defaults instead.
+            let archived_sql = archived
+                .map(|b| if b { "true" } else { "false" })
+                .unwrap_or("NULL");
+            let level_sql = level.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string());
+            let ref_ids_json = ref_ids
+                .map(|arr| serde_json::to_string(arr).unwrap_or_else(|_| "[]".to_string()));
+            let ref_ids_sql = opt_sql_literal(ref_ids_json.as_deref());
             self.db
                 .execute(&format!(
-                    "INSERT INTO {t} (id, workspace, biz_id, content, status, track_id, file_path, content_hash, updated_at)
-                     VALUES ('{id}', '{ws}', '{biz}', {content}::jsonb, COALESCE({status}, 'pending'), {track}, {path}, {hash}, NOW())
+                    "INSERT INTO {t} (id, workspace, biz_id, content, status, track_id, file_path, content_hash, updated_at, archived, level, ref_ids, merged_into)
+                     VALUES ('{id}', '{ws}', '{biz}', {content}::jsonb, COALESCE({status}, 'pending'), {track}, {path}, {hash}, NOW(), COALESCE({archived}, false), COALESCE({level}, 0), COALESCE({ref_ids}::jsonb, '[]'::jsonb), {merged_into})
                      ON CONFLICT ({conflict}) DO UPDATE
                      SET content = COALESCE({t}.content, '{{}}'::jsonb) || {content}::jsonb,
                          status = COALESCE({status}, {t}.status),
                          track_id = COALESCE({track}, NULLIF({t}.track_id, '')),
                          file_path = COALESCE({path}, NULLIF({t}.file_path, '')),
                          content_hash = COALESCE({hash}, NULLIF({t}.content_hash, '')),
+                         archived = COALESCE({archived}, {t}.archived),
+                         level = COALESCE({level}, {t}.level),
+                         ref_ids = COALESCE({ref_ids}::jsonb, {t}.ref_ids),
+                         merged_into = COALESCE({merged_into}, {t}.merged_into),
                          updated_at = NOW()",
                     t = self.table_name,
                     conflict = TENANT_CONFLICT_TARGET,
@@ -2683,7 +2867,11 @@ impl<D: PgDb> KVStorage for PgDocStatusStorage<D> {
                     status = opt_sql_literal(status),
                     track = opt_sql_literal(track_id),
                     path = opt_sql_literal(file_path),
-                    hash = opt_sql_literal(content_hash)
+                    hash = opt_sql_literal(content_hash),
+                    archived = archived_sql,
+                    level = level_sql,
+                    ref_ids = ref_ids_sql,
+                    merged_into = opt_sql_literal(merged_into)
                 ))
                 .await?;
         }
@@ -2770,6 +2958,7 @@ impl<D: PgDb> DocStatusStorage for PgDocStatusStorage<D> {
         sort_field: &str,
         sort_direction: &str,
         file_path_prefix: Option<&str>,
+        exclude_archived: bool,
         biz_id: &str,
     ) -> easyrag_core::Result<(Vec<(String, DocProcessingStatus)>, usize)> {
         let filter_values =
@@ -2789,6 +2978,10 @@ impl<D: PgDb> DocStatusStorage for PgDocStatusStorage<D> {
                 " AND file_path LIKE '{}%'",
                 sql_escape(&escape_like_pattern(prefix))
             ));
+        }
+        // R2: DB-level archive exclusion.
+        if exclude_archived {
+            condition.push_str(" AND archived = false");
         }
 
         // Total count.
@@ -2817,7 +3010,7 @@ impl<D: PgDb> DocStatusStorage for PgDocStatusStorage<D> {
         };
 
         let sql = format!(
-            "SELECT id, biz_id, content, status, created_at, updated_at FROM {t}
+            "SELECT id, biz_id, content, status, created_at, updated_at, archived, level, ref_ids, merged_into FROM {t}
              WHERE {scope}{condition}
              ORDER BY {safe_sort_field} {safe_sort_dir}
              LIMIT {page_size} OFFSET {offset}",

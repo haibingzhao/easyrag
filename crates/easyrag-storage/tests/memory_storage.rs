@@ -271,7 +271,7 @@ mod vector {
             .await
             .unwrap();
         let results = storage
-            .query("machine learning", 2, None, None, None, BIZ)
+            .query("machine learning", 2, None, None, None, false, BIZ)
             .await
             .unwrap();
         assert!(!results.is_empty());
@@ -294,7 +294,7 @@ mod vector {
             .unwrap();
         let query_embedding = [1.0f32; 4];
         let results = storage
-            .query("", 5, Some(&query_embedding), None, None, BIZ)
+            .query("", 5, Some(&query_embedding), None, None, false, BIZ)
             .await
             .unwrap();
         // Should not throw, results depend on similarity.
@@ -396,7 +396,7 @@ mod vector {
         // Only the requested set is scanned: b3 stays invisible, and the hits
         // come back globally ranked (descending distance) as one top_k.
         let hits = storage
-            .query_multi_biz("x", 10, None, None, None, &["b1", "b2"])
+            .query_multi_biz("x", 10, None, None, None, false, &["b1", "b2"])
             .await
             .unwrap();
         assert_eq!(2, hits.len());
@@ -424,7 +424,7 @@ mod vector {
         // A single-biz query keeps its exact-scope behavior — the multi-biz
         // predicate never leaks into it.
         let only_b1 = storage
-            .query("x", 10, None, None, None, "b1")
+            .query("x", 10, None, None, None, false, "b1")
             .await
             .unwrap();
         assert_eq!(1, only_b1.len());
@@ -433,7 +433,7 @@ mod vector {
         // Empty set returns nothing (callers never route an empty set here,
         // but the guard keeps it from widening into a whole-workspace scan).
         assert!(storage
-            .query_multi_biz("x", 10, None, None, None, &[])
+            .query_multi_biz("x", 10, None, None, None, false, &[])
             .await
             .unwrap()
             .is_empty());
@@ -464,7 +464,7 @@ mod vector {
             .unwrap();
 
         let hits = storage
-            .query_multi_biz("x", 2, None, None, None, &["b1", "b2"])
+            .query_multi_biz("x", 2, None, None, None, false, &["b1", "b2"])
             .await
             .unwrap();
         assert_eq!(2, hits.len());

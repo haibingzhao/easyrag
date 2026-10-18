@@ -414,7 +414,7 @@ async fn sql_golden_doc_status_paginated() {
     let db = Arc::new(MockPgDb::default());
     let storage = create_doc_status_storage(db.clone());
     storage
-        .get_docs_paginated(None, None, 2, 20, "updated_at", "desc", Some("/data/"), BIZ)
+        .get_docs_paginated(None, None, 2, 20, "updated_at", "desc", Some("/data/"), false, BIZ)
         .await
         .unwrap();
     let stmts = db.statements();
@@ -533,7 +533,7 @@ fn assert_exact_scope(db: &MockPgDb, path: &str) {
 async fn bc12_vector_list_paths_widen_on_empty_biz_id() {
     let db = Arc::new(MockPgDb::default());
     let storage = create_storage(db.clone());
-    storage.query("q", 5, None, None, None, "").await.unwrap();
+    storage.query("q", 5, None, None, None, false, "").await.unwrap();
     assert_wildcard_scope(&db, "vector query");
 
     let db = Arc::new(MockPgDb::default());

@@ -251,7 +251,7 @@ impl StructureQueryStrategy {
         } else {
             let results = self
                 .vector_storage
-                .query(query, 3, None, None, None, biz_id)
+                .query(query, 3, None, None, None, false, biz_id)
                 .await?;
             Ok(results.iter().find_map(|r| {
                 r.get("full_doc_id")
@@ -286,7 +286,7 @@ impl StructureQueryStrategy {
         }
         let results = self
             .vector_storage
-            .query(query, 10, None, None, None, biz_id)
+            .query(query, 10, None, None, None, false, biz_id)
             .await?;
         let mut rest = candidates;
         let mut ranked: Vec<StructureDocument> = Vec::with_capacity(rest.len());
@@ -325,6 +325,7 @@ impl StructureQueryStrategy {
                     "updated_at",
                     "desc",
                     scope,
+                    false, // structure queries include archived documents
                     biz_id,
                 )
                 .await?;
@@ -714,7 +715,7 @@ impl StructureQueryStrategy {
             .join(" ");
         let all_chunks: Vec<JsonMap> = self
             .vector_storage
-            .query(&query_text, 20, None, None, None, biz_id)
+            .query(&query_text, 20, None, None, None, false, biz_id)
             .await?
             .into_iter()
             .filter(|c| c.get("full_doc_id").and_then(|v| v.as_str()) == Some(doc_id))

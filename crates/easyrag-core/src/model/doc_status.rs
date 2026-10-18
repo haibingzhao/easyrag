@@ -118,6 +118,24 @@ pub struct DocProcessingStatus {
     /// back to the right biz_id instead of falling back to the scope default.
     #[serde(default)]
     pub biz_id: String,
+    /// Archive flag for memory consolidation (R1). Archived documents are
+    /// excluded from normal retrieval (`/api/query/data`, `/api/documents/list`
+    /// with `excludeArchived=true`) but remain readable by explicit docId
+    /// (`/api/documents/by-ids`). Default false (active).
+    #[serde(default)]
+    pub archived: bool,
+    /// Multi-level hierarchy depth (R1). Source documents = 0, consolidated
+    /// documents = max(source levels) + 1. Default 0.
+    #[serde(default)]
+    pub level: i32,
+    /// DocIds this document absorbed during consolidation (R1). Empty for
+    /// source documents, populated for consolidated documents.
+    #[serde(default)]
+    pub ref_ids: Vec<String>,
+    /// DocId of the consolidated document that absorbed this source (R1).
+    /// None for source documents or unconsolidated documents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_into: Option<String>,
 }
 
 impl DocProcessingStatus {
@@ -185,6 +203,18 @@ impl DocProcessingStatus {
             has_structure: fields.get("has_structure").and_then(|v| v.as_bool()) == Some(true),
             external_id: get_opt_str("external_id"),
             biz_id: get_str("biz_id"),
+            archived: fields.get("archived").and_then(|v| v.as_bool()).unwrap_or(false),
+            level: fields.get("level").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            ref_ids: fields
+                .get("ref_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            merged_into: get_opt_str("merged_into"),
         }
     }
 

@@ -5,7 +5,7 @@
 use crate::chunker::{Chunker, ChunkerConfig, ChunkerRegistry};
 use crate::extraction::{EntityExtractor, EntityExtractorConfig};
 use crate::parser::DocumentProcessingOptions;
-use crate::repository::{DocStatusRepository, StructureIndexRepository};
+use crate::repository::{ArchiveMeta, DocStatusRepository, StructureIndexRepository};
 use crate::structure::StructureTreeBuilder;
 use crate::summarizer::DocumentSummarizer;
 use easyrag_core::llm::embedding_func::EmbeddingFunc;
@@ -42,6 +42,26 @@ pub struct InsertDocumentExtras {
     pub create_time: Option<i64>,
     /// R4: client metadata merged into every chunk.
     pub user_metadata: Option<HashMap<String, String>>,
+    /// R1: archive flag (memory consolidation). Default false.
+    pub archived: Option<bool>,
+    /// R1: hierarchy level. Default 0.
+    pub level: Option<i32>,
+    /// R1: docIds absorbed by a consolidated document. Default empty.
+    pub ref_ids: Option<Vec<String>>,
+    /// R1: docId of the consolidated document that absorbed this source.
+    pub merged_into: Option<String>,
+}
+
+impl InsertDocumentExtras {
+    /// Extract the archive-related fields (R1) for the status row write.
+    pub fn archive_meta(&self) -> ArchiveMeta {
+        ArchiveMeta {
+            archived: self.archived.unwrap_or(false),
+            level: self.level.unwrap_or(0),
+            ref_ids: self.ref_ids.clone().unwrap_or_default(),
+            merged_into: self.merged_into.clone(),
+        }
+    }
 }
 
 /// RAII guard that clears an `AtomicBool` flag on drop, mirroring the
@@ -282,6 +302,27 @@ impl IngestionPipeline {
                 ),
             );
         }
+        // R1: archive-related fields travel with the document payload too, so
+        // chunk metadata and doc KV stay consistent with the status row.
+        if let Some(extras) = extras {
+            if extras.archived.unwrap_or(false) {
+                doc_data.insert("archived".into(), JsonValue::Bool(true));
+            }
+            if let Some(level) = extras.level.filter(|l| *l != 0) {
+                doc_data.insert("level".into(), JsonValue::from(level));
+            }
+            if let Some(ref_ids) = extras.ref_ids.as_ref().filter(|r| !r.is_empty()) {
+                doc_data.insert(
+                    "ref_ids".into(),
+                    JsonValue::Array(
+                        ref_ids.iter().map(|id| JsonValue::String(id.clone())).collect(),
+                    ),
+                );
+            }
+            if let Some(merged_into) = &extras.merged_into {
+                doc_data.insert("merged_into".into(), JsonValue::String(merged_into.clone()));
+            }
+        }
         if let Some(opts) = options {
             if let Some(m) = &opts.chunk_method {
                 doc_data.insert("chunk_method".into(), JsonValue::String(m.clone()));
@@ -304,8 +345,17 @@ impl IngestionPipeline {
         self.kv_storage.upsert(kv_batch, biz_id).await?;
 
         // Update doc status.
+        let archive_meta = extras.map(|e| e.archive_meta());
         self.doc_status_repo
-            .mark_pending(&doc_id, content, file_path, &create_time_iso, external_id, biz_id)
+            .mark_pending(
+                &doc_id,
+                content,
+                file_path,
+                &create_time_iso,
+                external_id,
+                archive_meta.as_ref(),
+                biz_id,
+            )
             .await?;
 
         Ok(doc_id)
@@ -428,6 +478,34 @@ impl IngestionPipeline {
             }
         };
 
+        // R2/R1: chunk rows mirror the document's archive fields so vector
+        // recall can filter archived memories without joining doc_status at
+        // query time, and `query/data` chunks can echo the four fields. The doc
+        // KV row is written before processing starts and is the source of truth
+        // (ingest and reprocess both go through it).
+        let doc_row = self.kv_storage.get_by_id(doc_id, biz_id).await.ok().flatten();
+        let archived = doc_row
+            .as_ref()
+            .and_then(|d| d.get("archived"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let level = doc_row
+            .as_ref()
+            .and_then(|d| d.get("level"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let ref_ids = doc_row
+            .as_ref()
+            .and_then(|d| d.get("ref_ids"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let merged_into = doc_row
+            .as_ref()
+            .and_then(|d| d.get("merged_into"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
         // Stage 1: Chunk the document (per-document chunker if specified).
         let active_chunker: Arc<dyn Chunker> = if let Some(method) =
             options.and_then(|o| o.chunk_method.as_deref())
@@ -481,6 +559,25 @@ impl IngestionPipeline {
             }
             merged_metadata.extend(chunk.metadata.clone());
             data.insert("metadata".into(), JsonValue::Object(merged_metadata));
+            // R2/R1: archive fields ride on every chunk so the vector backend
+            // can filter archived memories without joining doc_status, and so
+            // query/data hits can echo them back. Absent values keep the wire
+            // defaults (active, level 0, no refs, not merged).
+            if archived {
+                data.insert("archived".into(), JsonValue::Bool(true));
+            }
+            if level != 0 {
+                data.insert("level".into(), JsonValue::from(level));
+            }
+            if !ref_ids.is_empty() {
+                data.insert("ref_ids".into(), JsonValue::Array(ref_ids.clone()));
+            }
+            if let Some(merged_into) = &merged_into {
+                data.insert(
+                    "merged_into".into(),
+                    JsonValue::String(merged_into.clone()),
+                );
+            }
             chunk_data.insert(chunk_id.clone(), data);
             chunk_order.push(chunk_id);
         }

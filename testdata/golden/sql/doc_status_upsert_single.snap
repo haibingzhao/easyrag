@@ -1,12 +1,16 @@
 ---
 source: crates/easyrag-storage/tests/postgres_storage.rs
 ---
-INSERT INTO doc_status_doc_status (id, workspace, biz_id, content, status, track_id, file_path, content_hash, updated_at)
-                     VALUES ('doc1', 'test_ws', 'default', '{"status":"processed","file_path":"/data/doc1.txt","content_hash":"h1","track_id":"t1"}'::jsonb, COALESCE('processed', 'pending'), 't1', '/data/doc1.txt', 'h1', NOW())
+INSERT INTO doc_status_doc_status (id, workspace, biz_id, content, status, track_id, file_path, content_hash, updated_at, archived, level, ref_ids, merged_into)
+                     VALUES ('doc1', 'test_ws', 'default', '{"status":"processed","file_path":"/data/doc1.txt","content_hash":"h1","track_id":"t1"}'::jsonb, COALESCE('processed', 'pending'), 't1', '/data/doc1.txt', 'h1', NOW(), COALESCE(NULL, false), COALESCE(NULL, 0), COALESCE(NULL::jsonb, '[]'::jsonb), NULL)
                      ON CONFLICT (id, workspace, biz_id) DO UPDATE
                      SET content = COALESCE(doc_status_doc_status.content, '{}'::jsonb) || '{"status":"processed","file_path":"/data/doc1.txt","content_hash":"h1","track_id":"t1"}'::jsonb,
                          status = COALESCE('processed', doc_status_doc_status.status),
                          track_id = COALESCE('t1', NULLIF(doc_status_doc_status.track_id, '')),
                          file_path = COALESCE('/data/doc1.txt', NULLIF(doc_status_doc_status.file_path, '')),
                          content_hash = COALESCE('h1', NULLIF(doc_status_doc_status.content_hash, '')),
+                         archived = COALESCE(NULL, doc_status_doc_status.archived),
+                         level = COALESCE(NULL, doc_status_doc_status.level),
+                         ref_ids = COALESCE(NULL::jsonb, doc_status_doc_status.ref_ids),
+                         merged_into = COALESCE(NULL, doc_status_doc_status.merged_into),
                          updated_at = NOW()

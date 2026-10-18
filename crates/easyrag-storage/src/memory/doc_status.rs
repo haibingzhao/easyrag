@@ -189,6 +189,7 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
         _sort_field: &str,
         sort_direction: &str,
         file_path_prefix: Option<&str>,
+        exclude_archived: bool,
         biz_id: &str,
     ) -> easyrag_core::Result<(Vec<(String, DocProcessingStatus)>, usize)> {
         let filter_values = resolve_status_filter_values(status_filter, status_filters);
@@ -211,7 +212,13 @@ impl DocStatusStorage for InMemoryDocStatusStorage {
                         .map(|fp| fp.starts_with(p))
                         .unwrap_or(false)
                 });
-                status_ok && prefix_ok && biz_ok
+                // R2: DB-level archive exclusion.
+                let archived_ok = !exclude_archived
+                    || !doc
+                        .get("archived")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                status_ok && prefix_ok && biz_ok && archived_ok
             })
             .map(|(id, doc)| (id.clone(), doc))
             .collect();
